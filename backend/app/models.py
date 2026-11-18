@@ -211,6 +211,7 @@ class PhoneNumberCreate(BaseModel):
     expiry_date: str = ""
     bound_services: str = ""
     status: str = "active"  # active | standby | paused | cancelled
+    parent_phone_id: Optional[int] = None
     notes: str = ""
 
 
@@ -236,6 +237,7 @@ class PhoneNumberUpdate(BaseModel):
     expiry_date: Optional[str] = None
     bound_services: Optional[str] = None
     status: Optional[str] = None
+    parent_phone_id: Optional[int] = None
     notes: Optional[str] = None
 
 

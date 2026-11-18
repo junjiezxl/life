@@ -472,6 +472,58 @@ class TestLifeHubAPI(unittest.TestCase):
             self.assertTrue(manual["ok"])
             self.assertEqual(mock_post.call_count, calls_after_first + 1)
 
+    def test_12_phone_number_subcards(self):
+        primary = self.client.post(
+            "/api/phone-numbers",
+            json={
+                "label": "移动主卡",
+                "phone_number": "+86 13800138000",
+                "country_region": "中国大陆 (+86)",
+                "carrier": "中国移动",
+                "monthly_fee": 99.0,
+            },
+        ).json()
+        sub = self.client.post(
+            "/api/phone-numbers",
+            json={
+                "label": "移动副卡1",
+                "phone_number": "+86 13800138001",
+                "country_region": "中国大陆 (+86)",
+                "carrier": "中国移动",
+                "monthly_fee": 10.0,
+                "parent_phone_id": primary["id"],
+            },
+        )
+        self.assertEqual(sub.status_code, 200)
+        sub_id = sub.json()["id"]
+
+        # Reject nesting a sub-card under another sub-card
+        nested = self.client.post(
+            "/api/phone-numbers",
+            json={
+                "label": "套娃副卡",
+                "phone_number": "+86 13800138002",
+                "parent_phone_id": sub_id,
+            },
+        )
+        self.assertEqual(nested.status_code, 400)
+
+        # Listing enriches parent & sub_cards metadata
+        listing = self.client.get("/api/phone-numbers").json()
+        self.assertGreaterEqual(listing["summary"]["sub_card_count"], 1)
+        p_item = next(p for p in listing["items"] if p["id"] == primary["id"])
+        s_item = next(p for p in listing["items"] if p["id"] == sub_id)
+        self.assertEqual(p_item["sub_cards_count"], 1)
+        self.assertEqual(p_item["sub_cards"][0]["id"], sub_id)
+        self.assertEqual(s_item["parent_phone_id"], primary["id"])
+        self.assertEqual(s_item["parent_label"], "移动主卡")
+
+        # Deleting primary detaches sub-card cleanly instead of failing or deleting sub-card
+        self.assertEqual(self.client.delete(f"/api/phone-numbers/{primary['id']}").status_code, 200)
+        listing_after = self.client.get("/api/phone-numbers").json()
+        s_after = next(p for p in listing_after["items"] if p["id"] == sub_id)
+        self.assertIsNone(s_after["parent_phone_id"])
+
 
 if __name__ == "__main__":
     unittest.main()

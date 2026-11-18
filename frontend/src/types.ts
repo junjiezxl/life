@@ -187,6 +187,16 @@ export interface EmailSyncLog {
   synced_at: string;
 }
 
+export interface PhoneSubCardSummary {
+  id: number;
+  label: string;
+  phone_number: string;
+  status: 'active' | 'standby' | 'paused' | 'cancelled';
+  monthly_fee_cny: number;
+  sim_type: 'physical' | 'esim' | 'virtual';
+  device_slot: string;
+}
+
 export interface PhoneNumber {
   id: number;
   label: string;
@@ -212,6 +222,11 @@ export interface PhoneNumber {
   expiry_date: string;
   bound_services: string;
   status: 'active' | 'standby' | 'paused' | 'cancelled';
+  parent_phone_id: number | null;
+  parent_label?: string;
+  parent_number?: string;
+  sub_cards_count?: number;
+  sub_cards?: PhoneSubCardSummary[];
   notes: string;
   created_at: string;
   updated_at: string;
@@ -222,6 +237,7 @@ export interface PhoneNumbersResponse {
   summary: {
     total_count: number;
     active_count: number;
+    sub_card_count?: number;
     monthly_cny_total: number;
     annual_cny_total: number;
     extra_cny_total: number;

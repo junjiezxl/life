@@ -7,6 +7,7 @@ import {
   Edit3,
   Eye,
   EyeOff,
+  GitBranch,
   Globe,
   Plus,
   ShieldCheck,
@@ -141,6 +142,7 @@ const EMPTY_FORM = {
   expiry_date: '',
   bound_services: '',
   status: 'active' as PhoneNumber['status'],
+  parent_phone_id: '',
   notes: '',
 };
 
@@ -164,7 +166,7 @@ export const PhoneNumbersView: React.FC<Props> = ({ onRefreshDashboard, onNotify
   });
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [maskNumbers, setMaskNumbers] = useState(false);
-  const [regionFilter, setRegionFilter] = useState<'all' | 'cn' | 'overseas' | 'urgent'>('all');
+  const [regionFilter, setRegionFilter] = useState<'all' | 'cn' | 'overseas' | 'urgent' | 'subcards'>('all');
 
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
@@ -204,6 +206,25 @@ export const PhoneNumbersView: React.FC<Props> = ({ onRefreshDashboard, onNotify
     setShowForm(true);
   };
 
+  const openCreateSubCard = (parent: PhoneNumber) => {
+    setEditingId(null);
+    setIsCustomRegion(!REGION_PRESETS.some((p) => p.region === parent.country_region));
+    setForm({
+      ...EMPTY_FORM,
+      label: `${parent.label} · 副卡`,
+      country_region: parent.country_region,
+      carrier: parent.carrier,
+      currency: parent.currency,
+      cny_rate: String(parent.cny_rate),
+      billing_day: String(parent.billing_day),
+      monthly_fee: '0',
+      status: 'active',
+      parent_phone_id: String(parent.id),
+    });
+    setShowForm(true);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
   const openEditForm = (item: PhoneNumber) => {
     setEditingId(item.id);
     setIsCustomRegion(!REGION_PRESETS.some((p) => p.region === item.country_region));
@@ -229,6 +250,7 @@ export const PhoneNumbersView: React.FC<Props> = ({ onRefreshDashboard, onNotify
       expiry_date: item.expiry_date,
       bound_services: item.bound_services,
       status: item.status,
+      parent_phone_id: item.parent_phone_id ? String(item.parent_phone_id) : '',
       notes: item.notes,
     });
     setShowForm(true);
@@ -273,6 +295,7 @@ export const PhoneNumbersView: React.FC<Props> = ({ onRefreshDashboard, onNotify
       expiry_date: form.expiry_date,
       bound_services: form.bound_services.trim(),
       status: form.status,
+      parent_phone_id: form.parent_phone_id ? Number(form.parent_phone_id) : null,
       notes: form.notes.trim(),
     };
     try {
@@ -334,11 +357,16 @@ export const PhoneNumbersView: React.FC<Props> = ({ onRefreshDashboard, onNotify
     }
   };
 
+  const primaryCandidates = data.items.filter((p) => !p.parent_phone_id && p.id !== editingId);
+  const editingItem = editingId ? data.items.find((p) => p.id === editingId) : null;
+  const editingHasSubCards = Boolean(editingItem && (editingItem.sub_cards_count || 0) > 0);
+
   const filteredItems = data.items.filter((item) => {
     if (regionFilter === 'cn') return item.country_region.includes('大陆');
     if (regionFilter === 'overseas') return !item.country_region.includes('大陆');
     if (regionFilter === 'urgent')
       return item.keep_alive_days_left !== null && item.keep_alive_days_left <= (item.remind_before_days ?? 7);
+    if (regionFilter === 'subcards') return Boolean(item.parent_phone_id);
     return true;
   });
 
@@ -351,7 +379,10 @@ export const PhoneNumbersView: React.FC<Props> = ({ onRefreshDashboard, onNotify
             <Smartphone className="h-3.5 w-3.5 text-indigo-600" /> 在管号码数量
           </div>
           <div className="mt-2 text-2xl font-bold text-slate-900">{data.summary.active_count}</div>
-          <div className="mt-1 text-xs text-slate-400">共 {data.summary.total_count} 个号码记录</div>
+          <div className="mt-1 text-xs text-slate-400">
+            共 {data.summary.total_count} 个号码
+            {(data.summary.sub_card_count || 0) > 0 ? `（含 ${data.summary.sub_card_count} 张副卡）` : '记录'}
+          </div>
         </div>
         <div className="rounded-2xl border border-slate-200/80 bg-white p-4 shadow-xs">
           <div className="text-xs text-slate-500 flex items-center gap-1.5">
@@ -386,6 +417,7 @@ export const PhoneNumbersView: React.FC<Props> = ({ onRefreshDashboard, onNotify
               { key: 'all', label: '全部号码' },
               { key: 'cn', label: '中国大陆' },
               { key: 'overseas', label: '港澳台及海外' },
+              { key: 'subcards', label: '副卡' },
               { key: 'urgent', label: '近期需保号' },
             ].map((f) => (
               <button
@@ -434,6 +466,49 @@ export const PhoneNumbersView: React.FC<Props> = ({ onRefreshDashboard, onNotify
             <button type="button" onClick={() => setShowForm(false)} className="text-xs text-slate-400 hover:text-slate-700">
               收起
             </button>
+          </div>
+
+          <div className="rounded-xl border border-indigo-100 bg-indigo-50/40 p-3.5">
+            <label className="block text-[11px] font-semibold text-indigo-800 mb-1.5 flex items-center gap-1.5">
+              <GitBranch className="h-3.5 w-3.5" /> 主卡 / 副卡归属关系
+            </label>
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 sm:items-center">
+              <select
+                value={form.parent_phone_id}
+                disabled={editingHasSubCards}
+                onChange={(e) => {
+                  const pid = e.target.value;
+                  const parent = primaryCandidates.find((p) => String(p.id) === pid);
+                  setForm((prev) => ({
+                    ...prev,
+                    parent_phone_id: pid,
+                    country_region: !editingId && parent ? parent.country_region : prev.country_region,
+                    carrier: !editingId && parent && !prev.carrier ? parent.carrier : prev.carrier,
+                    currency: !editingId && parent ? parent.currency : prev.currency,
+                    cny_rate: !editingId && parent ? String(parent.cny_rate) : prev.cny_rate,
+                    billing_day: !editingId && parent ? String(parent.billing_day) : prev.billing_day,
+                  }));
+                  if (!editingId && parent) {
+                    setIsCustomRegion(!REGION_PRESETS.some((p) => p.region === parent.country_region));
+                  }
+                }}
+                className="w-full rounded-xl border border-indigo-200 bg-white px-3 py-2 text-xs disabled:opacity-60"
+              >
+                <option value="">独立主卡 / 常规号码（不挂靠其他号码）</option>
+                {primaryCandidates.map((p) => (
+                  <option key={p.id} value={String(p.id)}>
+                    作为副卡，挂在主号：{p.label} ({p.phone_number})
+                  </option>
+                ))}
+              </select>
+              <span className="text-[11px] text-slate-500">
+                {editingHasSubCards
+                  ? `该号码当前为主卡（名下已有 ${editingItem?.sub_cards_count} 张副卡），不可设为其他号码的副卡`
+                  : form.parent_phone_id
+                    ? '副卡可填写单独的功能费（如 10 元/月）或填 0 元表示共享主卡套餐'
+                    : '如有多张副卡挂在同一主卡名下，可在此选择所属主号'}
+              </span>
+            </div>
           </div>
 
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
@@ -796,7 +871,12 @@ export const PhoneNumbersView: React.FC<Props> = ({ onRefreshDashboard, onNotify
               : [];
 
             return (
-              <div key={item.id} className="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-xs space-y-4">
+              <div
+                key={item.id}
+                className={`rounded-2xl border bg-white p-5 shadow-xs space-y-4 ${
+                  item.parent_phone_id ? 'border-slate-200/80 border-l-4 border-l-indigo-400' : 'border-slate-200/80'
+                }`}
+              >
                 {/* Header */}
                 <div className="flex items-start justify-between gap-3">
                   <div>
@@ -804,11 +884,28 @@ export const PhoneNumbersView: React.FC<Props> = ({ onRefreshDashboard, onNotify
                       <span className="rounded-lg bg-indigo-50 px-2 py-0.5 text-[11px] font-medium text-indigo-700">
                         {item.country_region}
                       </span>
+                      {item.parent_phone_id ? (
+                        <span className="inline-flex items-center gap-1 rounded-md bg-violet-50 border border-violet-200 px-2 py-0.5 text-[11px] font-medium text-violet-700">
+                          <GitBranch className="h-3 w-3" /> 副卡
+                        </span>
+                      ) : (item.sub_cards_count || 0) > 0 ? (
+                        <span className="inline-flex items-center gap-1 rounded-md bg-indigo-600 px-2 py-0.5 text-[11px] font-medium text-white">
+                          主卡 · {item.sub_cards_count} 张副卡
+                        </span>
+                      ) : null}
                       <h3 className="text-base font-bold text-slate-900">{item.label}</h3>
                       <span className={`rounded-md border px-2 py-0.5 text-[11px] font-medium ${st.cls}`}>
                         {st.label}
                       </span>
                     </div>
+                    {item.parent_phone_id && item.parent_label && (
+                      <div className="mt-1.5 inline-flex items-center gap-1.5 rounded-lg bg-violet-50/70 px-2.5 py-1 text-[11px] text-violet-700">
+                        <GitBranch className="h-3 w-3" />
+                        <span>
+                          归属主号：<span className="font-semibold">{item.parent_label}</span> ({maskNumber(item.parent_number || '', maskNumbers)})
+                        </span>
+                      </div>
+                    )}
                     <div className="mt-1.5 flex flex-wrap items-center gap-2 text-xs text-slate-500">
                       <span>{item.carrier || '未填运营商'}</span>
                       <span>·</span>
@@ -822,7 +919,16 @@ export const PhoneNumbersView: React.FC<Props> = ({ onRefreshDashboard, onNotify
                     </div>
                   </div>
 
-                  <div className="flex items-center gap-1">
+                  <div className="flex items-center gap-1 shrink-0">
+                    {!item.parent_phone_id && (
+                      <button
+                        onClick={() => openCreateSubCard(item)}
+                        title="在此主号下添加副卡"
+                        className="inline-flex items-center gap-1 rounded-lg border border-indigo-200 bg-indigo-50 px-2 py-1 text-[11px] font-medium text-indigo-700 hover:bg-indigo-100 cursor-pointer"
+                      >
+                        <GitBranch className="h-3 w-3" /> + 副卡
+                      </button>
+                    )}
                     <button
                       onClick={() => openEditForm(item)}
                       title="编辑"
@@ -832,7 +938,11 @@ export const PhoneNumbersView: React.FC<Props> = ({ onRefreshDashboard, onNotify
                     </button>
                     <button
                       onClick={async () => {
-                        if (!window.confirm(`确定删除「${item.label}」吗？`)) return;
+                        const msg =
+                          (item.sub_cards_count || 0) > 0
+                            ? `确定删除主卡「${item.label}」吗？其名下的 ${item.sub_cards_count} 张副卡将自动转为独立号码。`
+                            : `确定删除「${item.label}」吗？`;
+                        if (!window.confirm(msg)) return;
                         await api.deletePhoneNumber(item.id);
                         await loadAll();
                         onRefreshDashboard();
@@ -940,6 +1050,53 @@ export const PhoneNumbersView: React.FC<Props> = ({ onRefreshDashboard, onNotify
                     </div>
                   </div>
                 </div>
+
+                {/* Sub-cards attached to this primary card */}
+                {!item.parent_phone_id && item.sub_cards && item.sub_cards.length > 0 && (
+                  <div className="rounded-xl border border-indigo-100 bg-indigo-50/40 p-3 space-y-2">
+                    <div className="flex items-center justify-between text-[11px] font-semibold text-indigo-800">
+                      <span className="inline-flex items-center gap-1.5">
+                        <GitBranch className="h-3.5 w-3.5" /> 名下挂载副卡 ({item.sub_cards.length})
+                      </span>
+                      <span className="font-normal text-indigo-600">
+                        副卡月费合计 {formatMoney(item.sub_cards.reduce((acc, s) => acc + s.monthly_fee_cny, 0))}
+                      </span>
+                    </div>
+                    <div className="space-y-1.5">
+                      {item.sub_cards.map((sub) => {
+                        const fullSub = data.items.find((x) => x.id === sub.id);
+                        const subSt = STATUS_META[sub.status] || STATUS_META.active;
+                        return (
+                          <div
+                            key={sub.id}
+                            className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-white border border-indigo-100/80 px-3 py-2 text-xs"
+                          >
+                            <div className="flex flex-wrap items-center gap-2 min-w-0">
+                              <span className="font-medium text-slate-800">{sub.label}</span>
+                              <span className="font-mono text-slate-600">{maskNumber(sub.phone_number, maskNumbers)}</span>
+                              <span className={`rounded px-1.5 py-0.5 text-[10px] border ${subSt.cls}`}>{subSt.label}</span>
+                              {sub.device_slot && <span className="text-[11px] text-slate-400">· {sub.device_slot}</span>}
+                            </div>
+                            <div className="flex items-center gap-2 shrink-0">
+                              <span className="text-[11px] font-medium text-slate-700">
+                                {sub.monthly_fee_cny > 0 ? `${formatMoney(sub.monthly_fee_cny)}/月` : '共享主卡'}
+                              </span>
+                              {fullSub && (
+                                <button
+                                  type="button"
+                                  onClick={() => openEditForm(fullSub)}
+                                  className="text-[11px] text-indigo-600 hover:underline cursor-pointer"
+                                >
+                                  编辑
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
 
                 {/* Bound services & notes */}
                 {(services.length > 0 || item.notes) && (

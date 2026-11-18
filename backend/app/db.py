@@ -189,6 +189,7 @@ def init_db(seed_demo: bool = True) -> None:
                 expiry_date TEXT DEFAULT '',
                 bound_services TEXT DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'active',
+                parent_phone_id INTEGER REFERENCES phone_numbers(id) ON DELETE SET NULL,
                 notes TEXT DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -227,6 +228,8 @@ def init_db(seed_demo: bool = True) -> None:
         phone_cols = {r["name"] for r in conn.execute("PRAGMA table_info(phone_numbers)").fetchall()}
         if "remind_before_days" not in phone_cols:
             conn.execute("ALTER TABLE phone_numbers ADD COLUMN remind_before_days INTEGER NOT NULL DEFAULT 7")
+        if "parent_phone_id" not in phone_cols:
+            conn.execute("ALTER TABLE phone_numbers ADD COLUMN parent_phone_id INTEGER REFERENCES phone_numbers(id) ON DELETE SET NULL")
 
         rem_cols = {r["name"] for r in conn.execute("PRAGMA table_info(reminders)").fetchall()}
         if "bark_notified_at" not in rem_cols:

@@ -1649,6 +1649,29 @@ def _sync_phone_reminders_conn(conn: Any, override_within_days: Optional[int] = 
     return created
 
 
+def _validate_parent_phone(conn: Any, parent_phone_id: Optional[int], current_phone_id: Optional[int] = None) -> Optional[int]:
+    if parent_phone_id is None:
+        return None
+    if current_phone_id is not None and parent_phone_id == current_phone_id:
+        raise HTTPException(status_code=400, detail="不能将号码设为自己的副卡")
+    parent_row = conn.execute(
+        "SELECT id, parent_phone_id FROM phone_numbers WHERE id = ?",
+        (parent_phone_id,),
+    ).fetchone()
+    if not parent_row:
+        raise HTTPException(status_code=404, detail="所选归属主号不存在")
+    if parent_row["parent_phone_id"] is not None:
+        raise HTTPException(status_code=400, detail="所选号码本身是副卡，请选择主卡作为归属主号")
+    if current_phone_id is not None:
+        has_children = conn.execute(
+            "SELECT 1 FROM phone_numbers WHERE parent_phone_id = ? LIMIT 1",
+            (current_phone_id,),
+        ).fetchone()
+        if has_children:
+            raise HTTPException(status_code=400, detail="该主卡名下已挂有副卡，请先移除副卡关联再修改")
+    return parent_phone_id
+
+
 @app.get("/api/phone-numbers")
 async def list_phone_numbers() -> Dict[str, Any]:
     with get_conn() as conn:
@@ -1662,6 +1685,35 @@ async def list_phone_numbers() -> Dict[str, Any]:
             d["remind_before_days"] = int(d.get("remind_before_days") if d.get("remind_before_days") is not None else 7)
             items.append(d)
 
+    by_id = {p["id"]: p for p in items}
+    children_map: Dict[int, List[Dict[str, Any]]] = {}
+    for p in items:
+        pid = p.get("parent_phone_id")
+        if pid and pid in by_id:
+            parent = by_id[pid]
+            p["parent_label"] = parent["label"]
+            p["parent_number"] = parent["phone_number"]
+            children_map.setdefault(pid, []).append(
+                {
+                    "id": p["id"],
+                    "label": p["label"],
+                    "phone_number": p["phone_number"],
+                    "status": p["status"],
+                    "monthly_fee_cny": p["monthly_fee_cny"],
+                    "sim_type": p["sim_type"],
+                    "device_slot": p.get("device_slot") or "",
+                }
+            )
+        else:
+            p["parent_phone_id"] = None
+            p["parent_label"] = ""
+            p["parent_number"] = ""
+
+    for p in items:
+        subs = children_map.get(p["id"], [])
+        p["sub_cards"] = subs
+        p["sub_cards_count"] = len(subs)
+
     if new_phone_rems:
         await _push_new_reminders_bark(new_phone_rems, prefix="📱 保号提前提醒：")
 
@@ -1672,12 +1724,14 @@ async def list_phone_numbers() -> Dict[str, Any]:
         p for p in active_items
         if p["keep_alive_days_left"] is not None and p["keep_alive_days_left"] <= p["remind_before_days"]
     ]
+    sub_card_count = sum(1 for p in items if p.get("parent_phone_id"))
 
     return {
         "items": items,
         "summary": {
             "total_count": len(items),
             "active_count": len(active_items),
+            "sub_card_count": sub_card_count,
             "monthly_cny_total": monthly_cny_total,
             "annual_cny_total": round(monthly_cny_total * 12, 2),
             "extra_cny_total": extra_cny_total,
@@ -1695,10 +1749,11 @@ async def create_phone_number(payload: PhoneNumberCreate) -> Dict[str, Any]:
     next_ka = payload.next_keep_alive_date.strip() or _calc_next_keep_alive(last_ka, payload.keep_alive_cycle_days)
 
     with get_conn() as conn:
+        parent_id = _validate_parent_phone(conn, payload.parent_phone_id)
         cur = conn.execute(
             """INSERT INTO phone_numbers
-            (label, phone_number, country_region, carrier, sim_type, device_slot, monthly_fee, currency, cny_rate, balance, extra_comm_cost, total_comm_spent, billing_day, keep_alive_rule, keep_alive_cycle_days, remind_before_days, last_keep_alive_date, next_keep_alive_date, expiry_date, bound_services, status, notes, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (label, phone_number, country_region, carrier, sim_type, device_slot, monthly_fee, currency, cny_rate, balance, extra_comm_cost, total_comm_spent, billing_day, keep_alive_rule, keep_alive_cycle_days, remind_before_days, last_keep_alive_date, next_keep_alive_date, expiry_date, bound_services, status, parent_phone_id, notes, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 payload.label.strip(),
                 payload.phone_number.strip(),
@@ -1721,6 +1776,7 @@ async def create_phone_number(payload: PhoneNumberCreate) -> Dict[str, Any]:
                 payload.expiry_date.strip(),
                 payload.bound_services.strip(),
                 payload.status,
+                parent_id,
                 payload.notes.strip(),
                 ts,
                 ts,
@@ -1737,7 +1793,7 @@ async def create_phone_number(payload: PhoneNumberCreate) -> Dict[str, Any]:
 
 @app.patch("/api/phone-numbers/{phone_id}")
 async def update_phone_number(phone_id: int, payload: PhoneNumberUpdate) -> Dict[str, Any]:
-    updates = {k: v for k, v in payload.model_dump().items() if v is not None}
+    updates = payload.model_dump(exclude_unset=True)
     if not updates:
         raise HTTPException(status_code=400, detail="无更新字段")
 
@@ -1746,6 +1802,9 @@ async def update_phone_number(phone_id: int, payload: PhoneNumberUpdate) -> Dict
         if not existing_row:
             raise HTTPException(status_code=404, detail="号码记录不存在")
         existing = _row_to_dict(existing_row)
+
+        if "parent_phone_id" in updates:
+            updates["parent_phone_id"] = _validate_parent_phone(conn, updates["parent_phone_id"], current_phone_id=phone_id)
 
         if (
             ("keep_alive_cycle_days" in updates or "last_keep_alive_date" in updates)
@@ -1772,6 +1831,7 @@ async def update_phone_number(phone_id: int, payload: PhoneNumberUpdate) -> Dict
 @app.delete("/api/phone-numbers/{phone_id}")
 def delete_phone_number(phone_id: int) -> Dict[str, bool]:
     with get_conn() as conn:
+        conn.execute("UPDATE phone_numbers SET parent_phone_id = NULL WHERE parent_phone_id = ?", (phone_id,))
         cur = conn.execute("DELETE FROM phone_numbers WHERE id = ?", (phone_id,))
         if cur.rowcount == 0:
             raise HTTPException(status_code=404, detail="号码记录不存在")
