@@ -288,7 +288,7 @@ export const RemindersChatView: React.FC<Props> = ({ onRefreshDashboard, onNotif
         </div>
 
         {/* List */}
-        <div className="mt-4 space-y-2.5 max-h-[600px] overflow-y-auto pr-1">
+        <div className="mt-4 space-y-2.5 max-h-[420px] lg:max-h-[calc(100dvh-19rem)] overflow-y-auto pr-1">
           {reminders.length === 0 ? (
             <div className="rounded-xl bg-slate-50 py-12 text-center text-sm text-slate-400">
               当前筛选条件下暂无提醒事项
@@ -368,8 +368,8 @@ export const RemindersChatView: React.FC<Props> = ({ onRefreshDashboard, onNotif
       </div>
 
       {/* Right 5 cols: AI Chat Assistant */}
-      <div className="lg:col-span-5 rounded-2xl border border-slate-200/80 bg-white shadow-xs flex flex-col h-[680px]">
-        <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
+      <div className="lg:col-span-5 lg:sticky lg:top-6 rounded-2xl border border-slate-200/80 bg-white shadow-xs flex flex-col h-[520px] lg:h-[calc(100dvh-10.5rem)] min-h-[420px] max-h-[820px]">
+        <div className="flex items-center justify-between border-b border-slate-100 px-5 py-3.5 shrink-0">
           <div className="flex items-center gap-2.5">
             <div className="rounded-xl bg-indigo-600 p-2 text-white">
               <Sparkles className="h-4 w-4" />
@@ -387,7 +387,7 @@ export const RemindersChatView: React.FC<Props> = ({ onRefreshDashboard, onNotif
           </button>
         </div>
 
-        <div ref={chatScrollRef} className="flex-1 overflow-y-auto p-4 space-y-4 bg-slate-50/40">
+        <div ref={chatScrollRef} className="flex-1 min-h-0 overflow-y-auto p-4 space-y-4 bg-slate-50/40">
           {messages.length === 0 && (
             <div className="rounded-xl bg-white border border-slate-100 p-4 text-xs text-slate-500">
               发送一句自然语言试试看，例如：「明天上午9点半提醒我交房租3200元，今天咖啡花了32元」。
@@ -436,8 +436,8 @@ export const RemindersChatView: React.FC<Props> = ({ onRefreshDashboard, onNotif
           ))}
         </div>
 
-        <div className="border-t border-slate-100 p-3 bg-white rounded-b-2xl space-y-2">
-          <div className="flex flex-wrap gap-1.5">
+        <div className="border-t border-slate-100 p-3 bg-white rounded-b-2xl space-y-2 shrink-0">
+          <div className="flex gap-1.5 overflow-x-auto pb-0.5">
             {[
               '后天上午10点提醒我交物业费260元',
               '今天打车花了38元',
@@ -447,7 +447,7 @@ export const RemindersChatView: React.FC<Props> = ({ onRefreshDashboard, onNotif
                 key={prompt}
                 type="button"
                 onClick={() => setChatInput(prompt)}
-                className="rounded-full bg-slate-100 px-2.5 py-1 text-[11px] text-slate-600 hover:bg-indigo-50 hover:text-indigo-700 transition cursor-pointer"
+                className="shrink-0 whitespace-nowrap rounded-full bg-slate-100 px-2.5 py-1 text-[11px] text-slate-600 hover:bg-indigo-50 hover:text-indigo-700 transition cursor-pointer"
               >
                 {prompt}
               </button>
