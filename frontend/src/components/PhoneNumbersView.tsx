@@ -169,6 +169,7 @@ export const PhoneNumbersView: React.FC<Props> = ({ onRefreshDashboard, onNotify
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [form, setForm] = useState(EMPTY_FORM);
+  const [isCustomRegion, setIsCustomRegion] = useState(false);
 
   // Quick cost/topup drawer per phone
   const [costPhone, setCostPhone] = useState<PhoneNumber | null>(null);
@@ -199,11 +200,13 @@ export const PhoneNumbersView: React.FC<Props> = ({ onRefreshDashboard, onNotify
   const openCreateForm = () => {
     setEditingId(null);
     setForm(EMPTY_FORM);
+    setIsCustomRegion(false);
     setShowForm(true);
   };
 
   const openEditForm = (item: PhoneNumber) => {
     setEditingId(item.id);
+    setIsCustomRegion(!REGION_PRESETS.some((p) => p.region === item.country_region));
     setForm({
       label: item.label,
       phone_number: item.phone_number,
@@ -459,9 +462,18 @@ export const PhoneNumbersView: React.FC<Props> = ({ onRefreshDashboard, onNotify
             <div>
               <label className="block text-[11px] font-medium text-slate-600 mb-1">所属国家 / 地区</label>
               <select
-                value={REGION_PRESETS.some((p) => p.region === form.country_region) ? form.country_region : '__custom'}
+                value={isCustomRegion ? '__custom' : form.country_region}
                 onChange={(e) => {
-                  if (e.target.value !== '__custom') handleRegionChange(e.target.value);
+                  if (e.target.value === '__custom') {
+                    setIsCustomRegion(true);
+                    setForm((prev) => ({
+                      ...prev,
+                      country_region: REGION_PRESETS.some((p) => p.region === prev.country_region) ? '' : prev.country_region,
+                    }));
+                  } else {
+                    setIsCustomRegion(false);
+                    handleRegionChange(e.target.value);
+                  }
                 }}
                 className="w-full rounded-xl border border-slate-200 px-3 py-2 text-xs"
               >
@@ -470,12 +482,13 @@ export const PhoneNumbersView: React.FC<Props> = ({ onRefreshDashboard, onNotify
                 ))}
                 <option value="__custom">自定义输入...</option>
               </select>
-              {!REGION_PRESETS.some((p) => p.region === form.country_region) && (
+              {isCustomRegion && (
                 <input
                   type="text"
+                  autoFocus
                   value={form.country_region}
                   onChange={(e) => setForm({ ...form, country_region: e.target.value })}
-                  placeholder="输入国家/地区"
+                  placeholder="输入国家/地区，如：马来西亚 (+60)"
                   className="mt-1.5 w-full rounded-xl border border-slate-200 px-3 py-1.5 text-xs"
                 />
               )}
