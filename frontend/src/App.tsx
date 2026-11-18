@@ -4,7 +4,6 @@ import {
   FileText,
   LayoutDashboard,
   LogOut,
-  Mail,
   RefreshCw,
   Settings,
   Smartphone,
@@ -14,7 +13,6 @@ import {
 } from 'lucide-react';
 import { api, setUnauthorizedHandler } from './api';
 import { DashboardView } from './components/DashboardView';
-import { EmailBillsView } from './components/EmailBillsView';
 import { FinanceSettlementView } from './components/FinanceSettlementView';
 import { LoginView } from './components/LoginView';
 import { NotesExtractorView } from './components/NotesExtractorView';
@@ -27,7 +25,6 @@ const NAV_ITEMS: Array<{ key: TabKey; label: string; icon: React.ComponentType<{
   { key: 'dashboard', label: '展示面板', icon: LayoutDashboard },
   { key: 'reminders', label: '提醒 & AI 对话', icon: Bell },
   { key: 'notes', label: '思源笔记提取', icon: FileText },
-  { key: 'emails', label: '邮箱账单 & 解析', icon: Mail },
   { key: 'phones', label: '手机号码管理', icon: Smartphone },
   { key: 'finance', label: '个人财务 & 结账', icon: Wallet },
   { key: 'settings', label: '系统设置', icon: Settings },
@@ -269,9 +266,6 @@ export function App() {
             )}
             {activeTab === 'notes' && (
               <NotesExtractorView onRefreshDashboard={loadDashboard} onNotify={notify} />
-            )}
-            {activeTab === 'emails' && (
-              <EmailBillsView onRefreshDashboard={loadDashboard} onNotify={notify} />
             )}
             {activeTab === 'phones' && (
               <PhoneNumbersView onRefreshDashboard={loadDashboard} onNotify={notify} />

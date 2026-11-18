@@ -1,4 +1,4 @@
-export type TabKey = 'dashboard' | 'reminders' | 'notes' | 'emails' | 'phones' | 'finance' | 'settings';
+export type TabKey = 'dashboard' | 'reminders' | 'notes' | 'phones' | 'finance' | 'settings';
 
 export interface Reminder {
   id: number;
