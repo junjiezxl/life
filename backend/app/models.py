@@ -237,3 +237,20 @@ class PhoneCommRecordRequest(BaseModel):
     sync_to_finance: bool = True
     account_id: Optional[int] = None
     mark_keep_alive: bool = False
+
+
+class AuthSetupRequest(BaseModel):
+    username: str = Field("admin", min_length=1, max_length=64)
+    password: str = Field(..., min_length=6, max_length=128)
+
+
+class AuthLoginRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=64)
+    password: str = Field(..., min_length=1, max_length=128)
+    remember_me: bool = True
+
+
+class AuthChangePasswordRequest(BaseModel):
+    current_password: str = Field(..., min_length=1, max_length=128)
+    new_password: Optional[str] = Field(None, max_length=128)
+    new_username: Optional[str] = Field(None, max_length=64)

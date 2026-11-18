@@ -223,3 +223,10 @@ export interface PhoneNumbersResponse {
 }
 
 export type AppSettings = Record<string, string>;
+
+export interface AuthStatus {
+  authenticated: boolean;
+  setup_required: boolean;
+  username: string | null;
+  active_sessions: number;
+}

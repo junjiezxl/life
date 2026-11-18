@@ -1,6 +1,7 @@
 import type {
   Account,
   AppSettings,
+  AuthStatus,
   ChatMessage,
   DashboardData,
   EmailFetchResponse,
@@ -16,12 +17,22 @@ import type {
   Transaction,
 } from './types';
 
+let unauthorizedHandler: (() => void) | null = null;
+
+export function setUnauthorizedHandler(handler: (() => void) | null) {
+  unauthorizedHandler = handler;
+}
+
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const resp = await fetch(url, {
+    credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json', ...(options?.headers || {}) },
     ...options,
   });
   if (!resp.ok) {
+    if (resp.status === 401 && !url.startsWith('/api/auth/')) {
+      unauthorizedHandler?.();
+    }
     let msg = `请求失败 (${resp.status})`;
     try {
       const data = await resp.json();
@@ -35,6 +46,29 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  // Auth
+  getAuthStatus: () => request<AuthStatus>('/api/auth/status'),
+  setupAuth: (username: string, password: string) =>
+    request<{ ok: boolean; username: string; expires_at: string }>('/api/auth/setup', {
+      method: 'POST',
+      body: JSON.stringify({ username, password }),
+    }),
+  login: (username: string, password: string, rememberMe = true) =>
+    request<{ ok: boolean; username: string; expires_at: string }>('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ username, password, remember_me: rememberMe }),
+    }),
+  logout: () => request<{ ok: boolean }>('/api/auth/logout', { method: 'POST' }),
+  logoutAll: (includeCurrent = false) =>
+    request<{ ok: boolean; revoked_count: number }>(`/api/auth/logout-all?include_current=${includeCurrent}`, {
+      method: 'POST',
+    }),
+  changePassword: (payload: { current_password: string; new_password?: string; new_username?: string }) =>
+    request<{ ok: boolean; username: string; revoked_other_sessions: number }>('/api/auth/change-password', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
   getDashboard: () => request<DashboardData>('/api/dashboard'),
 
   // Reminders
@@ -143,8 +177,15 @@ export const api = {
     const fd = new FormData();
     fd.append('file', file);
     fd.append('zip_password', zipPassword);
-    const resp = await fetch('/api/bills/parse-upload', { method: 'POST', body: fd });
+    const resp = await fetch('/api/bills/parse-upload', {
+      method: 'POST',
+      credentials: 'same-origin',
+      body: fd,
+    });
     if (!resp.ok) {
+      if (resp.status === 401) {
+        unauthorizedHandler?.();
+      }
       throw new Error(`上传解析失败 (${resp.status})`);
     }
     return resp.json() as Promise<{

@@ -3,17 +3,20 @@ import {
   Bell,
   FileText,
   LayoutDashboard,
+  LogOut,
   Mail,
   RefreshCw,
   Settings,
   Smartphone,
   Sparkles,
+  User,
   Wallet,
 } from 'lucide-react';
-import { api } from './api';
+import { api, setUnauthorizedHandler } from './api';
 import { DashboardView } from './components/DashboardView';
 import { EmailBillsView } from './components/EmailBillsView';
 import { FinanceSettlementView } from './components/FinanceSettlementView';
+import { LoginView } from './components/LoginView';
 import { NotesExtractorView } from './components/NotesExtractorView';
 import { PhoneNumbersView } from './components/PhoneNumbersView';
 import { RemindersChatView } from './components/RemindersChatView';
@@ -36,6 +39,12 @@ export function App() {
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState<string | null>(null);
 
+  const [authChecking, setAuthChecking] = useState(true);
+  const [authenticated, setAuthenticated] = useState(false);
+  const [setupRequired, setSetupRequired] = useState(false);
+  const [username, setUsername] = useState<string>('admin');
+  const [authNotice, setAuthNotice] = useState<string | null>(null);
+
   const notify = (msg: string) => {
     setToast(msg);
     window.setTimeout(() => {
@@ -54,9 +63,74 @@ export function App() {
     }
   };
 
+  const checkAuthAndLoad = async () => {
+    setAuthChecking(true);
+    try {
+      const status = await api.getAuthStatus();
+      setSetupRequired(status.setup_required);
+      setAuthenticated(status.authenticated);
+      if (status.username) setUsername(status.username);
+      if (status.authenticated) {
+        await loadDashboard();
+      } else {
+        setLoading(false);
+      }
+    } catch (err) {
+      setAuthNotice(err instanceof Error ? err.message : '连接后端服务失败');
+      setLoading(false);
+    } finally {
+      setAuthChecking(false);
+    }
+  };
+
   useEffect(() => {
-    loadDashboard();
+    setUnauthorizedHandler(() => {
+      setAuthenticated(false);
+      setSetupRequired(false);
+      setDashboard(null);
+      setAuthNotice('登录状态已失效，请重新登录');
+    });
+    checkAuthAndLoad();
+    return () => setUnauthorizedHandler(null);
   }, []);
+
+  const handleAuthenticated = async (loggedInUser: string) => {
+    setUsername(loggedInUser);
+    setAuthenticated(true);
+    setSetupRequired(false);
+    setAuthNotice(null);
+    setLoading(true);
+    await loadDashboard();
+  };
+
+  const handleLogout = async () => {
+    try {
+      await api.logout();
+    } catch {
+      // ignore
+    }
+    setAuthenticated(false);
+    setDashboard(null);
+    setAuthNotice('已安全退出登录');
+  };
+
+  if (authChecking) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4 text-sm text-slate-500">
+        正在检查登录状态...
+      </div>
+    );
+  }
+
+  if (!authenticated) {
+    return (
+      <LoginView
+        setupRequired={setupRequired}
+        notice={authNotice}
+        onAuthenticated={handleAuthenticated}
+      />
+    );
+  }
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col lg:flex-row">
@@ -72,13 +146,22 @@ export function App() {
               <div className="text-[11px] text-slate-400">个人提醒 · 笔记 · 财务中心</div>
             </div>
           </div>
-          <button
-            onClick={loadDashboard}
-            title="刷新数据"
-            className="lg:hidden rounded-lg p-2 text-slate-400 hover:bg-slate-100"
-          >
-            <RefreshCw className="h-4 w-4" />
-          </button>
+          <div className="flex items-center gap-1 lg:hidden">
+            <button
+              onClick={loadDashboard}
+              title="刷新数据"
+              className="rounded-lg p-2 text-slate-400 hover:bg-slate-100 cursor-pointer"
+            >
+              <RefreshCw className="h-4 w-4" />
+            </button>
+            <button
+              onClick={handleLogout}
+              title="退出登录"
+              className="rounded-lg p-2 text-slate-400 hover:bg-slate-100 hover:text-rose-600 cursor-pointer"
+            >
+              <LogOut className="h-4 w-4" />
+            </button>
+          </div>
         </div>
 
         <nav className="flex lg:flex-col gap-1 p-3 overflow-x-auto">
@@ -102,24 +185,39 @@ export function App() {
           })}
         </nav>
 
-        {dashboard && (
-          <div className="hidden lg:block mt-auto p-4 border-t border-slate-100 space-y-2 text-[11px] text-slate-500">
-            <div className="flex items-center justify-between">
-              <span>AI 引擎</span>
-              <span className="rounded-md bg-slate-100 px-2 py-0.5 font-medium text-slate-700">
-                {dashboard.config_status.ai_provider === 'local_fallback'
-                  ? '本地智能解析'
-                  : dashboard.config_status.ai_provider}
-              </span>
-            </div>
-            <div className="flex items-center justify-between">
-              <span>思源接入</span>
-              <span className="rounded-md bg-slate-100 px-2 py-0.5 font-medium text-slate-700">
-                {dashboard.config_status.siyuan_mode}
-              </span>
-            </div>
+        <div className="hidden lg:block mt-auto p-4 border-t border-slate-100 space-y-2.5 text-[11px] text-slate-500">
+          {dashboard && (
+            <>
+              <div className="flex items-center justify-between">
+                <span>AI 引擎</span>
+                <span className="rounded-md bg-slate-100 px-2 py-0.5 font-medium text-slate-700">
+                  {dashboard.config_status.ai_provider === 'local_fallback'
+                    ? '本地智能解析'
+                    : dashboard.config_status.ai_provider}
+                </span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span>思源接入</span>
+                <span className="rounded-md bg-slate-100 px-2 py-0.5 font-medium text-slate-700">
+                  {dashboard.config_status.siyuan_mode}
+                </span>
+              </div>
+            </>
+          )}
+          <div className="pt-2 border-t border-slate-100 flex items-center justify-between">
+            <span className="inline-flex items-center gap-1.5 font-medium text-slate-700">
+              <User className="h-3.5 w-3.5 text-indigo-600" />
+              {username}
+            </span>
+            <button
+              onClick={handleLogout}
+              className="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-slate-500 hover:bg-rose-50 hover:text-rose-600 transition cursor-pointer"
+            >
+              <LogOut className="h-3.5 w-3.5" />
+              退出
+            </button>
           </div>
-        )}
+        </div>
       </aside>
 
       {/* Main Content */}
@@ -182,7 +280,12 @@ export function App() {
               <FinanceSettlementView onRefreshDashboard={loadDashboard} onNotify={notify} />
             )}
             {activeTab === 'settings' && (
-              <SettingsView onRefreshDashboard={loadDashboard} onNotify={notify} />
+              <SettingsView
+                currentUsername={username}
+                onUsernameChanged={setUsername}
+                onRefreshDashboard={loadDashboard}
+                onNotify={notify}
+              />
             )}
           </>
         )}

@@ -5,14 +5,18 @@ import os
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .db import get_all_settings, get_conn, init_db, now_iso, reset_all_data, update_settings
 from .models import (
     AccountCreate,
     AccountUpdate,
+    AuthChangePasswordRequest,
+    AuthLoginRequest,
+    AuthSetupRequest,
     BatchImportRemindersRequest,
     BatchImportTransactionsRequest,
     ChatRequest,
@@ -39,12 +43,92 @@ from .services.ai_service import (
     process_chat_message,
     test_ai_connection,
 )
+from .services.auth_service import (
+    SESSION_COOKIE_NAME,
+    LoginRateLimiter,
+    authenticate_user,
+    count_active_sessions,
+    create_session,
+    create_user,
+    delete_other_sessions,
+    delete_session,
+    get_session_user,
+    has_any_user,
+    update_user_credentials,
+)
 from .services.bark_service import format_reminder_bark_message, send_bark_push
 from .services.bill_parser import parse_bill_file
 from .services.email_service import fetch_and_parse_emails, test_imap_connection
 from .services.siyuan_service import fetch_siyuan_notes, test_siyuan_connection
 
 app = FastAPI(title="LifeHub API", version="1.0.0")
+
+_PUBLIC_API_PATHS = {
+    "/api/health",
+    "/api/auth/status",
+    "/api/auth/setup",
+    "/api/auth/login",
+    "/api/auth/logout",
+}
+_login_limiter = LoginRateLimiter()
+
+
+def _extract_session_token(request: Request) -> str:
+    cookie_token = request.cookies.get(SESSION_COOKIE_NAME)
+    if cookie_token:
+        return cookie_token.strip()
+    auth_header = request.headers.get("authorization") or ""
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip()
+    return ""
+
+
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for") or ""
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _is_https_request(request: Request) -> bool:
+    proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+    return request.url.scheme == "https" or proto == "https"
+
+
+def _set_session_cookie(response: Response, request: Request, token: str, remember_me: bool, max_age: int) -> None:
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=token,
+        httponly=True,
+        samesite="lax",
+        secure=_is_https_request(request),
+        path="/",
+        max_age=max_age if remember_me else None,
+    )
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next: Any) -> Response:
+    path = request.url.path
+    if request.method == "OPTIONS" or not path.startswith("/api/"):
+        return await call_next(request)
+
+    token = _extract_session_token(request)
+    session_user = None
+    if token:
+        with get_conn() as conn:
+            session_user = get_session_user(conn, token)
+    request.state.auth_user = session_user
+    request.state.auth_token = token
+
+    if path in _PUBLIC_API_PATHS:
+        return await call_next(request)
+
+    if not session_user:
+        return JSONResponse(status_code=401, content={"detail": "未登录或登录已过期，请先登录"})
+
+    return await call_next(request)
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -186,6 +270,116 @@ async def on_startup() -> None:
     init_db(seed_demo=True)
     asyncio.create_task(_email_auto_sync_loop())
     asyncio.create_task(_bark_due_reminder_loop())
+
+
+# ---------------- Auth & Health ----------------
+
+
+@app.get("/api/health")
+def health_check() -> Dict[str, bool]:
+    return {"ok": True}
+
+
+@app.get("/api/auth/status")
+def auth_status(request: Request) -> Dict[str, Any]:
+    user = getattr(request.state, "auth_user", None)
+    with get_conn() as conn:
+        setup_required = not has_any_user(conn)
+        active_sessions = count_active_sessions(conn, user["user_id"]) if user else 0
+    return {
+        "authenticated": bool(user),
+        "setup_required": setup_required,
+        "username": user["username"] if user else None,
+        "active_sessions": active_sessions,
+    }
+
+
+@app.post("/api/auth/setup")
+def auth_setup(payload: AuthSetupRequest, request: Request, response: Response) -> Dict[str, Any]:
+    user_agent = request.headers.get("user-agent") or ""
+    with get_conn() as conn:
+        if has_any_user(conn):
+            raise HTTPException(status_code=403, detail="已完成初始化，请直接登录")
+        try:
+            user = create_user(conn, payload.username, payload.password)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        token, expires_at, max_age = create_session(conn, user["id"], user["username"], remember_me=True, user_agent=user_agent)
+
+    _set_session_cookie(response, request, token, remember_me=True, max_age=max_age)
+    return {"ok": True, "username": user["username"], "expires_at": expires_at}
+
+
+@app.post("/api/auth/login")
+def auth_login(payload: AuthLoginRequest, request: Request, response: Response) -> Dict[str, Any]:
+    ip = _client_ip(request)
+    wait_s = _login_limiter.check_blocked(ip)
+    if wait_s > 0:
+        raise HTTPException(status_code=429, detail=f"登录尝试次数过多，请 {wait_s} 秒后再试")
+
+    user_agent = request.headers.get("user-agent") or ""
+    with get_conn() as conn:
+        if not has_any_user(conn):
+            raise HTTPException(status_code=400, detail="尚未初始化管理员账号，请先设置登录密码")
+        user = authenticate_user(conn, payload.username, payload.password)
+        if not user:
+            locked_s = _login_limiter.record_failure(ip)
+            if locked_s > 0:
+                raise HTTPException(status_code=429, detail=f"密码错误次数过多，已暂时锁定 {locked_s} 秒")
+            raise HTTPException(status_code=401, detail="用户名或密码错误")
+
+        _login_limiter.reset(ip)
+        token, expires_at, max_age = create_session(
+            conn, user["id"], user["username"], remember_me=payload.remember_me, user_agent=user_agent
+        )
+
+    _set_session_cookie(response, request, token, remember_me=payload.remember_me, max_age=max_age)
+    return {"ok": True, "username": user["username"], "expires_at": expires_at}
+
+
+@app.post("/api/auth/logout")
+def auth_logout(request: Request, response: Response) -> Dict[str, bool]:
+    token = getattr(request.state, "auth_token", "")
+    if token:
+        with get_conn() as conn:
+            delete_session(conn, token)
+    response.delete_cookie(key=SESSION_COOKIE_NAME, path="/")
+    return {"ok": True}
+
+
+@app.post("/api/auth/logout-all")
+def auth_logout_all(request: Request, include_current: bool = Query(False)) -> Dict[str, Any]:
+    user = request.state.auth_user
+    token = getattr(request.state, "auth_token", "")
+    with get_conn() as conn:
+        revoked = delete_other_sessions(
+            conn,
+            user["user_id"],
+            except_raw_token=None if include_current else token,
+        )
+    return {"ok": True, "revoked_count": revoked}
+
+
+@app.post("/api/auth/change-password")
+def auth_change_password(payload: AuthChangePasswordRequest, request: Request) -> Dict[str, Any]:
+    user = request.state.auth_user
+    token = getattr(request.state, "auth_token", "")
+    with get_conn() as conn:
+        try:
+            updated = update_user_credentials(
+                conn,
+                user["user_id"],
+                current_password=payload.current_password,
+                new_password=payload.new_password,
+                new_username=payload.new_username,
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=401, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        revoked = delete_other_sessions(conn, user["user_id"], except_raw_token=token)
+    return {"ok": True, "username": updated["username"], "revoked_other_sessions": revoked}
 
 
 def _row_to_dict(row: Any) -> Dict[str, Any]:

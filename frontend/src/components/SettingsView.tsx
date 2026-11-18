@@ -1,14 +1,21 @@
 import React, { useEffect, useState } from 'react';
-import { BellRing, Bot, CheckCircle2, Database, Mail, PlugZap, Save, XCircle } from 'lucide-react';
+import { BellRing, Bot, CheckCircle2, Database, KeyRound, LogOut, Mail, PlugZap, Save, ShieldCheck, XCircle } from 'lucide-react';
 import { api } from '../api';
 import type { AppSettings } from '../types';
 
 interface Props {
+  currentUsername: string;
+  onUsernameChanged: (username: string) => void;
   onRefreshDashboard: () => void;
   onNotify: (msg: string) => void;
 }
 
-export const SettingsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }) => {
+export const SettingsView: React.FC<Props> = ({
+  currentUsername,
+  onUsernameChanged,
+  onRefreshDashboard,
+  onNotify,
+}) => {
   const [settings, setSettings] = useState<AppSettings>({});
   const [saving, setSaving] = useState(false);
   const [aiTestResult, setAiTestResult] = useState<{ ok: boolean; message: string } | null>(null);
@@ -20,9 +27,23 @@ export const SettingsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }) 
   const [emailTestResult, setEmailTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [barkTestResult, setBarkTestResult] = useState<{ ok: boolean; message: string } | null>(null);
 
+  // Account security state
+  const [newUsername, setNewUsername] = useState(currentUsername);
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmNewPassword, setConfirmNewPassword] = useState('');
+  const [updatingAuth, setUpdatingAuth] = useState(false);
+  const [activeSessions, setActiveSessions] = useState<number>(1);
+  const [authFeedback, setAuthFeedback] = useState<{ ok: boolean; message: string } | null>(null);
+
   useEffect(() => {
     api.getSettings().then(setSettings).catch(() => {});
+    api.getAuthStatus().then((st) => setActiveSessions(st.active_sessions || 1)).catch(() => {});
   }, []);
+
+  useEffect(() => {
+    setNewUsername(currentUsername);
+  }, [currentUsername]);
 
   const updateField = (key: string, value: string) => {
     setSettings((prev) => ({ ...prev, [key]: value }));
@@ -75,8 +96,71 @@ export const SettingsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }) 
     onRefreshDashboard();
   };
 
+  const handleChangeCredentials = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthFeedback(null);
+    if (!currentPassword) {
+      setAuthFeedback({ ok: false, message: '请输入当前密码进行验证' });
+      return;
+    }
+    if (newPassword && newPassword.length < 6) {
+      setAuthFeedback({ ok: false, message: '新密码长度至少需要 6 位' });
+      return;
+    }
+    if (newPassword !== confirmNewPassword) {
+      setAuthFeedback({ ok: false, message: '两次输入的新密码不一致' });
+      return;
+    }
+    const trimmedUser = newUsername.trim();
+    if (!trimmedUser) {
+      setAuthFeedback({ ok: false, message: '用户名不能为空' });
+      return;
+    }
+
+    setUpdatingAuth(true);
+    try {
+      const res = await api.changePassword({
+        current_password: currentPassword,
+        new_password: newPassword || undefined,
+        new_username: trimmedUser !== currentUsername ? trimmedUser : undefined,
+      });
+      onUsernameChanged(res.username);
+      setCurrentPassword('');
+      setNewPassword('');
+      setConfirmNewPassword('');
+      setActiveSessions(1);
+      setAuthFeedback({
+        ok: true,
+        message: `账号凭证已更新（已自动下线其他 ${res.revoked_other_sessions} 个会话）`,
+      });
+      onNotify('登录账号/密码已更新');
+    } catch (err) {
+      setAuthFeedback({
+        ok: false,
+        message: err instanceof Error ? err.message : '更新失败',
+      });
+    } finally {
+      setUpdatingAuth(false);
+    }
+  };
+
+  const handleLogoutOthers = async () => {
+    try {
+      const res = await api.logoutAll(false);
+      setActiveSessions(1);
+      setAuthFeedback({
+        ok: true,
+        message: `已下线其他 ${res.revoked_count} 台设备的登录会话`,
+      });
+      onNotify('已清理其他设备登录态');
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : '操作失败');
+    }
+  };
+
   return (
-    <form onSubmit={handleSave} className="space-y-6 max-w-4xl">
+    <div className="space-y-6 max-w-4xl">
+    <form onSubmit={handleSave} className="space-y-6">
       {/* AI Config */}
       <div className="rounded-2xl border border-slate-200/80 bg-white p-6 shadow-xs space-y-4">
         <div className="flex items-center justify-between border-b border-slate-100 pb-3">
@@ -557,5 +641,96 @@ export const SettingsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }) 
         </button>
       </div>
     </form>
+
+    {/* Account & Public Security */}
+    <form onSubmit={handleChangeCredentials} className="rounded-2xl border border-slate-200/80 bg-white p-6 shadow-xs space-y-4">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-3">
+        <div className="flex items-center gap-2">
+          <ShieldCheck className="h-5 w-5 text-indigo-600" />
+          <div>
+            <h3 className="text-base font-semibold text-slate-900">登录账号与公网访问安全</h3>
+            <p className="text-xs text-slate-500">
+              当前账号 <span className="font-medium text-slate-700">{currentUsername}</span> · 活跃登录设备/会话：{activeSessions} 个（密码错误 5 次自动锁定 5 分钟）
+            </p>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={handleLogoutOthers}
+          className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 px-3.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 cursor-pointer"
+        >
+          <LogOut className="h-3.5 w-3.5" />
+          下线其他设备
+        </button>
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        <div>
+          <label className="block text-xs font-medium text-slate-700 mb-1">登录用户名</label>
+          <input
+            type="text"
+            value={newUsername}
+            onChange={(e) => setNewUsername(e.target.value)}
+            className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm"
+          />
+        </div>
+        <div>
+          <label className="block text-xs font-medium text-slate-700 mb-1">当前密码（验证身份）*</label>
+          <input
+            type="password"
+            autoComplete="current-password"
+            value={currentPassword}
+            onChange={(e) => setCurrentPassword(e.target.value)}
+            placeholder="请输入当前登录密码"
+            className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm"
+          />
+        </div>
+        <div>
+          <label className="block text-xs font-medium text-slate-700 mb-1">新密码（不改密码可留空）</label>
+          <input
+            type="password"
+            autoComplete="new-password"
+            value={newPassword}
+            onChange={(e) => setNewPassword(e.target.value)}
+            placeholder="至少 6 位"
+            className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm"
+          />
+        </div>
+        <div>
+          <label className="block text-xs font-medium text-slate-700 mb-1">确认新密码</label>
+          <input
+            type="password"
+            autoComplete="new-password"
+            value={confirmNewPassword}
+            onChange={(e) => setConfirmNewPassword(e.target.value)}
+            placeholder="再次输入新密码"
+            className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm"
+          />
+        </div>
+      </div>
+
+      {authFeedback && (
+        <div
+          className={`flex items-center gap-2 rounded-xl px-4 py-2.5 text-xs ${
+            authFeedback.ok ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-700'
+          }`}
+        >
+          {authFeedback.ok ? <CheckCircle2 className="h-4 w-4" /> : <XCircle className="h-4 w-4" />}
+          <span>{authFeedback.message}</span>
+        </div>
+      )}
+
+      <div className="flex justify-end">
+        <button
+          type="submit"
+          disabled={updatingAuth}
+          className="inline-flex items-center gap-1.5 rounded-xl border border-indigo-200 bg-indigo-50 px-4 py-2 text-xs font-medium text-indigo-700 hover:bg-indigo-100 cursor-pointer"
+        >
+          <KeyRound className="h-3.5 w-3.5" />
+          {updatingAuth ? '更新中...' : '修改用户名 / 密码'}
+        </button>
+      </div>
+    </form>
+    </div>
   );
 };

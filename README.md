@@ -91,4 +91,4 @@ docker compose up -d --build
 - **数据持久化**：SQLite 数据库自动保存在项目同级 `./data/life_hub.db`（映射到容器 `/app/backend/data`）。如需迁移本机已有数据，将本机 `backend/data/life_hub.db` 复制到 `./data/life_hub.db` 即可。
 - **更新版本**：执行 `git pull && docker compose up -d --build`，数据卷不受影响。
 - **思源笔记连接**：容器内建议使用「直连思源内核 API (`siyuan_api`)」，地址填写 NAS/宿主机局域网 IP（如 `http://192.168.1.x:6806`）。
-- **外网访问安全**：项目无内置登录鉴权，建议配合 **Tailscale** 或 NAS 内网 VPN 使用，避免将 `8000` 端口直接暴露到公网。
+- **外网访问安全**：已内置登录鉴权（PBKDF2 密码哈希 + `HttpOnly` 会话 Cookie + 登录防爆破锁定）。首次启动可通过页面向导初始化管理员账号，或在部署到公网前直接通过环境变量预设初始账号密码：`LIFEHUB_AUTH_USERNAME`（默认 `admin`）与 `LIFEHUB_AUTH_PASSWORD`；公网部署请务必配合 HTTPS 反向代理（如 Nginx / Caddy / Cloudflare）。

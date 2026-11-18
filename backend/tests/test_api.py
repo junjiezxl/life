@@ -23,6 +23,76 @@ class TestLifeHubAPI(unittest.TestCase):
         if os.path.exists(tmp_db.name):
             os.remove(tmp_db.name)
 
+    def test_00_auth_setup_login_and_protection(self):
+        # Unauthenticated requests to protected APIs must be rejected
+        self.assertEqual(self.client.get("/api/health").status_code, 200)
+        self.assertEqual(self.client.get("/api/dashboard").status_code, 401)
+        self.assertEqual(self.client.get("/api/settings").status_code, 401)
+
+        st0 = self.client.get("/api/auth/status")
+        self.assertEqual(st0.status_code, 200)
+        self.assertFalse(st0.json()["authenticated"])
+        self.assertTrue(st0.json()["setup_required"])
+
+        # First-time setup
+        setup_resp = self.client.post(
+            "/api/auth/setup",
+            json={"username": "admin", "password": "initial_password_123"},
+        )
+        self.assertEqual(setup_resp.status_code, 200)
+        self.assertEqual(setup_resp.json()["username"], "admin")
+
+        # Subsequent setup must be forbidden
+        second_setup = self.client.post(
+            "/api/auth/setup",
+            json={"username": "hacker", "password": "hack_password_123"},
+        )
+        self.assertEqual(second_setup.status_code, 403)
+
+        # Separate client tests brute-force rate limiting & login
+        anon = TestClient(app)
+        for _ in range(4):
+            bad = anon.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "wrong_password"},
+                headers={"x-forwarded-for": "198.51.100.42"},
+            )
+            self.assertEqual(bad.status_code, 401)
+        locked = anon.post(
+            "/api/auth/login",
+            json={"username": "admin", "password": "wrong_password"},
+            headers={"x-forwarded-for": "198.51.100.42"},
+        )
+        self.assertEqual(locked.status_code, 429)
+
+        # Login from normal IP succeeds
+        ok_login = anon.post(
+            "/api/auth/login",
+            json={"username": "admin", "password": "initial_password_123", "remember_me": True},
+            headers={"x-forwarded-for": "198.51.100.99"},
+        )
+        self.assertEqual(ok_login.status_code, 200)
+        self.assertEqual(anon.get("/api/dashboard").status_code, 200)
+
+        # Change password on self.client revokes anon's session
+        chg = self.client.post(
+            "/api/auth/change-password",
+            json={"current_password": "initial_password_123", "new_password": "new_password_456"},
+        )
+        self.assertEqual(chg.status_code, 200)
+        self.assertGreaterEqual(chg.json()["revoked_other_sessions"], 1)
+        self.assertEqual(anon.get("/api/dashboard").status_code, 401)
+
+        # Logout and re-login with new password on self.client
+        self.assertEqual(self.client.post("/api/auth/logout").status_code, 200)
+        self.assertEqual(self.client.get("/api/dashboard").status_code, 401)
+        relogin = self.client.post(
+            "/api/auth/login",
+            json={"username": "admin", "password": "new_password_456", "remember_me": True},
+            headers={"x-forwarded-for": "198.51.100.99"},
+        )
+        self.assertEqual(relogin.status_code, 200)
+
     def test_01_dashboard_seeded(self):
         resp = self.client.get("/api/dashboard")
         self.assertEqual(resp.status_code, 200)
