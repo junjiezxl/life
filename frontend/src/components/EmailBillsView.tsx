@@ -1,0 +1,527 @@
+import React, { useEffect, useState } from 'react';
+import {
+  AlertCircle,
+  CheckSquare,
+  Download,
+  FileSpreadsheet,
+  Inbox,
+  Mail,
+  RefreshCw,
+  Sparkles,
+  Square,
+  Upload,
+} from 'lucide-react';
+import { api } from '../api';
+import type {
+  Account,
+  EmailScanSummary,
+  EmailSyncLog,
+  NoteCandidate,
+  ParsedBillTransaction,
+} from '../types';
+import { formatMoney, SOURCE_META } from '../utils/format';
+
+interface Props {
+  onRefreshDashboard: () => void;
+  onNotify: (msg: string) => void;
+}
+
+export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }) => {
+  const [days, setDays] = useState(14);
+  const [keyword, setKeyword] = useState('');
+  const [zipPassword, setZipPassword] = useState('');
+  const [unreadOnly, setUnreadOnly] = useState(false);
+  const [includeBodyAi, setIncludeBodyAi] = useState(true);
+  const [scanning, setScanning] = useState(false);
+
+  const [accounts, setAccounts] = useState<Account[]>([]);
+  const [targetAccountId, setTargetAccountId] = useState<string>('');
+
+  const [emails, setEmails] = useState<EmailScanSummary[]>([]);
+  const [txCandidates, setTxCandidates] = useState<ParsedBillTransaction[]>([]);
+  const [txSelected, setTxSelected] = useState<Record<number, boolean>>({});
+  const [remCandidates, setRemCandidates] = useState<NoteCandidate[]>([]);
+  const [remSelected, setRemSelected] = useState<Record<number, boolean>>({});
+  const [warnings, setWarnings] = useState<string[]>([]);
+  const [importing, setImporting] = useState(false);
+
+  // Manual paste email test
+  const [pasteSubject, setPasteSubject] = useState('');
+  const [pasteBody, setPasteBody] = useState('');
+  const [parsingText, setParsingText] = useState(false);
+
+  // Sync logs
+  const [logs, setLogs] = useState<EmailSyncLog[]>([]);
+
+  const loadMeta = async () => {
+    try {
+      const [accRes, logRes] = await Promise.all([api.listAccounts(), api.listEmailLogs()]);
+      setAccounts(accRes.accounts);
+      if (!targetAccountId && accRes.accounts.length > 0) {
+        setTargetAccountId(String(accRes.accounts[0].id));
+      }
+      setLogs(logRes);
+    } catch {
+      // ignore
+    }
+  };
+
+  useEffect(() => {
+    loadMeta();
+  }, []);
+
+  const populateCandidates = (
+    txs: ParsedBillTransaction[],
+    rems: NoteCandidate[],
+    append = false,
+  ) => {
+    if (append) {
+      setTxCandidates((prev) => {
+        const next = [...prev, ...txs];
+        const sel: Record<number, boolean> = { ...txSelected };
+        txs.forEach((t, offset) => {
+          sel[prev.length + offset] = !t.already_imported;
+        });
+        setTxSelected(sel);
+        return next;
+      });
+      setRemCandidates((prev) => {
+        const next = [...prev, ...rems];
+        const sel: Record<number, boolean> = { ...remSelected };
+        rems.forEach((_, offset) => {
+          sel[prev.length + offset] = true;
+        });
+        setRemSelected(sel);
+        return next;
+      });
+      return;
+    }
+
+    setTxCandidates(txs);
+    const tSel: Record<number, boolean> = {};
+    txs.forEach((t, idx) => {
+      tSel[idx] = !t.already_imported;
+    });
+    setTxSelected(tSel);
+
+    setRemCandidates(rems);
+    const rSel: Record<number, boolean> = {};
+    rems.forEach((_, idx) => {
+      rSel[idx] = true;
+    });
+    setRemSelected(rSel);
+  };
+
+  const handleScanInbox = async () => {
+    setScanning(true);
+    setWarnings([]);
+    try {
+      const res = await api.fetchParseEmails({
+        days,
+        limit: 30,
+        keyword,
+        zip_password: zipPassword,
+        include_body_ai: includeBodyAi,
+        unread_only: unreadOnly,
+      });
+      setEmails(res.emails || []);
+      setWarnings(res.warnings || []);
+      populateCandidates(res.transactions || [], res.reminders || [], false);
+      onNotify(
+        `已扫描 ${res.emails.length} 封邮件，识别出 ${res.transactions.length} 笔账目与 ${res.reminders.length} 条提醒`,
+      );
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : '扫描邮箱失败');
+    } finally {
+      setScanning(false);
+    }
+  };
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const res = await api.parseBillUpload(file, zipPassword);
+      setWarnings(res.errors || []);
+      populateCandidates(res.transactions || [], [], true);
+      onNotify(`已从 ${file.name} 解析出 ${res.transactions.length} 笔账目`);
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : '账单文件解析失败');
+    } finally {
+      e.target.value = '';
+    }
+  };
+
+  const handleParsePaste = async () => {
+    if (!pasteBody.trim()) return;
+    setParsingText(true);
+    try {
+      const res = await api.parseEmailText({
+        subject: pasteSubject.trim() || '邮件通知',
+        sender: '手动粘贴',
+        body: pasteBody.trim(),
+      });
+      populateCandidates(res.transactions || [], res.reminders || [], true);
+      onNotify(`从正文识别出 ${res.transactions.length} 笔账目、${res.reminders.length} 条提醒`);
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : '解析失败');
+    } finally {
+      setParsingText(false);
+    }
+  };
+
+  const handleCommitImport = async () => {
+    const pickedTxs = txCandidates.filter((_, idx) => txSelected[idx]);
+    const pickedRems = remCandidates.filter((_, idx) => remSelected[idx]);
+    if (pickedTxs.length === 0 && pickedRems.length === 0) {
+      onNotify('请先勾选至少一条账目或提醒');
+      return;
+    }
+    setImporting(true);
+    try {
+      const res = await api.importEmailItems({
+        transactions: pickedTxs,
+        reminders: pickedRems,
+        account_id: targetAccountId ? Number(targetAccountId) : null,
+        skip_duplicates: true,
+        email_logs: emails.map((em) => ({
+          message_uid: em.uid,
+          subject: em.subject,
+          sender: em.sender,
+          received_at: em.received_at,
+          tx_imported: em.parsed_tx_count,
+          rem_imported: em.parsed_rem_count,
+        })),
+      });
+      onNotify(
+        `导入完成：新增 ${res.imported_tx_count} 笔账目（跳过重复 ${res.skipped_duplicate_count} 笔），新增 ${res.imported_rem_count} 条提醒`,
+      );
+      setTxCandidates([]);
+      setRemCandidates([]);
+      setTxSelected({});
+      setRemSelected({});
+      await loadMeta();
+      onRefreshDashboard();
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : '导入失败');
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      {/* Top Bar: IMAP Scan + File Upload */}
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
+        <div className="lg:col-span-8 rounded-2xl border border-slate-200/80 bg-white p-5 shadow-xs space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <Mail className="h-5 w-5 text-sky-600" />
+              <div>
+                <h2 className="text-base font-semibold text-slate-900">自动扫描解析邮箱数据 (IMAP)</h2>
+                <p className="text-xs text-slate-500">
+                  自动解析邮件附件里的支付宝/微信账单（.zip/.csv/.xlsx），以及正文中的信用卡账单、缴费与行程提醒
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-4">
+            <select
+              value={days}
+              onChange={(e) => setDays(Number(e.target.value))}
+              className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs"
+            >
+              <option value={7}>最近 7 天邮件</option>
+              <option value={14}>最近 14 天邮件</option>
+              <option value={30}>最近 30 天邮件</option>
+              <option value={90}>最近 90 天邮件</option>
+            </select>
+            <input
+              type="text"
+              value={keyword}
+              onChange={(e) => setKeyword(e.target.value)}
+              placeholder="关键词过滤（如 支付宝/账单）"
+              className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs"
+            />
+            <input
+              type="password"
+              value={zipPassword}
+              onChange={(e) => setZipPassword(e.target.value)}
+              placeholder="账单压缩包解压密码（可选）"
+              className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs"
+            />
+            <button
+              onClick={handleScanInbox}
+              disabled={scanning}
+              className="inline-flex items-center justify-center gap-1.5 rounded-xl bg-sky-600 px-4 py-2 text-xs font-medium text-white hover:bg-sky-700 disabled:opacity-50 cursor-pointer"
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${scanning ? 'animate-spin' : ''}`} />
+              {scanning ? '正在拉取解析...' : '扫描邮箱并解析'}
+            </button>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-5 text-xs text-slate-600">
+            <label className="inline-flex items-center gap-1.5 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={includeBodyAi}
+                onChange={(e) => setIncludeBodyAi(e.target.checked)}
+              />
+              <span>AI 解析邮件正文（信用卡账单 / 缴费 / 行程 / 消费通知）</span>
+            </label>
+            <label className="inline-flex items-center gap-1.5 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={unreadOnly}
+                onChange={(e) => setUnreadOnly(e.target.checked)}
+              />
+              <span>仅扫描未读邮件</span>
+            </label>
+          </div>
+        </div>
+
+        {/* Local Alipay/WeChat File Upload */}
+        <div className="lg:col-span-4 rounded-2xl border border-slate-200/80 bg-white p-5 shadow-xs flex flex-col justify-between">
+          <div>
+            <div className="flex items-center gap-2">
+              <FileSpreadsheet className="h-5 w-5 text-emerald-600" />
+              <h3 className="text-base font-semibold text-slate-900">本地账单文件直传</h3>
+            </div>
+            <p className="mt-1 text-xs text-slate-500">
+              直接上传支付宝/微信导出的 <code className="text-slate-700">.csv</code>、<code className="text-slate-700">.xlsx</code> 或加密 <code className="text-slate-700">.zip</code>
+            </p>
+          </div>
+
+          <label className="mt-4 flex flex-col items-center justify-center rounded-xl border-2 border-dashed border-slate-200 bg-slate-50/80 py-5 px-4 text-center hover:border-emerald-400 hover:bg-emerald-50/30 transition cursor-pointer">
+            <Upload className="h-5 w-5 text-emerald-600 mb-1.5" />
+            <span className="text-xs font-medium text-slate-700">点击选择账单文件（支持多平台自动识别）</span>
+            <span className="text-[11px] text-slate-400 mt-0.5">需密码时请先在左侧填入解压密码</span>
+            <input type="file" accept=".csv,.xlsx,.zip" onChange={handleFileUpload} className="hidden" />
+          </label>
+        </div>
+      </div>
+
+      {warnings.length > 0 && (
+        <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-xs text-amber-800 space-y-1">
+          {warnings.map((w, i) => (
+            <div key={i} className="flex items-start gap-2">
+              <AlertCircle className="h-4 w-4 shrink-0 mt-0.5 text-amber-600" />
+              <span>{w}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Main Review Area */}
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
+        {/* Left 4 cols: Scanned Emails + Paste Text Tester */}
+        <div className="lg:col-span-4 space-y-5">
+          <div className="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-xs">
+            <div className="flex items-center gap-2 border-b border-slate-100 pb-3">
+              <Inbox className="h-4 w-4 text-slate-600" />
+              <h3 className="text-sm font-semibold text-slate-900">本次扫描邮件 ({emails.length})</h3>
+            </div>
+            <div className="mt-3 space-y-2.5 max-h-[280px] overflow-y-auto pr-1">
+              {emails.length === 0 ? (
+                <p className="py-8 text-center text-xs text-slate-400">
+                  请先在「系统设置」配置邮箱 IMAP 后点击扫描
+                </p>
+              ) : (
+                emails.map((em) => (
+                  <div key={em.uid} className="rounded-xl border border-slate-100 bg-slate-50/70 p-3 text-xs">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-medium text-slate-900 truncate">{em.subject}</span>
+                      {em.already_synced && (
+                        <span className="rounded bg-slate-200 px-1.5 py-0.5 text-[10px] text-slate-600 shrink-0">
+                          曾同步
+                        </span>
+                      )}
+                    </div>
+                    <div className="mt-1 text-[11px] text-slate-400 truncate">{em.sender} · {em.received_at}</div>
+                    {em.attachments.length > 0 && (
+                      <div className="mt-1 text-[11px] text-sky-700">附件：{em.attachments.join(', ')}</div>
+                    )}
+                    <div className="mt-1 text-[11px] text-slate-600">
+                      识别：{em.parsed_tx_count} 笔账目 / {em.parsed_rem_count} 条提醒
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+
+          {/* Manual Email Paste */}
+          <div className="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-xs space-y-3">
+            <h3 className="text-sm font-semibold text-slate-900">粘贴邮件正文快速测试</h3>
+            <input
+              type="text"
+              value={pasteSubject}
+              onChange={(e) => setPasteSubject(e.target.value)}
+              placeholder="邮件主题（如：招商银行信用卡11月电子账单）"
+              className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs"
+            />
+            <textarea
+              rows={4}
+              value={pasteBody}
+              onChange={(e) => setPasteBody(e.target.value)}
+              placeholder="粘贴银行账单、消费小票、缴费通知或机票行程邮件正文..."
+              className="w-full rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs"
+            />
+            <button
+              onClick={handleParsePaste}
+              disabled={parsingText || !pasteBody.trim()}
+              className="w-full inline-flex items-center justify-center gap-1.5 rounded-xl bg-indigo-600 py-2 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50 cursor-pointer"
+            >
+              <Sparkles className="h-3.5 w-3.5" />
+              {parsingText ? 'AI 解析中...' : '智能解析该邮件'}
+            </button>
+          </div>
+        </div>
+
+        {/* Right 8 cols: Extracted Transactions & Reminders Preview */}
+        <div className="lg:col-span-8 rounded-2xl border border-slate-200/80 bg-white p-5 shadow-xs space-y-5">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-3">
+            <div>
+              <h3 className="text-base font-semibold text-slate-900">
+                待确认入账流水 ({txCandidates.length}) & 提醒 ({remCandidates.length})
+              </h3>
+              <p className="text-xs text-slate-500">已自动检测并默认取消勾选重复流水（基于交易单号指纹去重）</p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <select
+                value={targetAccountId}
+                onChange={(e) => setTargetAccountId(e.target.value)}
+                className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs"
+              >
+                <option value="">入账账户：不绑定特定账户</option>
+                {accounts.map((a) => (
+                  <option key={a.id} value={a.id}>入账到：{a.name}</option>
+                ))}
+              </select>
+              <button
+                onClick={handleCommitImport}
+                disabled={importing || (txCandidates.length === 0 && remCandidates.length === 0)}
+                className="inline-flex items-center gap-1.5 rounded-xl bg-slate-900 px-4 py-2 text-xs font-medium text-white hover:bg-slate-800 disabled:opacity-40 cursor-pointer"
+              >
+                <Download className="h-3.5 w-3.5" />
+                {importing ? '正在导入...' : '一键确认入账并导入提醒'}
+              </button>
+            </div>
+          </div>
+
+          {/* Reminders candidates */}
+          {remCandidates.length > 0 && (
+            <div className="space-y-2">
+              <div className="text-xs font-semibold text-indigo-700">识别到的待办 / 账单提醒 ({remCandidates.length})</div>
+              {remCandidates.map((rem, idx) => (
+                <div
+                  key={idx}
+                  className="flex items-start gap-2.5 rounded-xl border border-indigo-100 bg-indigo-50/40 p-3 text-xs"
+                >
+                  <button
+                    type="button"
+                    onClick={() => setRemSelected((p) => ({ ...p, [idx]: !p[idx] }))}
+                    className="mt-0.5 text-indigo-600 cursor-pointer"
+                  >
+                    {remSelected[idx] ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4 text-slate-400" />}
+                  </button>
+                  <div className="flex-1">
+                    <div className="font-medium text-slate-900">{rem.title}</div>
+                    <div className="text-slate-500 mt-0.5">{rem.description}</div>
+                    <div className="mt-1 flex gap-3 text-[11px] text-slate-400">
+                      <span>到期：{rem.due_at || '未指定'}</span>
+                      {rem.linked_amount && <span className="text-orange-600 font-medium">金额 {formatMoney(rem.linked_amount)}</span>}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Transactions candidates */}
+          <div className="space-y-2 max-h-[420px] overflow-y-auto pr-1">
+            {txCandidates.length === 0 ? (
+              <div className="rounded-xl bg-slate-50 py-14 text-center text-xs text-slate-400">
+                暂无待确认账目。可通过上方「扫描邮箱」、上传支付宝/微信账单文件或粘贴邮件正文来提取。
+              </div>
+            ) : (
+              txCandidates.map((tx, idx) => {
+                const src = SOURCE_META[tx.source_type] || SOURCE_META.bill_import;
+                const checked = Boolean(txSelected[idx]);
+                return (
+                  <div
+                    key={idx}
+                    className={`flex items-center justify-between gap-3 rounded-xl border px-3.5 py-2.5 text-xs transition ${
+                      tx.already_imported
+                        ? 'border-slate-100 bg-slate-50 opacity-55'
+                        : checked
+                          ? 'border-sky-200 bg-sky-50/30'
+                          : 'border-slate-200 bg-white'
+                    }`}
+                  >
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <button
+                        type="button"
+                        onClick={() => setTxSelected((p) => ({ ...p, [idx]: !p[idx] }))}
+                        className="text-sky-600 cursor-pointer shrink-0"
+                      >
+                        {checked ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4 text-slate-400" />}
+                      </button>
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${src.cls}`}>{src.label}</span>
+                          <span className="font-medium text-slate-900 truncate max-w-[260px]">{tx.description}</span>
+                          {tx.already_imported && (
+                            <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700">
+                              已存在（自动去重）
+                            </span>
+                          )}
+                        </div>
+                        <div className="mt-0.5 text-[11px] text-slate-400">{tx.occurred_at}</div>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-2.5 shrink-0">
+                      <select
+                        value={tx.category}
+                        onChange={(e) =>
+                          setTxCandidates((prev) =>
+                            prev.map((item, i) => (i === idx ? { ...item, category: e.target.value } : item)),
+                          )
+                        }
+                        className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-[11px]"
+                      >
+                        {['餐饮', '交通', '购物', '住房', '订阅服务', '通讯', '医疗', '娱乐', '工资收入', '报销回款', '理财收益', '其他', '其他收入'].map(
+                          (c) => (
+                            <option key={c} value={c}>{c}</option>
+                          ),
+                        )}
+                      </select>
+                      <span className={`font-semibold w-20 text-right ${tx.type === 'income' ? 'text-emerald-600' : 'text-slate-900'}`}>
+                        {tx.type === 'income' ? `+${formatMoney(tx.amount)}` : `-${formatMoney(tx.amount)}`}
+                      </span>
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+
+          {logs.length > 0 && (
+            <div className="border-t border-slate-100 pt-3">
+              <div className="text-xs font-medium text-slate-500 mb-2">最近邮件同步归档记录</div>
+              <div className="flex flex-wrap gap-2">
+                {logs.slice(0, 6).map((l) => (
+                  <span key={l.id} className="rounded-lg bg-slate-100 px-2.5 py-1 text-[11px] text-slate-600">
+                    {l.subject.slice(0, 22)}（账目 {l.tx_imported} / 提醒 {l.rem_imported}）
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};

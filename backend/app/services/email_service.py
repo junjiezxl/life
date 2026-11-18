@@ -1,0 +1,318 @@
+import email
+import hashlib
+import html
+import imaplib
+import re
+from datetime import datetime, timedelta
+from email.header import decode_header
+from email.message import Message
+from email.utils import parsedate_to_datetime
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from .ai_service import extract_from_email_content
+from .bill_parser import parse_bill_file
+
+
+def _decode_mime_str(raw: Optional[str]) -> str:
+    if not raw:
+        return ""
+    parts = decode_header(raw)
+    decoded: List[str] = []
+    for chunk, charset in parts:
+        if isinstance(chunk, bytes):
+            enc = charset or "utf-8"
+            try:
+                decoded.append(chunk.decode(enc, errors="ignore"))
+            except LookupError:
+                decoded.append(chunk.decode("utf-8", errors="ignore"))
+        else:
+            decoded.append(str(chunk))
+    return "".join(decoded).strip()
+
+
+def _html_to_text(raw_html: str) -> str:
+    text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", raw_html)
+    text = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>|</li>", "\n", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _parse_email_date(date_hdr: Optional[str]) -> str:
+    if not date_hdr:
+        return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
+    try:
+        dt = parsedate_to_datetime(date_hdr)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone()
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def _extract_body_and_attachments(msg: Message) -> Tuple[str, List[Tuple[str, bytes]]]:
+    plain_parts: List[str] = []
+    html_parts: List[str] = []
+    attachments: List[Tuple[str, bytes]] = []
+
+    if msg.is_multipart():
+        for part in msg.walk():
+            cdisp = str(part.get("Content-Disposition") or "").lower()
+            ctype = (part.get_content_type() or "").lower()
+            raw_fname = part.get_filename()
+            filename = _decode_mime_str(raw_fname) if raw_fname else ""
+
+            if filename or "attachment" in cdisp:
+                payload = part.get_payload(decode=True)
+                if payload and filename:
+                    attachments.append((filename, payload))
+                continue
+
+            if ctype == "text/plain":
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset() or "utf-8"
+                    try:
+                        plain_parts.append(payload.decode(charset, errors="ignore"))
+                    except LookupError:
+                        plain_parts.append(payload.decode("utf-8", errors="ignore"))
+            elif ctype == "text/html":
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset() or "utf-8"
+                    try:
+                        html_parts.append(payload.decode(charset, errors="ignore"))
+                    except LookupError:
+                        html_parts.append(payload.decode("utf-8", errors="ignore"))
+    else:
+        payload = msg.get_payload(decode=True)
+        if payload:
+            charset = msg.get_content_charset() or "utf-8"
+            try:
+                txt = payload.decode(charset, errors="ignore")
+            except LookupError:
+                txt = payload.decode("utf-8", errors="ignore")
+            if (msg.get_content_type() or "").lower() == "text/html":
+                html_parts.append(txt)
+            else:
+                plain_parts.append(txt)
+
+    body = "\n".join(p.strip() for p in plain_parts if p.strip())
+    if not body and html_parts:
+        body = _html_to_text("\n".join(html_parts))
+    return body, attachments
+
+
+def _connect_imap(settings: Dict[str, str]) -> imaplib.IMAP4:
+    host = (settings.get("email_imap_host") or "").strip()
+    port = int(settings.get("email_imap_port") or 993)
+    username = (settings.get("email_username") or "").strip()
+    password = (settings.get("email_password") or "").strip()
+    use_ssl = settings.get("email_use_ssl", "1") != "0"
+
+    if not host or not username or not password:
+        raise ValueError("请先在「系统设置」填写邮箱 IMAP 服务器、邮箱账号和授权码。")
+
+    if use_ssl:
+        client: imaplib.IMAP4 = imaplib.IMAP4_SSL(host, port, timeout=15)
+    else:
+        client = imaplib.IMAP4(host, port, timeout=15)
+    client.login(username, password)
+    return client
+
+
+def test_imap_connection(settings: Dict[str, str]) -> Dict[str, Any]:
+    try:
+        client = _connect_imap(settings)
+        try:
+            status, data = client.select("INBOX", readonly=True)
+            msg_count = int(data[0].decode()) if status == "OK" and data and data[0] else 0
+            return {
+                "ok": True,
+                "message": f"邮箱连接成功！收件箱共有 {msg_count} 封邮件。",
+                "inbox_count": msg_count,
+            }
+        finally:
+            try:
+                client.logout()
+            except Exception:
+                pass
+    except Exception as exc:
+        err = str(exc)
+        hint = ""
+        if "login" in err.lower() or "auth" in err.lower() or "password" in err.lower():
+            hint = "（提示：QQ邮箱/163邮箱/Gmail 请使用「IMAP 专用授权码 / App Password」，而不是登录密码。）"
+        return {"ok": False, "message": f"邮箱连接失败: {err} {hint}".strip(), "inbox_count": 0}
+
+
+def _fetch_raw_emails_sync(
+    settings: Dict[str, str],
+    days: int = 14,
+    limit: int = 25,
+    unread_only: bool = False,
+) -> List[Dict[str, Any]]:
+    client = _connect_imap(settings)
+    fetched: List[Dict[str, Any]] = []
+    try:
+        status, _ = client.select("INBOX", readonly=True)
+        if status != "OK":
+            raise RuntimeError("无法打开收件箱 INBOX")
+
+        since_date = (datetime.now() - timedelta(days=days)).strftime("%d-%b-%Y")
+        criteria = f'(UNSEEN SINCE "{since_date}")' if unread_only else f'(SINCE "{since_date}")'
+        typ, data = client.uid("search", None, criteria)
+        if typ != "OK" or not data or not data[0]:
+            return []
+
+        uids = data[0].split()
+        # Most recent first
+        selected_uids = list(reversed(uids))[:limit]
+
+        for uid_bytes in selected_uids:
+            uid_str = uid_bytes.decode("utf-8", errors="ignore")
+            typ_f, msg_data = client.uid("fetch", uid_bytes, "(RFC822)")
+            if typ_f != "OK" or not msg_data:
+                continue
+            raw_bytes: Optional[bytes] = None
+            for part in msg_data:
+                if isinstance(part, tuple) and len(part) >= 2 and isinstance(part[1], (bytes, bytearray)):
+                    raw_bytes = bytes(part[1])
+                    break
+            if not raw_bytes:
+                continue
+
+            msg = email.message_from_bytes(raw_bytes)
+            subject = _decode_mime_str(msg.get("Subject"))
+            sender = _decode_mime_str(msg.get("From"))
+            received_at = _parse_email_date(msg.get("Date"))
+            message_id = (msg.get("Message-ID") or "").strip() or f"uid:{uid_str}"
+            body, attachments = _extract_body_and_attachments(msg)
+
+            fetched.append(
+                {
+                    "uid": message_id,
+                    "imap_uid": uid_str,
+                    "subject": subject or "(无主题)",
+                    "sender": sender,
+                    "received_at": received_at,
+                    "body": body,
+                    "attachments": attachments,
+                }
+            )
+    finally:
+        try:
+            client.logout()
+        except Exception:
+            pass
+    return fetched
+
+
+async def fetch_and_parse_emails(
+    settings: Dict[str, str],
+    existing_refs: Set[str],
+    synced_uids: Set[str],
+    days: int = 14,
+    limit: int = 25,
+    keyword: str = "",
+    zip_password: str = "",
+    include_body_ai: bool = True,
+    unread_only: bool = False,
+    skip_already_synced: bool = False,
+) -> Dict[str, Any]:
+    effective_zip_pwd = zip_password or settings.get("email_bill_zip_password") or ""
+    raw_emails = _fetch_raw_emails_sync(settings, days=days, limit=limit, unread_only=unread_only)
+
+    kw_lower = keyword.strip().lower()
+    email_summaries: List[Dict[str, Any]] = []
+    all_txs: List[Dict[str, Any]] = []
+    all_reminders: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+
+    for item in raw_emails:
+        uid = item["uid"]
+        if skip_already_synced and uid in synced_uids:
+            continue
+
+        subject = item["subject"]
+        sender = item["sender"]
+        body = item["body"]
+        attachments: List[Tuple[str, bytes]] = item["attachments"]
+        att_names = [a[0] for a in attachments]
+
+        if kw_lower:
+            haystack = f"{subject} {sender} {' '.join(att_names)} {body[:600]}".lower()
+            if kw_lower not in haystack:
+                continue
+
+        email_tx_count = 0
+        email_rem_count = 0
+
+        # 1. Parse bill attachments (.zip / .csv / .xlsx)
+        for fname, raw_bytes in attachments:
+            lower_fn = fname.lower()
+            if not lower_fn.endswith((".zip", ".csv", ".xlsx")):
+                continue
+            parsed = parse_bill_file(
+                raw_bytes,
+                fname,
+                zip_password=effective_zip_pwd,
+                existing_refs=existing_refs,
+            )
+            if parsed["errors"]:
+                warnings.extend(parsed["errors"])
+            for tx in parsed["transactions"]:
+                tx["email_subject"] = subject
+                tx["email_uid"] = uid
+                all_txs.append(tx)
+                email_tx_count += 1
+
+        # 2. Parse email body for bills / itineraries / reminders
+        should_parse_body = include_body_ai and bool(body.strip()) and (
+            email_tx_count == 0
+            or any(k in subject for k in ("账单", "还款", "行程", "机票", "火车", "缴费", "提醒", "发票", "工资"))
+        )
+        if should_parse_body:
+            body_res = await extract_from_email_content(
+                subject=subject,
+                sender=sender,
+                received_at=item["received_at"],
+                body_text=body,
+                settings=settings,
+            )
+            for tx in body_res.get("transactions", []):
+                fp_raw = f"email|{uid}|{tx.get('amount')}|{tx.get('description')}"
+                ext_ref = "email:" + hashlib.sha256(fp_raw.encode("utf-8")).hexdigest()[:16]
+                tx["external_ref"] = ext_ref
+                tx["already_imported"] = ext_ref in existing_refs
+                tx["email_subject"] = subject
+                tx["email_uid"] = uid
+                all_txs.append(tx)
+                email_tx_count += 1
+
+            for rem in body_res.get("reminders", []):
+                rem["email_subject"] = subject
+                rem["email_uid"] = uid
+                all_reminders.append(rem)
+                email_rem_count += 1
+
+        email_summaries.append(
+            {
+                "uid": uid,
+                "subject": subject,
+                "sender": sender,
+                "received_at": item["received_at"],
+                "attachments": att_names,
+                "already_synced": uid in synced_uids,
+                "parsed_tx_count": email_tx_count,
+                "parsed_rem_count": email_rem_count,
+            }
+        )
+
+    return {
+        "emails": email_summaries,
+        "transactions": all_txs,
+        "reminders": all_reminders,
+        "warnings": list(dict.fromkeys(warnings)),
+    }
