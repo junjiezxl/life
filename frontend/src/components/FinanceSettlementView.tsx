@@ -58,6 +58,7 @@ export const FinanceSettlementView: React.FC<Props> = ({ onRefreshDashboard, onN
   const [regeneratingId, setRegeneratingId] = useState<number | null>(null);
   const [expandedSettlementId, setExpandedSettlementId] = useState<number | null>(null);
   const [settlementDetailLoading, setSettlementDetailLoading] = useState(false);
+  const [settlementDetailError, setSettlementDetailError] = useState<string | null>(null);
   const [settlementDetailTxs, setSettlementDetailTxs] = useState<Transaction[]>([]);
   const [settlementCategoryStats, setSettlementCategoryStats] = useState<SettlementCategoryStat[]>([]);
   const [detailCategoryFilter, setDetailCategoryFilter] = useState<string>('ALL');
@@ -168,12 +169,17 @@ export const FinanceSettlementView: React.FC<Props> = ({ onRefreshDashboard, onN
 
   const loadSettlementDetails = async (settlementId: number) => {
     setSettlementDetailLoading(true);
+    setSettlementDetailError(null);
     try {
       const res = await api.getSettlementTransactions(settlementId);
       setSettlementDetailTxs(res.transactions);
       setSettlementCategoryStats(res.category_stats);
     } catch (err) {
-      onNotify(err instanceof Error ? err.message : '加载结账明细失败');
+      const msg = err instanceof Error ? err.message : '加载结账明细失败';
+      setSettlementDetailError(msg);
+      setSettlementDetailTxs([]);
+      setSettlementCategoryStats([]);
+      onNotify(msg);
     } finally {
       setSettlementDetailLoading(false);
     }
@@ -648,6 +654,10 @@ export const FinanceSettlementView: React.FC<Props> = ({ onRefreshDashboard, onN
 
                           {settlementDetailLoading ? (
                             <div className="py-6 text-center text-xs text-slate-400">正在加载流水明细...</div>
+                          ) : settlementDetailError ? (
+                            <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-3 text-xs text-rose-700">
+                              加载明细失败：{settlementDetailError}（若刚更新过代码，请重启后端服务后再试）
+                            </div>
                           ) : (
                             <>
                               <div className="flex flex-wrap gap-1.5">
