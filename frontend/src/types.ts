@@ -71,6 +71,13 @@ export interface Settlement {
   created_at: string;
 }
 
+export interface SettlementCategoryStat {
+  type: 'expense' | 'income' | 'transfer';
+  category: string;
+  count: number;
+  total: number;
+}
+
 export interface ChatAction {
   kind: 'reminder' | 'transaction';
   id: number;

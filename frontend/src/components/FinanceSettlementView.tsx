@@ -1,11 +1,17 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   BellRing,
   CheckCheck,
+  ChevronDown,
+  ChevronUp,
   CreditCard,
   Landmark,
+  ListFilter,
   Plus,
   Receipt,
+  RefreshCw,
+  RotateCcw,
+  Search,
   Sparkles,
   Trash2,
   TrendingDown,
@@ -13,8 +19,11 @@ import {
   Wallet,
 } from 'lucide-react';
 import { api } from '../api';
-import type { Account, RecurringBill, Settlement, Transaction } from '../types';
+import type { Account, RecurringBill, Settlement, SettlementCategoryStat, Transaction } from '../types';
 import { ACCOUNT_TYPE_LABELS, formatMoney } from '../utils/format';
+
+const EXPENSE_CATEGORIES = ['餐饮', '交通', '住房', '购物', '订阅服务', '通讯', '医疗', '娱乐', '其他'];
+const INCOME_CATEGORIES = ['工资收入', '奖金', '报销回款', '理财收益', '其他收入'];
 
 interface Props {
   onRefreshDashboard: () => void;
@@ -45,6 +54,20 @@ export const FinanceSettlementView: React.FC<Props> = ({ onRefreshDashboard, onN
   // Checkout state
   const [periodLabel, setPeriodLabel] = useState('');
   const [settling, setSettling] = useState(false);
+  const [regeneratingId, setRegeneratingId] = useState<number | null>(null);
+  const [expandedSettlementId, setExpandedSettlementId] = useState<number | null>(null);
+  const [settlementDetailLoading, setSettlementDetailLoading] = useState(false);
+  const [settlementDetailTxs, setSettlementDetailTxs] = useState<Transaction[]>([]);
+  const [settlementCategoryStats, setSettlementCategoryStats] = useState<SettlementCategoryStat[]>([]);
+  const [detailCategoryFilter, setDetailCategoryFilter] = useState<string>('ALL');
+  const [detailTypeFilter, setDetailTypeFilter] = useState<'all' | 'expense' | 'income'>('all');
+  const [detailQuery, setDetailQuery] = useState('');
+
+  // Transaction tab filters
+  const [txSettledFilter, setTxSettledFilter] = useState<'all' | 'unsettled' | 'settled'>('all');
+  const [txTypeFilter, setTxTypeFilter] = useState<'all' | 'expense' | 'income'>('all');
+  const [txCategoryFilter, setTxCategoryFilter] = useState<string>('ALL');
+  const [txSearchQuery, setTxSearchQuery] = useState('');
 
   // Add transaction state
   const [txType, setTxType] = useState<'expense' | 'income'>('expense');
@@ -142,6 +165,80 @@ export const FinanceSettlementView: React.FC<Props> = ({ onRefreshDashboard, onN
     onRefreshDashboard();
   };
 
+  const loadSettlementDetails = async (settlementId: number) => {
+    setSettlementDetailLoading(true);
+    try {
+      const res = await api.getSettlementTransactions(settlementId);
+      setSettlementDetailTxs(res.transactions);
+      setSettlementCategoryStats(res.category_stats);
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : '加载结账明细失败');
+    } finally {
+      setSettlementDetailLoading(false);
+    }
+  };
+
+  const handleToggleSettlementDetail = async (settlementId: number, presetCategory = 'ALL', presetType: 'all' | 'expense' | 'income' = 'all') => {
+    if (expandedSettlementId === settlementId && presetCategory === 'ALL' && detailCategoryFilter === 'ALL') {
+      setExpandedSettlementId(null);
+      return;
+    }
+    setExpandedSettlementId(settlementId);
+    setDetailCategoryFilter(presetCategory);
+    setDetailTypeFilter(presetType);
+    setDetailQuery('');
+    await loadSettlementDetails(settlementId);
+  };
+
+  const handleRegenerateSettlement = async (st: Settlement) => {
+    setRegeneratingId(st.id);
+    try {
+      await api.regenerateSettlement(st.id);
+      onNotify(`已重新统计分类并刷新「${st.period_label}」AI 总结`);
+      await loadAll();
+      if (expandedSettlementId === st.id) {
+        await loadSettlementDetails(st.id);
+      }
+      onRefreshDashboard();
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : '重新生成失败');
+    } finally {
+      setRegeneratingId(null);
+    }
+  };
+
+  const handleUndoSettlement = async (st: Settlement) => {
+    if (!window.confirm(`确定要撤销「${st.period_label}」吗？\n撤销后，关联的 ${st.tx_count} 笔流水将退回「待结账」池，可重新修改分类或重新结账。`)) {
+      return;
+    }
+    try {
+      const res = await api.deleteSettlement(st.id);
+      if (expandedSettlementId === st.id) {
+        setExpandedSettlementId(null);
+      }
+      onNotify(`已撤销结账，${res.released_tx_count} 笔流水已退回待结账池`);
+      await loadAll();
+      onRefreshDashboard();
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : '撤销结账失败');
+    }
+  };
+
+  const handleQuickChangeCategory = async (tx: Transaction, newCategory: string, settlementId?: number) => {
+    if (!newCategory || newCategory === tx.category) return;
+    try {
+      await api.updateTransaction(tx.id, { category: newCategory });
+      onNotify(`已将「${tx.description || tx.category}」分类改为「${newCategory}」（若在历史报告内，可点「重新生成总结」同步统计）`);
+      await loadAll();
+      if (settlementId && expandedSettlementId === settlementId) {
+        await loadSettlementDetails(settlementId);
+      }
+      onRefreshDashboard();
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : '修改分类失败');
+    }
+  };
+
   const handleAddAccount = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!accName.trim()) return;
@@ -200,6 +297,50 @@ export const FinanceSettlementView: React.FC<Props> = ({ onRefreshDashboard, onN
   };
 
   const breakdownEntries = Object.entries(unsettledSummary.category_breakdown).sort((a, b) => b[1] - a[1]);
+
+  const availableTxCategories = useMemo(() => {
+    const set = new Set<string>([...EXPENSE_CATEGORIES, ...INCOME_CATEGORIES]);
+    transactions.forEach((t) => {
+      if (t.category) set.add(t.category);
+    });
+    return Array.from(set);
+  }, [transactions]);
+
+  const filteredTransactions = useMemo(() => {
+    const kw = txSearchQuery.trim().toLowerCase();
+    return transactions.filter((t) => {
+      if (txSettledFilter === 'unsettled' && t.settlement_id !== null) return false;
+      if (txSettledFilter === 'settled' && t.settlement_id === null) return false;
+      if (txTypeFilter !== 'all' && t.type !== txTypeFilter) return false;
+      if (txCategoryFilter !== 'ALL' && (t.category || '其他') !== txCategoryFilter) return false;
+      if (kw && !(t.description || '').toLowerCase().includes(kw) && !(t.category || '').toLowerCase().includes(kw)) {
+        return false;
+      }
+      return true;
+    });
+  }, [transactions, txSettledFilter, txTypeFilter, txCategoryFilter, txSearchQuery]);
+
+  const filteredTxStats = useMemo(() => {
+    let inc = 0;
+    let exp = 0;
+    for (const t of filteredTransactions) {
+      if (t.type === 'income') inc += t.amount;
+      else if (t.type === 'expense') exp += t.amount;
+    }
+    return { income: inc, expense: exp };
+  }, [filteredTransactions]);
+
+  const filteredDetailTxs = useMemo(() => {
+    const kw = detailQuery.trim().toLowerCase();
+    return settlementDetailTxs.filter((t) => {
+      if (detailTypeFilter !== 'all' && t.type !== detailTypeFilter) return false;
+      if (detailCategoryFilter !== 'ALL' && (t.category || '其他') !== detailCategoryFilter) return false;
+      if (kw && !(t.description || '').toLowerCase().includes(kw) && !(t.category || '').toLowerCase().includes(kw)) {
+        return false;
+      }
+      return true;
+    });
+  }, [settlementDetailTxs, detailTypeFilter, detailCategoryFilter, detailQuery]);
 
   return (
     <div className="space-y-6">
@@ -295,14 +436,37 @@ export const FinanceSettlementView: React.FC<Props> = ({ onRefreshDashboard, onN
 
             {breakdownEntries.length > 0 && (
               <div className="rounded-xl bg-white border border-slate-200/80 p-4">
-                <div className="text-xs font-semibold text-slate-700 mb-2.5">待结支出分类构成</div>
-                <div className="space-y-2">
-                  {breakdownEntries.map(([cat, amt]) => (
-                    <div key={cat} className="flex items-center justify-between text-xs">
-                      <span className="text-slate-600">{cat}</span>
-                      <span className="font-medium text-slate-900">{formatMoney(amt)}</span>
-                    </div>
-                  ))}
+                <div className="flex items-center justify-between mb-2.5">
+                  <span className="text-xs font-semibold text-slate-700">待结支出分类构成</span>
+                  <span className="text-[11px] text-slate-400">点击分类可查看明细</span>
+                </div>
+                <div className="space-y-2.5">
+                  {breakdownEntries.map(([cat, amt]) => {
+                    const pct = unsettledSummary.expense > 0 ? Math.min(100, Math.round((amt / unsettledSummary.expense) * 100)) : 0;
+                    return (
+                      <button
+                        key={cat}
+                        type="button"
+                        onClick={() => {
+                          setSubTab('transactions');
+                          setTxSettledFilter('unsettled');
+                          setTxTypeFilter('expense');
+                          setTxCategoryFilter(cat);
+                        }}
+                        className="w-full text-left group cursor-pointer"
+                      >
+                        <div className="flex items-center justify-between text-xs mb-1">
+                          <span className="text-slate-700 group-hover:text-indigo-600 font-medium">{cat}</span>
+                          <span className="font-medium text-slate-900">
+                            {formatMoney(amt)} <span className="text-[11px] text-slate-400">({pct}%)</span>
+                          </span>
+                        </div>
+                        <div className="h-1.5 w-full rounded-full bg-slate-100 overflow-hidden">
+                          <div className="h-full rounded-full bg-indigo-500 group-hover:bg-indigo-600 transition-all" style={{ width: `${pct}%` }} />
+                        </div>
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
             )}
@@ -323,6 +487,11 @@ export const FinanceSettlementView: React.FC<Props> = ({ onRefreshDashboard, onN
                 <Sparkles className="h-4 w-4" />
                 {settling ? '正在结账并生成 AI 总结...' : '确认结账并生成个人财务总结'}
               </button>
+              {unsettledSummary.count === 0 && (
+                <p className="text-[11px] text-slate-500 leading-relaxed">
+                  提示：当前待结账流水为 0 笔。后续有新记账/导入账单时可继续生成新一期结账；如需调整本次结果，可在右侧点击「重新生成总结」或「撤销结账」退回重写。
+                </p>
+              )}
             </div>
           </div>
 
@@ -331,49 +500,234 @@ export const FinanceSettlementView: React.FC<Props> = ({ onRefreshDashboard, onN
             <h3 className="text-base font-semibold text-slate-900 border-b border-slate-100 pb-3">
               历史结账报告与财务总结 ({settlements.length})
             </h3>
-            <div className="mt-4 space-y-4 max-h-[580px] overflow-y-auto pr-1">
+            <div className="mt-4 space-y-4">
               {settlements.length === 0 ? (
                 <div className="rounded-xl bg-slate-50 py-12 text-center text-xs text-slate-400">
                   暂无历史结账记录，在左侧完成第一次周期结账吧
                 </div>
               ) : (
-                settlements.map((st) => (
-                  <div key={st.id} className="rounded-2xl border border-slate-200/80 bg-slate-50/50 p-4 space-y-3">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <div>
-                        <span className="font-semibold text-slate-900">{st.period_label}</span>
-                        <span className="ml-2 text-xs text-slate-400">
-                          {st.start_date} ~ {st.end_date} · {st.tx_count} 笔
-                        </span>
-                      </div>
-                      <span className="rounded-lg bg-emerald-50 border border-emerald-200 px-2.5 py-1 text-xs font-medium text-emerald-700">
-                        时点净资产 {formatMoney(st.net_worth_snapshot)}
-                      </span>
-                    </div>
-
-                    <div className="grid grid-cols-3 gap-2 rounded-xl bg-white p-3 text-xs border border-slate-100">
-                      <div>
-                        <span className="text-slate-400">收入</span>
-                        <div className="mt-0.5 font-semibold text-emerald-600">{formatMoney(st.total_income)}</div>
-                      </div>
-                      <div>
-                        <span className="text-slate-400">支出</span>
-                        <div className="mt-0.5 font-semibold text-rose-600">{formatMoney(st.total_expense)}</div>
-                      </div>
-                      <div>
-                        <span className="text-slate-400">净结余</span>
-                        <div className={`mt-0.5 font-semibold ${st.net_cashflow >= 0 ? 'text-indigo-600' : 'text-rose-600'}`}>
-                          {formatMoney(st.net_cashflow, true)}
+                settlements.map((st) => {
+                  const stCategories = Object.entries(st.category_breakdown || {}).sort((a, b) => b[1] - a[1]);
+                  const isExpanded = expandedSettlementId === st.id;
+                  return (
+                    <div key={st.id} className="rounded-2xl border border-slate-200/80 bg-slate-50/50 p-4 space-y-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div>
+                          <span className="font-semibold text-slate-900">{st.period_label}</span>
+                          <span className="ml-2 text-xs text-slate-400">
+                            {st.start_date} ~ {st.end_date} · {st.tx_count} 笔
+                          </span>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="rounded-lg bg-emerald-50 border border-emerald-200 px-2.5 py-1 text-xs font-medium text-emerald-700">
+                            时点净资产 {formatMoney(st.net_worth_snapshot)}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => handleToggleSettlementDetail(st.id)}
+                            className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100 cursor-pointer"
+                          >
+                            <ListFilter className="h-3.5 w-3.5 text-indigo-600" />
+                            {isExpanded ? '收起明细' : '分类明细'}
+                            {isExpanded ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={regeneratingId === st.id}
+                            onClick={() => handleRegenerateSettlement(st)}
+                            title="重新统计分类并刷新 AI 财务总结"
+                            className="inline-flex items-center gap-1 rounded-lg border border-indigo-200 bg-indigo-50 px-2.5 py-1 text-xs font-medium text-indigo-700 hover:bg-indigo-100 disabled:opacity-50 cursor-pointer"
+                          >
+                            <RefreshCw className={`h-3.5 w-3.5 ${regeneratingId === st.id ? 'animate-spin' : ''}`} />
+                            {regeneratingId === st.id ? '生成中...' : '重新生成总结'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleUndoSettlement(st)}
+                            title="撤销此期结账，把流水退回待结账池"
+                            className="inline-flex items-center gap-1 rounded-lg border border-rose-200 bg-white px-2.5 py-1 text-xs font-medium text-rose-600 hover:bg-rose-50 cursor-pointer"
+                          >
+                            <RotateCcw className="h-3.5 w-3.5" />
+                            撤销结账
+                          </button>
                         </div>
                       </div>
-                    </div>
 
-                    <div className="rounded-xl bg-indigo-50/70 border border-indigo-100 p-3 text-xs text-slate-700 leading-relaxed">
-                      <span className="font-semibold text-indigo-700">AI 财务总结：</span>
-                      {st.ai_summary}
+                      <div className="grid grid-cols-3 gap-2 rounded-xl bg-white p-3 text-xs border border-slate-100">
+                        <div>
+                          <span className="text-slate-400">收入</span>
+                          <div className="mt-0.5 font-semibold text-emerald-600">{formatMoney(st.total_income)}</div>
+                        </div>
+                        <div>
+                          <span className="text-slate-400">支出</span>
+                          <div className="mt-0.5 font-semibold text-rose-600">{formatMoney(st.total_expense)}</div>
+                        </div>
+                        <div>
+                          <span className="text-slate-400">净结余</span>
+                          <div className={`mt-0.5 font-semibold ${st.net_cashflow >= 0 ? 'text-indigo-600' : 'text-rose-600'}`}>
+                            {formatMoney(st.net_cashflow, true)}
+                          </div>
+                        </div>
+                      </div>
+
+                      {stCategories.length > 0 && (
+                        <div className="rounded-xl bg-white border border-slate-100 p-3 space-y-2">
+                          <div className="flex items-center justify-between text-[11px] text-slate-500">
+                            <span className="font-semibold text-slate-700">各分类支出明细（点击分类可下钻看流水）</span>
+                            <span>共 {stCategories.length} 个支出分类</span>
+                          </div>
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                            {stCategories.map(([cat, amt]) => {
+                              const pct = st.total_expense > 0 ? Math.min(100, Math.round((amt / st.total_expense) * 100)) : 0;
+                              const activeCat = isExpanded && detailCategoryFilter === cat && detailTypeFilter === 'expense';
+                              return (
+                                <button
+                                  key={cat}
+                                  type="button"
+                                  onClick={() => handleToggleSettlementDetail(st.id, cat, 'expense')}
+                                  className={`rounded-xl border px-3 py-2 text-left transition cursor-pointer ${
+                                    activeCat
+                                      ? 'border-indigo-400 bg-indigo-50/70'
+                                      : 'border-slate-100 bg-slate-50/60 hover:border-indigo-200 hover:bg-indigo-50/30'
+                                  }`}
+                                >
+                                  <div className="flex items-center justify-between text-xs mb-1">
+                                    <span className="font-medium text-slate-800">{cat}</span>
+                                    <span className="font-semibold text-slate-900">
+                                      {formatMoney(amt)} <span className="text-[11px] font-normal text-slate-400">({pct}%)</span>
+                                    </span>
+                                  </div>
+                                  <div className="h-1.5 w-full rounded-full bg-slate-200/70 overflow-hidden">
+                                    <div className="h-full rounded-full bg-indigo-500" style={{ width: `${pct}%` }} />
+                                  </div>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+
+                      <div className="rounded-xl bg-indigo-50/70 border border-indigo-100 p-3 text-xs text-slate-700 leading-relaxed">
+                        <span className="font-semibold text-indigo-700">AI 财务总结：</span>
+                        {st.ai_summary}
+                      </div>
+
+                      {isExpanded && (
+                        <div className="rounded-xl border border-indigo-200/80 bg-white p-4 space-y-3">
+                          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-2.5">
+                            <span className="text-xs font-semibold text-slate-800">
+                              「{st.period_label}」分类流水明细 ({filteredDetailTxs.length} 笔)
+                            </span>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <select
+                                value={detailTypeFilter}
+                                onChange={(e) => {
+                                  setDetailTypeFilter(e.target.value as 'all' | 'expense' | 'income');
+                                  setDetailCategoryFilter('ALL');
+                                }}
+                                className="rounded-lg border border-slate-200 px-2.5 py-1 text-xs"
+                              >
+                                <option value="all">全部收支</option>
+                                <option value="expense">仅支出</option>
+                                <option value="income">仅收入</option>
+                              </select>
+                              <div className="relative">
+                                <Search className="h-3.5 w-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+                                <input
+                                  type="text"
+                                  value={detailQuery}
+                                  onChange={(e) => setDetailQuery(e.target.value)}
+                                  placeholder="搜索商户/备注..."
+                                  className="rounded-lg border border-slate-200 pl-7 pr-2.5 py-1 text-xs w-36 focus:border-indigo-500 focus:outline-none"
+                                />
+                              </div>
+                            </div>
+                          </div>
+
+                          {settlementDetailLoading ? (
+                            <div className="py-6 text-center text-xs text-slate-400">正在加载流水明细...</div>
+                          ) : (
+                            <>
+                              <div className="flex flex-wrap gap-1.5">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setDetailCategoryFilter('ALL');
+                                    setDetailTypeFilter('all');
+                                  }}
+                                  className={`rounded-lg px-2.5 py-1 text-[11px] font-medium cursor-pointer ${
+                                    detailCategoryFilter === 'ALL' && detailTypeFilter === 'all'
+                                      ? 'bg-slate-900 text-white'
+                                      : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                                  }`}
+                                >
+                                  全部 ({settlementDetailTxs.length})
+                                </button>
+                                {settlementCategoryStats
+                                  .filter((cs) => detailTypeFilter === 'all' || cs.type === detailTypeFilter)
+                                  .map((cs) => {
+                                    const active = detailCategoryFilter === cs.category && detailTypeFilter === cs.type;
+                                    return (
+                                      <button
+                                        key={`${cs.type}-${cs.category}`}
+                                        type="button"
+                                        onClick={() => {
+                                          setDetailTypeFilter(cs.type === 'income' ? 'income' : 'expense');
+                                          setDetailCategoryFilter(cs.category);
+                                        }}
+                                        className={`rounded-lg px-2.5 py-1 text-[11px] font-medium cursor-pointer ${
+                                          active
+                                            ? 'bg-indigo-600 text-white'
+                                            : 'bg-slate-100 text-slate-700 hover:bg-indigo-50 hover:text-indigo-700'
+                                        }`}
+                                      >
+                                        {cs.type === 'income' ? '收' : '支'} · {cs.category} ({cs.count}笔 · {formatMoney(cs.total)})
+                                      </button>
+                                    );
+                                  })}
+                              </div>
+
+                              <div className="max-h-[340px] overflow-y-auto space-y-1.5 pr-1">
+                                {filteredDetailTxs.length === 0 ? (
+                                  <div className="py-6 text-center text-xs text-slate-400">当前筛选条件下无匹配流水</div>
+                                ) : (
+                                  filteredDetailTxs.map((tx) => (
+                                    <div
+                                      key={tx.id}
+                                      className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-100 bg-slate-50/60 px-3 py-2 text-xs"
+                                    >
+                                      <div className="min-w-0 flex-1">
+                                        <div className="flex items-center gap-2">
+                                          <select
+                                            value={tx.category}
+                                            onChange={(e) => handleQuickChangeCategory(tx, e.target.value, st.id)}
+                                            title="可直接调整该笔流水分类"
+                                            className="rounded-md border border-slate-200 bg-white px-1.5 py-0.5 text-[11px] font-medium text-slate-700 cursor-pointer"
+                                          >
+                                            {Array.from(new Set([...(tx.type === 'income' ? INCOME_CATEGORIES : EXPENSE_CATEGORIES), tx.category])).map((c) => (
+                                              <option key={c} value={c}>{c}</option>
+                                            ))}
+                                          </select>
+                                          <span className="text-slate-800 truncate">{tx.description || '无备注'}</span>
+                                        </div>
+                                        <div className="mt-0.5 text-[11px] text-slate-400">
+                                          {tx.occurred_at} · {tx.account_name || '未关联账户'}
+                                        </div>
+                                      </div>
+                                      <span className={`font-semibold shrink-0 ${tx.type === 'income' ? 'text-emerald-600' : 'text-slate-900'}`}>
+                                        {tx.type === 'income' ? `+${formatMoney(tx.amount)}` : `-${formatMoney(tx.amount)}`}
+                                      </span>
+                                    </div>
+                                  ))
+                                )}
+                              </div>
+                            </>
+                          )}
+                        </div>
+                      )}
                     </div>
-                  </div>
-                ))
+                  );
+                })
               )}
             </div>
           </div>
@@ -457,47 +811,108 @@ export const FinanceSettlementView: React.FC<Props> = ({ onRefreshDashboard, onN
             </button>
           </form>
 
-          <div className="lg:col-span-8 rounded-2xl border border-slate-200/80 bg-white p-5 shadow-xs">
-            <h3 className="text-base font-semibold text-slate-900 border-b border-slate-100 pb-3">
-              收支流水明细 ({transactions.length})
-            </h3>
-            <div className="mt-3 space-y-2 max-h-[540px] overflow-y-auto pr-1">
-              {transactions.map((tx) => (
-                <div
-                  key={tx.id}
-                  className="flex items-center justify-between gap-3 rounded-xl border border-slate-100 bg-slate-50/60 px-4 py-3 text-sm"
+          <div className="lg:col-span-8 rounded-2xl border border-slate-200/80 bg-white p-5 shadow-xs space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-3">
+              <div>
+                <h3 className="text-base font-semibold text-slate-900">
+                  收支流水明细 ({filteredTransactions.length} / {transactions.length})
+                </h3>
+                <p className="text-[11px] text-slate-400 mt-0.5">
+                  当前筛选合计：收入 <span className="text-emerald-600 font-medium">{formatMoney(filteredTxStats.income)}</span> · 支出{' '}
+                  <span className="text-rose-600 font-medium">{formatMoney(filteredTxStats.expense)}</span>
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <select
+                  value={txSettledFilter}
+                  onChange={(e) => setTxSettledFilter(e.target.value as 'all' | 'unsettled' | 'settled')}
+                  className="rounded-xl border border-slate-200 px-2.5 py-1.5 text-xs"
                 >
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-2">
-                      <span className="font-medium text-slate-900">{tx.category}</span>
-                      {tx.description && <span className="text-xs text-slate-500 truncate">{tx.description}</span>}
-                      <span
-                        className={`rounded-md px-1.5 py-0.5 text-[10px] font-medium ${
-                          tx.settlement_id ? 'bg-slate-200 text-slate-600' : 'bg-amber-50 text-amber-700 border border-amber-200'
-                        }`}
-                      >
-                        {tx.settlement_id ? '已结账' : '待结账'}
-                      </span>
-                    </div>
-                    <div className="mt-1 text-[11px] text-slate-400">
-                      {tx.occurred_at} · {tx.account_name || '未关联账户'}
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-3 shrink-0">
-                    <span className={`font-semibold ${tx.type === 'income' ? 'text-emerald-600' : 'text-slate-900'}`}>
-                      {tx.type === 'income' ? `+${formatMoney(tx.amount)}` : `-${formatMoney(tx.amount)}`}
-                    </span>
-                    {!tx.settlement_id && (
-                      <button
-                        onClick={() => handleDeleteTx(tx.id)}
-                        className="text-slate-300 hover:text-rose-500 cursor-pointer"
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </button>
-                    )}
-                  </div>
+                  <option value="all">全部状态</option>
+                  <option value="unsettled">待结账</option>
+                  <option value="settled">已结账</option>
+                </select>
+                <select
+                  value={txTypeFilter}
+                  onChange={(e) => setTxTypeFilter(e.target.value as 'all' | 'expense' | 'income')}
+                  className="rounded-xl border border-slate-200 px-2.5 py-1.5 text-xs"
+                >
+                  <option value="all">全部收支</option>
+                  <option value="expense">支出</option>
+                  <option value="income">收入</option>
+                </select>
+                <select
+                  value={txCategoryFilter}
+                  onChange={(e) => setTxCategoryFilter(e.target.value)}
+                  className="rounded-xl border border-slate-200 px-2.5 py-1.5 text-xs"
+                >
+                  <option value="ALL">全部分类</option>
+                  {availableTxCategories.map((c) => (
+                    <option key={c} value={c}>{c}</option>
+                  ))}
+                </select>
+                <div className="relative">
+                  <Search className="h-3.5 w-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+                  <input
+                    type="text"
+                    value={txSearchQuery}
+                    onChange={(e) => setTxSearchQuery(e.target.value)}
+                    placeholder="搜索备注/分类"
+                    className="rounded-xl border border-slate-200 pl-7 pr-2.5 py-1.5 text-xs w-36 focus:border-indigo-500 focus:outline-none"
+                  />
                 </div>
-              ))}
+              </div>
+            </div>
+            <div className="space-y-2 max-h-[540px] overflow-y-auto pr-1">
+              {filteredTransactions.length === 0 ? (
+                <div className="py-10 text-center text-xs text-slate-400">暂无符合筛选条件的流水</div>
+              ) : (
+                filteredTransactions.map((tx) => (
+                  <div
+                    key={tx.id}
+                    className="flex items-center justify-between gap-3 rounded-xl border border-slate-100 bg-slate-50/60 px-4 py-3 text-sm"
+                  >
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <select
+                          value={tx.category}
+                          onChange={(e) => handleQuickChangeCategory(tx, e.target.value)}
+                          title="修改分类"
+                          className="rounded-lg border border-slate-200 bg-white px-2 py-0.5 text-xs font-medium text-slate-900 cursor-pointer"
+                        >
+                          {Array.from(new Set([...(tx.type === 'income' ? INCOME_CATEGORIES : EXPENSE_CATEGORIES), tx.category])).map((c) => (
+                            <option key={c} value={c}>{c}</option>
+                          ))}
+                        </select>
+                        {tx.description && <span className="text-xs text-slate-500 truncate">{tx.description}</span>}
+                        <span
+                          className={`rounded-md px-1.5 py-0.5 text-[10px] font-medium ${
+                            tx.settlement_id ? 'bg-slate-200 text-slate-600' : 'bg-amber-50 text-amber-700 border border-amber-200'
+                          }`}
+                        >
+                          {tx.settlement_id ? '已结账' : '待结账'}
+                        </span>
+                      </div>
+                      <div className="mt-1 text-[11px] text-slate-400">
+                        {tx.occurred_at} · {tx.account_name || '未关联账户'}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-3 shrink-0">
+                      <span className={`font-semibold ${tx.type === 'income' ? 'text-emerald-600' : 'text-slate-900'}`}>
+                        {tx.type === 'income' ? `+${formatMoney(tx.amount)}` : `-${formatMoney(tx.amount)}`}
+                      </span>
+                      {!tx.settlement_id && (
+                        <button
+                          onClick={() => handleDeleteTx(tx.id)}
+                          className="text-slate-300 hover:text-rose-500 cursor-pointer"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))
+              )}
             </div>
           </div>
         </div>

@@ -14,6 +14,7 @@ import type {
   RecurringBill,
   Reminder,
   Settlement,
+  SettlementCategoryStat,
   Transaction,
 } from './types';
 
@@ -135,8 +136,23 @@ export const api = {
     request<Account>(`/api/accounts/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),
   deleteAccount: (id: number) => request<{ deleted: boolean }>(`/api/accounts/${id}`, { method: 'DELETE' }),
 
-  listTransactions: (settled?: 'unsettled' | 'settled') =>
-    request<{
+  listTransactions: (params?: {
+    settled?: 'unsettled' | 'settled';
+    settlement_id?: number;
+    category?: string;
+    tx_type?: string;
+    q?: string;
+    limit?: number;
+  }) => {
+    const qs = new URLSearchParams();
+    if (params?.settled) qs.set('settled', params.settled);
+    if (params?.settlement_id !== undefined) qs.set('settlement_id', String(params.settlement_id));
+    if (params?.category) qs.set('category', params.category);
+    if (params?.tx_type) qs.set('tx_type', params.tx_type);
+    if (params?.q) qs.set('q', params.q);
+    if (params?.limit) qs.set('limit', String(params.limit));
+    const queryStr = qs.toString();
+    return request<{
       transactions: Transaction[];
       unsettled_summary: {
         count: number;
@@ -145,9 +161,12 @@ export const api = {
         net_cashflow: number;
         category_breakdown: Record<string, number>;
       };
-    }>(`/api/transactions${settled ? `?settled=${settled}` : ''}`),
+    }>(`/api/transactions${queryStr ? `?${queryStr}` : ''}`);
+  },
   createTransaction: (payload: Partial<Transaction>) =>
     request<Transaction>('/api/transactions', { method: 'POST', body: JSON.stringify(payload) }),
+  updateTransaction: (id: number, payload: { category?: string; description?: string }) =>
+    request<Transaction>(`/api/transactions/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),
   deleteTransaction: (id: number) => request<{ deleted: boolean }>(`/api/transactions/${id}`, { method: 'DELETE' }),
 
   listRecurringBills: () => request<RecurringBill[]>('/api/recurring-bills'),
@@ -170,6 +189,30 @@ export const api = {
     request<Settlement>('/api/settlements/settle', {
       method: 'POST',
       body: JSON.stringify({ period_label: periodLabel }),
+    }),
+  getSettlementTransactions: (
+    settlementId: number,
+    params?: { category?: string; tx_type?: string; q?: string },
+  ) => {
+    const qs = new URLSearchParams();
+    if (params?.category) qs.set('category', params.category);
+    if (params?.tx_type) qs.set('tx_type', params.tx_type);
+    if (params?.q) qs.set('q', params.q);
+    const queryStr = qs.toString();
+    return request<{
+      settlement: Settlement;
+      category_stats: SettlementCategoryStat[];
+      transactions: Transaction[];
+    }>(`/api/settlements/${settlementId}/transactions${queryStr ? `?${queryStr}` : ''}`);
+  },
+  regenerateSettlement: (settlementId: number, periodLabel?: string) =>
+    request<Settlement>(`/api/settlements/${settlementId}/regenerate`, {
+      method: 'POST',
+      body: JSON.stringify(periodLabel !== undefined ? { period_label: periodLabel } : {}),
+    }),
+  deleteSettlement: (settlementId: number) =>
+    request<{ deleted: boolean; released_tx_count: number }>(`/api/settlements/${settlementId}`, {
+      method: 'DELETE',
     }),
 
   // Bills & Emails

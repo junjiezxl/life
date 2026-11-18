@@ -33,8 +33,10 @@ from .models import (
     ReminderUpdate,
     SettingsUpdateRequest,
     SettlementCreateRequest,
+    SettlementRegenerateRequest,
     SiyuanFetchRequest,
     TransactionCreate,
+    TransactionUpdate,
 )
 from .services.ai_service import (
     extract_from_email_content,
@@ -900,18 +902,40 @@ def delete_account(account_id: int) -> Dict[str, bool]:
 
 
 @app.get("/api/transactions")
-def list_transactions(settled: Optional[str] = Query(None)) -> Dict[str, Any]:
+def list_transactions(
+    settled: Optional[str] = Query(None),
+    settlement_id: Optional[int] = Query(None),
+    category: Optional[str] = Query(None),
+    tx_type: Optional[str] = Query(None),
+    q: Optional[str] = Query(None),
+    limit: int = Query(1000, ge=1, le=5000),
+) -> Dict[str, Any]:
     sql = """SELECT t.*, a.name AS account_name
              FROM transactions t
              LEFT JOIN accounts a ON t.account_id = a.id
              WHERE 1=1"""
+    params: List[Any] = []
     if settled == "unsettled":
         sql += " AND t.settlement_id IS NULL"
     elif settled == "settled":
         sql += " AND t.settlement_id IS NOT NULL"
-    sql += " ORDER BY t.occurred_at DESC, t.id DESC LIMIT 200"
+    if settlement_id is not None:
+        sql += " AND t.settlement_id = ?"
+        params.append(settlement_id)
+    if category:
+        sql += " AND t.category = ?"
+        params.append(category)
+    if tx_type:
+        sql += " AND t.type = ?"
+        params.append(tx_type)
+    if q and q.strip():
+        like_q = f"%{q.strip()}%"
+        sql += " AND (t.description LIKE ? OR t.category LIKE ?)"
+        params.extend([like_q, like_q])
+    sql += " ORDER BY t.occurred_at DESC, t.id DESC LIMIT ?"
+    params.append(limit)
     with get_conn() as conn:
-        items = [_row_to_dict(r) for r in conn.execute(sql).fetchall()]
+        items = [_row_to_dict(r) for r in conn.execute(sql, params).fetchall()]
         snap = _compute_finance_snapshot(conn)
         return {
             "transactions": items,
@@ -940,6 +964,28 @@ def create_transaction(payload: TransactionCreate) -> Dict[str, Any]:
         row = conn.execute(
             "SELECT t.*, a.name AS account_name FROM transactions t LEFT JOIN accounts a ON t.account_id = a.id WHERE t.id = ?",
             (cur.lastrowid,),
+        ).fetchone()
+        return _row_to_dict(row)
+
+
+@app.patch("/api/transactions/{tx_id}")
+def update_transaction(tx_id: int, payload: TransactionUpdate) -> Dict[str, Any]:
+    updates: Dict[str, Any] = {}
+    if payload.category is not None:
+        updates["category"] = payload.category.strip() or "其他"
+    if payload.description is not None:
+        updates["description"] = payload.description.strip()
+    if not updates:
+        raise HTTPException(status_code=400, detail="无更新字段")
+    sets = ", ".join(f"{k} = ?" for k in updates.keys())
+    params = list(updates.values()) + [tx_id]
+    with get_conn() as conn:
+        cur = conn.execute(f"UPDATE transactions SET {sets} WHERE id = ?", params)
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="账目不存在")
+        row = conn.execute(
+            "SELECT t.*, a.name AS account_name FROM transactions t LEFT JOIN accounts a ON t.account_id = a.id WHERE t.id = ?",
+            (tx_id,),
         ).fetchone()
         return _row_to_dict(row)
 
@@ -1184,6 +1230,155 @@ async def create_settlement(payload: SettlementCreateRequest) -> Dict[str, Any]:
         res["category_breakdown"] = breakdown
         res["account_snapshot"] = account_snapshot
         return res
+
+
+@app.get("/api/settlements/{settlement_id}/transactions")
+def get_settlement_transactions(
+    settlement_id: int,
+    category: Optional[str] = Query(None),
+    tx_type: Optional[str] = Query(None),
+    q: Optional[str] = Query(None),
+) -> Dict[str, Any]:
+    with get_conn() as conn:
+        st_row = conn.execute("SELECT * FROM settlements WHERE id = ?", (settlement_id,)).fetchone()
+        if not st_row:
+            raise HTTPException(status_code=404, detail="结账记录不存在")
+        settlement = _row_to_dict(st_row)
+        settlement["category_breakdown"] = json.loads(settlement.get("category_breakdown_json") or "{}")
+        settlement["account_snapshot"] = json.loads(settlement.get("account_snapshot_json") or "[]")
+
+        all_txs = [
+            _row_to_dict(r)
+            for r in conn.execute(
+                """SELECT t.*, a.name AS account_name
+                   FROM transactions t
+                   LEFT JOIN accounts a ON t.account_id = a.id
+                   WHERE t.settlement_id = ?
+                   ORDER BY t.occurred_at DESC, t.id DESC""",
+                (settlement_id,),
+            ).fetchall()
+        ]
+
+    stats_map: Dict[tuple, Dict[str, Any]] = {}
+    for t in all_txs:
+        cat = t.get("category") or "其他"
+        tp = t.get("type") or "expense"
+        key = (tp, cat)
+        if key not in stats_map:
+            stats_map[key] = {"type": tp, "category": cat, "count": 0, "total": 0.0}
+        stats_map[key]["count"] += 1
+        stats_map[key]["total"] = round(stats_map[key]["total"] + float(t["amount"]), 2)
+
+    category_stats = sorted(stats_map.values(), key=lambda x: x["total"], reverse=True)
+
+    filtered = all_txs
+    if tx_type:
+        filtered = [t for t in filtered if t["type"] == tx_type]
+    if category:
+        filtered = [t for t in filtered if (t.get("category") or "其他") == category]
+    if q and q.strip():
+        kw = q.strip().lower()
+        filtered = [
+            t
+            for t in filtered
+            if kw in (t.get("description") or "").lower() or kw in (t.get("category") or "").lower()
+        ]
+
+    return {
+        "settlement": settlement,
+        "category_stats": category_stats,
+        "transactions": filtered,
+    }
+
+
+@app.post("/api/settlements/{settlement_id}/regenerate")
+async def regenerate_settlement(
+    settlement_id: int,
+    payload: Optional[SettlementRegenerateRequest] = None,
+) -> Dict[str, Any]:
+    settings = get_all_settings()
+    with get_conn() as conn:
+        st_row = conn.execute("SELECT * FROM settlements WHERE id = ?", (settlement_id,)).fetchone()
+        if not st_row:
+            raise HTTPException(status_code=404, detail="结账记录不存在")
+        st = _row_to_dict(st_row)
+        txs = [
+            _row_to_dict(r)
+            for r in conn.execute(
+                "SELECT * FROM transactions WHERE settlement_id = ? ORDER BY occurred_at ASC",
+                (settlement_id,),
+            ).fetchall()
+        ]
+        if not txs:
+            raise HTTPException(status_code=400, detail="该结账记录下没有关联流水，无法重新生成")
+
+        finance = _compute_finance_snapshot(conn)
+        total_income = round(sum(t["amount"] for t in txs if t["type"] == "income"), 2)
+        total_expense = round(sum(t["amount"] for t in txs if t["type"] == "expense"), 2)
+        net_cashflow = round(total_income - total_expense, 2)
+
+        breakdown: Dict[str, float] = {}
+        for t in txs:
+            if t["type"] == "expense":
+                cat = t["category"] or "其他"
+                breakdown[cat] = round(breakdown.get(cat, 0.0) + t["amount"], 2)
+
+        dates = sorted([t["occurred_at"][:10] for t in txs if t.get("occurred_at")])
+        start_date = dates[0] if dates else st["start_date"]
+        end_date = dates[-1] if dates else st["end_date"]
+        period_label = (payload.period_label or "").strip() if payload and payload.period_label is not None else st["period_label"]
+        if not period_label:
+            period_label = st["period_label"]
+
+    summary_input = {
+        "period_label": period_label,
+        "start_date": start_date,
+        "end_date": end_date,
+        "total_income": total_income,
+        "total_expense": total_expense,
+        "net_cashflow": net_cashflow,
+        "net_worth_snapshot": st["net_worth_snapshot"],
+        "total_assets": finance["total_assets"],
+        "total_liabilities": finance["total_liabilities"],
+        "tx_count": len(txs),
+        "category_breakdown": breakdown,
+    }
+    ai_summary = await generate_settlement_summary(summary_input, settings)
+
+    with get_conn() as conn:
+        conn.execute(
+            """UPDATE settlements
+            SET period_label = ?, start_date = ?, end_date = ?, total_income = ?, total_expense = ?,
+                net_cashflow = ?, tx_count = ?, category_breakdown_json = ?, ai_summary = ?
+            WHERE id = ?""",
+            (
+                period_label,
+                start_date,
+                end_date,
+                total_income,
+                total_expense,
+                net_cashflow,
+                len(txs),
+                json.dumps(breakdown, ensure_ascii=False),
+                ai_summary,
+                settlement_id,
+            ),
+        )
+        updated = _row_to_dict(conn.execute("SELECT * FROM settlements WHERE id = ?", (settlement_id,)).fetchone())
+        updated["category_breakdown"] = breakdown
+        updated["account_snapshot"] = json.loads(updated.get("account_snapshot_json") or "[]")
+        return updated
+
+
+@app.delete("/api/settlements/{settlement_id}")
+def delete_settlement(settlement_id: int) -> Dict[str, Any]:
+    with get_conn() as conn:
+        row = conn.execute("SELECT id FROM settlements WHERE id = ?", (settlement_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="结账记录不存在")
+        cur_rel = conn.execute("UPDATE transactions SET settlement_id = NULL WHERE settlement_id = ?", (settlement_id,))
+        conn.execute("DELETE FROM settlements WHERE id = ?", (settlement_id,))
+        return {"deleted": True, "released_tx_count": cur_rel.rowcount or 0}
 
 
 # ---------------- Bills & Email Sync ----------------

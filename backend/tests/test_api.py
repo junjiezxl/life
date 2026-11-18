@@ -147,6 +147,33 @@ class TestLifeHubAPI(unittest.TestCase):
         after = self.client.get("/api/transactions?settled=unsettled").json()
         self.assertEqual(after["unsettled_summary"]["count"], 0)
 
+        # Inspect category stats & transactions inside the settlement
+        details = self.client.get(f"/api/settlements/{settlement['id']}/transactions").json()
+        self.assertEqual(len(details["transactions"]), unsettled_count_before)
+        self.assertGreater(len(details["category_stats"]), 0)
+
+        # Update an expense transaction's category and regenerate summary
+        first_expense = next((t for t in details["transactions"] if t["type"] == "expense"), None)
+        self.assertIsNotNone(first_expense)
+        upd = self.client.patch(f"/api/transactions/{first_expense['id']}", json={"category": "医疗"})
+        self.assertEqual(upd.status_code, 200)
+        self.assertEqual(upd.json()["category"], "医疗")
+
+        regen = self.client.post(f"/api/settlements/{settlement['id']}/regenerate", json={"period_label": "重算测试结账"})
+        self.assertEqual(regen.status_code, 200)
+        self.assertEqual(regen.json()["period_label"], "重算测试结账")
+        self.assertIn("医疗", regen.json()["category_breakdown"])
+
+        # Undo settlement releases transactions back to unsettled, then re-settle
+        undo = self.client.delete(f"/api/settlements/{settlement['id']}")
+        self.assertEqual(undo.status_code, 200)
+        self.assertEqual(undo.json()["released_tx_count"], unsettled_count_before)
+        restored = self.client.get("/api/transactions?settled=unsettled").json()
+        self.assertEqual(restored["unsettled_summary"]["count"], unsettled_count_before)
+
+        re_settle = self.client.post("/api/settlements/settle", json={"period_label": "测试期结账"})
+        self.assertEqual(re_settle.status_code, 200)
+
     def test_05_recurring_bill_sync_and_complete_reminder(self):
         sync_resp = self.client.post("/api/recurring-bills/sync-reminders?force_all=true")
         self.assertEqual(sync_resp.status_code, 200)

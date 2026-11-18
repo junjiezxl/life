@@ -53,6 +53,11 @@ class TransactionCreate(BaseModel):
     external_ref: str = ""
 
 
+class TransactionUpdate(BaseModel):
+    category: Optional[str] = Field(None, min_length=1, max_length=40)
+    description: Optional[str] = Field(None, max_length=300)
+
+
 class RecurringBillCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=120)
     amount: float = Field(..., gt=0)
@@ -109,6 +114,10 @@ class SettlementCreateRequest(BaseModel):
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     transaction_ids: Optional[List[int]] = None
+
+
+class SettlementRegenerateRequest(BaseModel):
+    period_label: Optional[str] = None
 
 
 class BatchImportTransactionsRequest(BaseModel):
