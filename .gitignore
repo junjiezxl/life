@@ -13,6 +13,7 @@ dist/
 *.tsbuildinfo
 
 # Local database & environment files
+/data/
 backend/data/
 *.db
 *.sqlite

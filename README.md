@@ -40,3 +40,20 @@ cd backend && .venv/bin/uvicorn app.main:app --reload --port 8000
 # 终端 2：启动前端
 cd frontend && npm run dev
 ```
+
+## NAS / Docker Compose 部署
+
+适用于群晖、飞牛 fnOS、威联通、绿联等支持 Docker Compose 的 NAS：
+
+```bash
+git clone https://github.com/junjiezxl/life.git lifehub
+cd lifehub
+docker compose up -d --build
+```
+
+启动后访问：`http://<NAS_IP>:8000`
+
+- **数据持久化**：SQLite 数据库自动保存在项目同级 `./data/life_hub.db`（映射到容器 `/app/backend/data`）。如需迁移本机已有数据，将本机 `backend/data/life_hub.db` 复制到 `./data/life_hub.db` 即可。
+- **更新版本**：执行 `git pull && docker compose up -d --build`，数据卷不受影响。
+- **思源笔记连接**：容器内建议使用「直连思源内核 API (`siyuan_api`)」，地址填写 NAS/宿主机局域网 IP（如 `http://192.168.1.x:6806`）。
+- **外网访问安全**：项目无内置登录鉴权，建议配合 **Tailscale** 或 NAS 内网 VPN 使用，避免将 `8000` 端口直接暴露到公网。

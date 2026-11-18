@@ -1,0 +1,15 @@
+services:
+  lifehub:
+    build: .
+    container_name: lifehub
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - TZ=Asia/Shanghai
+      - LIFEHUB_DB_PATH=/app/backend/data/life_hub.db
+      # 如需通过局域网代理访问 Gemini / 外部服务，可取消下方注释：
+      # - HTTP_PROXY=http://192.168.1.10:7890
+      # - HTTPS_PROXY=http://192.168.1.10:7890
+    volumes:
+      - ./data:/app/backend/data
