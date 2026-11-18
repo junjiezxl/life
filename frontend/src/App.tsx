@@ -132,7 +132,7 @@ export function App() {
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col lg:flex-row">
       {/* Sidebar */}
-      <aside className="w-full lg:w-64 bg-white border-b lg:border-b-0 lg:border-r border-slate-200/80 flex flex-col shrink-0">
+      <aside className="w-full lg:w-64 lg:sticky lg:top-0 lg:h-screen bg-white border-b lg:border-b-0 lg:border-r border-slate-200/80 flex flex-col shrink-0">
         <div className="px-5 py-4 flex items-center justify-between lg:justify-start gap-3 border-b border-slate-100">
           <div className="flex items-center gap-2.5">
             <div className="h-9 w-9 rounded-xl bg-gradient-to-br from-indigo-600 to-violet-600 text-white flex items-center justify-center shadow-xs">

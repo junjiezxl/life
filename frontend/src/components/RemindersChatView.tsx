@@ -39,7 +39,7 @@ export const RemindersChatView: React.FC<Props> = ({ onRefreshDashboard, onNotif
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [sending, setSending] = useState(false);
-  const chatEndRef = useRef<HTMLDivElement>(null);
+  const chatScrollRef = useRef<HTMLDivElement>(null);
 
   const loadReminders = async () => {
     try {
@@ -72,7 +72,10 @@ export const RemindersChatView: React.FC<Props> = ({ onRefreshDashboard, onNotif
   }, []);
 
   useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    const el = chatScrollRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+    }
   }, [messages]);
 
   const handleAddReminder = async (e: React.FormEvent) => {
@@ -384,7 +387,7 @@ export const RemindersChatView: React.FC<Props> = ({ onRefreshDashboard, onNotif
           </button>
         </div>
 
-        <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-slate-50/40">
+        <div ref={chatScrollRef} className="flex-1 overflow-y-auto p-4 space-y-4 bg-slate-50/40">
           {messages.length === 0 && (
             <div className="rounded-xl bg-white border border-slate-100 p-4 text-xs text-slate-500">
               发送一句自然语言试试看，例如：「明天上午9点半提醒我交房租3200元，今天咖啡花了32元」。
@@ -431,7 +434,6 @@ export const RemindersChatView: React.FC<Props> = ({ onRefreshDashboard, onNotif
               </div>
             </div>
           ))}
-          <div ref={chatEndRef} />
         </div>
 
         <div className="border-t border-slate-100 p-3 bg-white rounded-b-2xl space-y-2">
