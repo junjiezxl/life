@@ -29,7 +29,42 @@ chmod +x start.sh
 ./start.sh
 ```
 
-启动后访问：`http://127.0.0.1:8000`
+启动后访问：`http://127.0.0.1:8000`（局域网/NAS 可通过 `http://<NAS_IP>:8000` 访问，支持通过 `LIFEHUB_HOST` / `LIFEHUB_PORT` 环境变量覆盖监听地址与端口）。
+
+### 原生部署（不使用 Docker，适合 Linux NAS / 飞牛 / 群晖）
+
+1. **环境准备**：NAS 上安装 `python3`（3.9+）与 `nodejs`（18+，如果 NAS 不想装 Node，可先在本地电脑执行 `cd frontend && npm install && npm run build` 后把 `frontend/dist` 拷贝到 NAS，NAS 上只需 Python 即可运行）。
+2. **拉取代码并启动**：
+   ```bash
+   git clone https://github.com/junjiezxl/life.git /opt/lifehub
+   cd /opt/lifehub
+   chmod +x start.sh
+   ./start.sh
+   ```
+   `start.sh` 会自动创建 `backend/.venv`、安装 `backend/requirements.txt`、构建前端并监听 `0.0.0.0:8000`。
+3. **后台常驻与开机自启（systemd）**：
+   新建 `/etc/systemd/system/lifehub.service`：
+   ```ini
+   [Unit]
+   Description=LifeHub Service
+   After=network.target
+
+   [Service]
+   Type=simple
+   WorkingDirectory=/opt/lifehub
+   Environment="TZ=Asia/Shanghai"
+   ExecStart=/opt/lifehub/start.sh
+   Restart=always
+   RestartSec=5
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+   启用服务：
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now lifehub
+   ```
 
 ### 开发模式（前后端分离热更新）
 
