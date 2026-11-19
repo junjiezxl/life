@@ -3,9 +3,14 @@ import type {
   AppSettings,
   AuthStatus,
   ChatMessage,
+  CreditCard,
   DashboardData,
+  DebtOperation,
+  DebtOverviewResponse,
+  DebtPlanResponse,
   EmailFetchResponse,
   EmailSyncLog,
+  Loan,
   NoteCandidate,
   NoteSnippet,
   ParsedBillTransaction,
@@ -308,6 +313,46 @@ export const api = {
       `/api/phone-numbers/sync-reminders${withinDays ? `?within_days=${withinDays}` : ''}`,
       { method: 'POST' },
     ),
+
+  // Credit Cards, Loans & Debt Repayment Planner
+  getDebtOverview: () => request<DebtOverviewResponse>('/api/debt/overview'),
+  createCreditCard: (payload: Partial<CreditCard>) =>
+    request<CreditCard>('/api/debt/cards', { method: 'POST', body: JSON.stringify(payload) }),
+  updateCreditCard: (id: number, payload: Partial<CreditCard>) =>
+    request<CreditCard>(`/api/debt/cards/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),
+  deleteCreditCard: (id: number) => request<{ deleted: boolean }>(`/api/debt/cards/${id}`, { method: 'DELETE' }),
+
+  createLoan: (payload: Partial<Loan>) =>
+    request<Loan>('/api/debt/loans', { method: 'POST', body: JSON.stringify(payload) }),
+  updateLoan: (id: number, payload: Partial<Loan>) =>
+    request<Loan>(`/api/debt/loans/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),
+  deleteLoan: (id: number) => request<{ deleted: boolean }>(`/api/debt/loans/${id}`, { method: 'DELETE' }),
+
+  planDebtRepayment: (payload: {
+    available_cash?: number;
+    horizon_days?: number;
+    reserve_ratio?: number;
+    strategy?: 'balanced' | 'max_free_days' | 'min_fee';
+    allow_relay?: boolean;
+  }) => request<DebtPlanResponse>('/api/debt/plan', { method: 'POST', body: JSON.stringify(payload) }),
+
+  executeDebtOperation: (payload: {
+    op_type: 'cash_repay_card' | 'swipe_repay_card' | 'repay_loan' | 'swipe_cash_out';
+    source_card_id?: number | null;
+    source_account_id?: number | null;
+    target_card_id?: number | null;
+    target_loan_id?: number | null;
+    amount: number;
+    fee_amount?: number;
+    note?: string;
+    sync_to_finance?: boolean;
+  }) => request<DebtOperation>('/api/debt/operations', { method: 'POST', body: JSON.stringify(payload) }),
+  undoDebtOperation: (opId: number) =>
+    request<{ deleted: boolean }>(`/api/debt/operations/${opId}`, { method: 'DELETE' }),
+  syncDebtReminders: (withinDays = 5) =>
+    request<{ created_count: number; reminders: Reminder[] }>(`/api/debt/sync-reminders?within_days=${withinDays}`, {
+      method: 'POST',
+    }),
 
   // Settings
   getSettings: () => request<AppSettings>('/api/settings'),

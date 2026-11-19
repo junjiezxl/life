@@ -212,6 +212,60 @@ def init_db(seed_demo: bool = True) -> None:
                 created_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS credit_cards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                bank_name TEXT DEFAULT '',
+                last4 TEXT DEFAULT '',
+                account_id INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
+                credit_limit REAL NOT NULL DEFAULT 0,
+                current_debt REAL NOT NULL DEFAULT 0,
+                statement_bill_amount REAL NOT NULL DEFAULT 0,
+                paid_amount_this_cycle REAL NOT NULL DEFAULT 0,
+                min_payment REAL NOT NULL DEFAULT 0,
+                statement_day INTEGER NOT NULL DEFAULT 5,
+                due_day INTEGER NOT NULL DEFAULT 23,
+                grace_days INTEGER NOT NULL DEFAULT 3,
+                swipe_fee_rate REAL NOT NULL DEFAULT 0.006,
+                status TEXT NOT NULL DEFAULT 'active',
+                notes TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS loans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                lender TEXT DEFAULT '',
+                total_principal REAL NOT NULL DEFAULT 0,
+                remaining_principal REAL NOT NULL DEFAULT 0,
+                monthly_payment REAL NOT NULL DEFAULT 0,
+                paid_this_month REAL NOT NULL DEFAULT 0,
+                due_day INTEGER NOT NULL DEFAULT 15,
+                apr REAL NOT NULL DEFAULT 0,
+                remaining_periods INTEGER NOT NULL DEFAULT 12,
+                account_id INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                notes TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS debt_operations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                op_type TEXT NOT NULL,
+                source_card_id INTEGER REFERENCES credit_cards(id) ON DELETE SET NULL,
+                source_account_id INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
+                target_card_id INTEGER REFERENCES credit_cards(id) ON DELETE SET NULL,
+                target_loan_id INTEGER REFERENCES loans(id) ON DELETE SET NULL,
+                amount REAL NOT NULL,
+                fee_amount REAL NOT NULL DEFAULT 0,
+                op_date TEXT NOT NULL,
+                note TEXT DEFAULT '',
+                tx_id INTEGER REFERENCES transactions(id) ON DELETE SET NULL,
+                created_at TEXT NOT NULL
+            );
             """
         )
 
@@ -510,6 +564,9 @@ def reset_all_data(reseed: bool = False) -> None:
             DELETE FROM accounts;
             DELETE FROM email_sync_logs;
             DELETE FROM phone_numbers;
+            DELETE FROM debt_operations;
+            DELETE FROM credit_cards;
+            DELETE FROM loans;
             """
         )
         conn.execute(

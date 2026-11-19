@@ -253,3 +253,156 @@ export interface AuthStatus {
   username: string | null;
   active_sessions: number;
 }
+
+export interface CreditCard {
+  id: number;
+  name: string;
+  bank_name: string;
+  last4: string;
+  account_id: number | null;
+  credit_limit: number;
+  current_debt: number;
+  available_credit: number;
+  utilization_pct: number;
+  statement_bill_amount: number;
+  paid_amount_this_cycle: number;
+  remaining_bill: number;
+  min_payment: number;
+  statement_day: number;
+  due_day: number;
+  grace_days: number;
+  swipe_fee_rate: number;
+  status: 'active' | 'frozen' | 'closed';
+  notes: string;
+  next_due_date: string;
+  days_until_due: number;
+  grace_deadline_date: string;
+  swipe_bill_date: string;
+  swipe_repay_date: string;
+  swipe_free_days: number;
+  days_to_next_statement: number;
+  is_statement_day: boolean;
+  next_cycle_start_date: string;
+  next_cycle_free_days: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface Loan {
+  id: number;
+  name: string;
+  lender: string;
+  total_principal: number;
+  remaining_principal: number;
+  monthly_payment: number;
+  paid_this_month: number;
+  remaining_month_payment: number;
+  due_day: number;
+  apr: number;
+  remaining_periods: number;
+  account_id: number | null;
+  status: 'active' | 'paid_off';
+  notes: string;
+  next_due_date: string;
+  days_until_due: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface DebtOperation {
+  id: number;
+  op_type: 'cash_repay_card' | 'swipe_repay_card' | 'repay_loan' | 'swipe_cash_out';
+  source_card_id: number | null;
+  source_account_id: number | null;
+  target_card_id: number | null;
+  target_loan_id: number | null;
+  source_card_name?: string;
+  target_card_name?: string;
+  target_loan_name?: string;
+  source_account_name?: string;
+  amount: number;
+  fee_amount: number;
+  op_date: string;
+  note: string;
+  tx_id: number | null;
+  created_at: string;
+}
+
+export interface DebtOverviewResponse {
+  cards: CreditCard[];
+  loans: Loan[];
+  operations: DebtOperation[];
+  suggested_cash: number;
+  summary: {
+    active_card_count: number;
+    active_loan_count: number;
+    total_credit_limit: number;
+    total_card_debt: number;
+    total_available_credit: number;
+    overall_utilization_pct: number;
+    total_remaining_bill: number;
+    total_loan_principal: number;
+    total_loan_month_remaining: number;
+    total_debt: number;
+    total_fee_spent: number;
+  };
+}
+
+export interface DebtPlanStep {
+  step_no: number;
+  op_type: 'cash_repay_card' | 'swipe_repay_card' | 'repay_loan' | 'swipe_cash_out';
+  title: string;
+  source_type: 'cash' | 'credit_card';
+  source_id: number | null;
+  source_name: string;
+  target_type: 'credit_card' | 'loan';
+  target_id: number;
+  target_name: string;
+  amount: number;
+  fee_amount: number;
+  due_date: string;
+  days_until_due: number;
+  free_days_gained: number;
+  repay_date: string;
+  reason: string;
+  risk_tip: string;
+}
+
+export interface DebtPlanResponse {
+  strategy: 'balanced' | 'max_free_days' | 'min_fee';
+  horizon_days: number;
+  available_cash_input: number;
+  remaining_cash_after: number;
+  summary: {
+    obligation_count: number;
+    total_due: number;
+    total_loan_due: number;
+    total_card_due: number;
+    cash_used: number;
+    swipe_used: number;
+    total_fee: number;
+    avg_free_days: number;
+    total_shortfall: number;
+    fully_covered: boolean;
+  };
+  steps: DebtPlanStep[];
+  uncovered_obligations: Array<{
+    kind: string;
+    id: number;
+    name: string;
+    shortfall: number;
+    due_date: string;
+  }>;
+  warnings: string[];
+  swipe_ranking: Array<{
+    id: number;
+    name: string;
+    usable_available: number;
+    swipe_free_days: number;
+    swipe_repay_date: string;
+    swipe_fee_rate: number;
+    utilization_pct: number;
+    days_to_next_statement: number;
+    next_cycle_free_days: number;
+  }>;
+}

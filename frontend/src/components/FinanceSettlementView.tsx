@@ -21,6 +21,7 @@ import {
 import { api } from '../api';
 import type { Account, RecurringBill, Settlement, SettlementCategoryStat, Transaction } from '../types';
 import { ACCOUNT_TYPE_LABELS, formatMoney } from '../utils/format';
+import { DebtPlannerView } from './DebtPlannerView';
 import { EmailBillsView } from './EmailBillsView';
 
 const EXPENSE_CATEGORIES = ['餐饮', '交通', '住房', '购物', '订阅服务', '通讯', '医疗', '娱乐', '其他'];
@@ -31,7 +32,7 @@ interface Props {
   onNotify: (msg: string) => void;
 }
 
-type SubTab = 'checkout' | 'transactions' | 'accounts' | 'bills' | 'emails';
+type SubTab = 'checkout' | 'debt' | 'transactions' | 'accounts' | 'bills' | 'emails';
 
 export const FinanceSettlementView: React.FC<Props> = ({ onRefreshDashboard, onNotify }) => {
   const [subTab, setSubTab] = useState<SubTab>('checkout');
@@ -389,6 +390,7 @@ export const FinanceSettlementView: React.FC<Props> = ({ onRefreshDashboard, onN
       <div className="flex flex-wrap gap-2 rounded-2xl bg-white p-1.5 border border-slate-200/80 w-fit">
         {[
           { key: 'checkout', label: '一键结账 & 财务总结' },
+          { key: 'debt', label: '信用卡 & 贷款规划' },
           { key: 'transactions', label: '记账与流水明细' },
           { key: 'accounts', label: '资产与负债账户' },
           { key: 'bills', label: '周期固定账单' },
@@ -1134,6 +1136,18 @@ export const FinanceSettlementView: React.FC<Props> = ({ onRefreshDashboard, onN
       {subTab === 'emails' && (
         <EmailBillsView
           onRefreshDashboard={async () => {
+            await loadAll();
+            onRefreshDashboard();
+          }}
+          onNotify={onNotify}
+        />
+      )}
+
+      {/* SubTab 6: Credit Cards, Loans & Optimal Repayment Path Planner */}
+      {subTab === 'debt' && (
+        <DebtPlannerView
+          accounts={accounts}
+          onRefreshAll={async () => {
             await loadAll();
             onRefreshDashboard();
           }}

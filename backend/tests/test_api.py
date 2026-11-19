@@ -524,6 +524,118 @@ class TestLifeHubAPI(unittest.TestCase):
         s_after = next(p for p in listing_after["items"] if p["id"] == sub_id)
         self.assertIsNone(s_after["parent_phone_id"])
 
+    def test_13_credit_card_loan_and_optimal_repayment_planner(self):
+        from datetime import datetime, timedelta
+
+        today = datetime.now().astimezone().date()
+        urgent_due_day = (today + timedelta(days=2)).day
+        later_due_day = (today + timedelta(days=10)).day
+        # Card B just passed statement day (e.g. yesterday) -> long interest-free period
+        just_passed_stmt_day = (today - timedelta(days=2)).day
+        # Card A statement day is upcoming so shorter free days
+        upcoming_stmt_day = (today + timedelta(days=5)).day
+
+        card_a = self.client.post(
+            "/api/debt/cards",
+            json={
+                "name": "招行主力卡",
+                "bank_name": "招商银行",
+                "credit_limit": 30000,
+                "current_debt": 22000,
+                "statement_bill_amount": 8000,
+                "statement_day": upcoming_stmt_day,
+                "due_day": urgent_due_day,
+                "swipe_fee_rate": 0.006,
+            },
+        ).json()
+        card_b = self.client.post(
+            "/api/debt/cards",
+            json={
+                "name": "广发周转卡",
+                "bank_name": "广发银行",
+                "credit_limit": 40000,
+                "current_debt": 5000,
+                "statement_bill_amount": 0,
+                "statement_day": just_passed_stmt_day,
+                "due_day": later_due_day,
+                "swipe_fee_rate": 0.0055,
+            },
+        ).json()
+        loan = self.client.post(
+            "/api/debt/loans",
+            json={
+                "name": "消费信用贷",
+                "lender": "微众银行",
+                "total_principal": 50000,
+                "remaining_principal": 30000,
+                "monthly_payment": 2500,
+                "due_day": urgent_due_day,
+                "apr": 7.2,
+            },
+        ).json()
+
+        ov = self.client.get("/api/debt/overview")
+        self.assertEqual(ov.status_code, 200)
+        self.assertEqual(ov.json()["summary"]["active_card_count"], 2)
+        self.assertEqual(ov.json()["summary"]["active_loan_count"], 1)
+
+        # Plan with 3000 cash -> 2500 covers rigid loan, 500 goes to Card A, remaining 7500 on Card A swiped from Card B
+        plan_resp = self.client.post(
+            "/api/debt/plan",
+            json={
+                "available_cash": 3000,
+                "horizon_days": 30,
+                "reserve_ratio": 0.05,
+                "strategy": "balanced",
+                "allow_relay": True,
+            },
+        )
+        self.assertEqual(plan_resp.status_code, 200)
+        plan = plan_resp.json()
+        self.assertTrue(plan["summary"]["fully_covered"])
+        self.assertEqual(plan["summary"]["cash_used"], 3000.0)
+        self.assertEqual(plan["summary"]["swipe_used"], 7500.0)
+        swipe_steps = [s for s in plan["steps"] if s["op_type"] == "swipe_repay_card"]
+        self.assertEqual(len(swipe_steps), 1)
+        self.assertEqual(swipe_steps[0]["source_id"], card_b["id"])
+        self.assertEqual(swipe_steps[0]["target_id"], card_a["id"])
+        self.assertEqual(swipe_steps[0]["amount"], 7500.0)
+
+        # Execute swipe_repay_card step and verify card balances update
+        step = swipe_steps[0]
+        exec_resp = self.client.post(
+            "/api/debt/operations",
+            json={
+                "op_type": step["op_type"],
+                "source_card_id": step["source_id"],
+                "target_card_id": step["target_id"],
+                "amount": step["amount"],
+                "fee_amount": step["fee_amount"],
+                "sync_to_finance": True,
+            },
+        )
+        self.assertEqual(exec_resp.status_code, 200)
+        op_id = exec_resp.json()["id"]
+
+        ov2 = self.client.get("/api/debt/overview").json()
+        c_a2 = next(c for c in ov2["cards"] if c["id"] == card_a["id"])
+        c_b2 = next(c for c in ov2["cards"] if c["id"] == card_b["id"])
+        self.assertEqual(c_a2["remaining_bill"], 500.0)
+        self.assertEqual(c_a2["current_debt"], 14500.0)
+        self.assertEqual(c_b2["current_debt"], 12500.0)
+
+        # Undo operation reverts balances cleanly
+        self.assertEqual(self.client.delete(f"/api/debt/operations/{op_id}").status_code, 200)
+        ov3 = self.client.get("/api/debt/overview").json()
+        c_a3 = next(c for c in ov3["cards"] if c["id"] == card_a["id"])
+        self.assertEqual(c_a3["remaining_bill"], 8000.0)
+        self.assertEqual(c_a3["current_debt"], 22000.0)
+
+        # Sync debt reminders creates reminders for upcoming card & loan
+        sync_rem = self.client.post("/api/debt/sync-reminders?within_days=10")
+        self.assertEqual(sync_rem.status_code, 200)
+        self.assertGreaterEqual(sync_rem.json()["created_count"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

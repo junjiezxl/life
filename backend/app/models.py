@@ -265,3 +265,90 @@ class AuthChangePasswordRequest(BaseModel):
     current_password: str = Field(..., min_length=1, max_length=128)
     new_password: Optional[str] = Field(None, max_length=128)
     new_username: Optional[str] = Field(None, max_length=64)
+
+
+class CreditCardCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    bank_name: str = ""
+    last4: str = Field("", max_length=8)
+    account_id: Optional[int] = None
+    credit_limit: float = Field(..., ge=0)
+    current_debt: float = Field(0.0, ge=0)
+    statement_bill_amount: float = Field(0.0, ge=0)
+    paid_amount_this_cycle: float = Field(0.0, ge=0)
+    min_payment: float = Field(0.0, ge=0)
+    statement_day: int = Field(5, ge=1, le=31)
+    due_day: int = Field(23, ge=1, le=31)
+    grace_days: int = Field(3, ge=0, le=10)
+    swipe_fee_rate: float = Field(0.006, ge=0, le=0.1)
+    status: str = "active"  # active | frozen | closed
+    notes: str = ""
+
+
+class CreditCardUpdate(BaseModel):
+    name: Optional[str] = None
+    bank_name: Optional[str] = None
+    last4: Optional[str] = None
+    account_id: Optional[int] = None
+    credit_limit: Optional[float] = None
+    current_debt: Optional[float] = None
+    statement_bill_amount: Optional[float] = None
+    paid_amount_this_cycle: Optional[float] = None
+    min_payment: Optional[float] = None
+    statement_day: Optional[int] = None
+    due_day: Optional[int] = None
+    grace_days: Optional[int] = None
+    swipe_fee_rate: Optional[float] = None
+    status: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class LoanCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    lender: str = ""
+    total_principal: float = Field(0.0, ge=0)
+    remaining_principal: float = Field(0.0, ge=0)
+    monthly_payment: float = Field(..., ge=0)
+    paid_this_month: float = Field(0.0, ge=0)
+    due_day: int = Field(15, ge=1, le=31)
+    apr: float = Field(0.0, ge=0, le=100)
+    remaining_periods: int = Field(12, ge=0, le=600)
+    account_id: Optional[int] = None
+    status: str = "active"  # active | paid_off
+    notes: str = ""
+
+
+class LoanUpdate(BaseModel):
+    name: Optional[str] = None
+    lender: Optional[str] = None
+    total_principal: Optional[float] = None
+    remaining_principal: Optional[float] = None
+    monthly_payment: Optional[float] = None
+    paid_this_month: Optional[float] = None
+    due_day: Optional[int] = None
+    apr: Optional[float] = None
+    remaining_periods: Optional[int] = None
+    account_id: Optional[int] = None
+    status: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class DebtPlanRequest(BaseModel):
+    available_cash: Optional[float] = Field(None, ge=0)
+    horizon_days: int = Field(30, ge=1, le=90)
+    reserve_ratio: float = Field(0.05, ge=0.0, le=0.5)
+    strategy: str = "balanced"  # balanced | max_free_days | min_fee
+    allow_relay: bool = True
+
+
+class DebtOperationCreate(BaseModel):
+    op_type: str  # cash_repay_card | swipe_repay_card | repay_loan | swipe_cash_out
+    source_card_id: Optional[int] = None
+    source_account_id: Optional[int] = None
+    target_card_id: Optional[int] = None
+    target_loan_id: Optional[int] = None
+    amount: float = Field(..., gt=0)
+    fee_amount: float = Field(0.0, ge=0)
+    op_date: Optional[str] = None
+    note: str = ""
+    sync_to_finance: bool = False

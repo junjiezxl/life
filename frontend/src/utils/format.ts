@@ -38,6 +38,7 @@ export const SOURCE_META: Record<string, { label: string; cls: string }> = {
   wechat: { label: '微信账单', cls: 'bg-green-50 text-green-700' },
   bill_import: { label: '账单导入', cls: 'bg-violet-50 text-violet-700' },
   phone_sim: { label: '手机保号', cls: 'bg-teal-50 text-teal-700' },
+  debt_bill: { label: '卡贷还款', cls: 'bg-rose-50 text-rose-700' },
 };
 
 export function formatCurrency(val: number | null | undefined, currency = 'CNY'): string {

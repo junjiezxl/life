@@ -20,9 +20,15 @@ from .models import (
     BatchImportRemindersRequest,
     BatchImportTransactionsRequest,
     ChatRequest,
+    CreditCardCreate,
+    CreditCardUpdate,
+    DebtOperationCreate,
+    DebtPlanRequest,
     EmailFetchRequest,
     EmailImportRequest,
     EmailParseTextRequest,
+    LoanCreate,
+    LoanUpdate,
     NoteExtractRequest,
     PhoneCommRecordRequest,
     PhoneNumberCreate,
@@ -60,6 +66,11 @@ from .services.auth_service import (
 )
 from .services.bark_service import format_reminder_bark_message, send_bark_push
 from .services.bill_parser import parse_bill_file
+from .services.debt_planner_service import (
+    enrich_credit_card,
+    enrich_loan,
+    plan_optimal_repayment_paths,
+)
 from .services.email_service import fetch_and_parse_emails, test_imap_connection
 from .services.siyuan_service import fetch_siyuan_notes, test_siyuan_connection
 
@@ -1933,6 +1944,487 @@ async def sync_phone_reminders(within_days: Optional[int] = Query(None, ge=1, le
         created = _sync_phone_reminders_conn(conn, override_within_days=within_days)
     if created:
         await _push_new_reminders_bark(created, prefix="📱 保号提前提醒：")
+    return {"created_count": len(created), "reminders": created}
+
+
+# ---------------- Credit Cards, Loans & Optimal Debt Repayment Planner ----------------
+
+
+def _load_debt_state(conn: Any) -> Dict[str, Any]:
+    raw_cards = [
+        _row_to_dict(r)
+        for r in conn.execute("SELECT * FROM credit_cards ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, due_day ASC, id ASC").fetchall()
+    ]
+    raw_loans = [
+        _row_to_dict(r)
+        for r in conn.execute("SELECT * FROM loans ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, due_day ASC, id ASC").fetchall()
+    ]
+    cards = [enrich_credit_card(c) for c in raw_cards]
+    loans = [enrich_loan(l) for l in raw_loans]
+
+    accounts = [_row_to_dict(r) for r in conn.execute("SELECT * FROM accounts ORDER BY id ASC").fetchall()]
+    suggested_cash = round(
+        sum(float(a["balance"]) for a in accounts if a["type"] in ("cash", "bank") and float(a["balance"]) > 0),
+        2,
+    )
+    return {"cards": cards, "loans": loans, "suggested_cash": suggested_cash}
+
+
+@app.get("/api/debt/overview")
+def get_debt_overview() -> Dict[str, Any]:
+    with get_conn() as conn:
+        state = _load_debt_state(conn)
+        ops = [
+            _row_to_dict(r)
+            for r in conn.execute(
+                """SELECT o.*,
+                          sc.name AS source_card_name,
+                          tc.name AS target_card_name,
+                          tl.name AS target_loan_name,
+                          sa.name AS source_account_name
+                   FROM debt_operations o
+                   LEFT JOIN credit_cards sc ON o.source_card_id = sc.id
+                   LEFT JOIN credit_cards tc ON o.target_card_id = tc.id
+                   LEFT JOIN loans tl ON o.target_loan_id = tl.id
+                   LEFT JOIN accounts sa ON o.source_account_id = sa.id
+                   ORDER BY o.op_date DESC, o.id DESC
+                   LIMIT 80"""
+            ).fetchall()
+        ]
+
+    active_cards = [c for c in state["cards"] if c["status"] == "active"]
+    active_loans = [l for l in state["loans"] if l["status"] == "active"]
+
+    total_credit_limit = round(sum(c["credit_limit"] for c in active_cards), 2)
+    total_card_debt = round(sum(c["current_debt"] for c in active_cards), 2)
+    total_available_credit = round(sum(c["available_credit"] for c in active_cards), 2)
+    total_remaining_bill = round(sum(c["remaining_bill"] for c in active_cards), 2)
+
+    total_loan_principal = round(sum(l["remaining_principal"] for l in active_loans), 2)
+    total_loan_month_rem = round(sum(l["remaining_month_payment"] for l in active_loans), 2)
+
+    overall_utilization = round((total_card_debt / total_credit_limit) * 100, 1) if total_credit_limit > 0 else 0.0
+    total_fee_spent = round(sum(float(o.get("fee_amount") or 0) for o in ops), 2)
+
+    return {
+        "cards": state["cards"],
+        "loans": state["loans"],
+        "operations": ops,
+        "suggested_cash": state["suggested_cash"],
+        "summary": {
+            "active_card_count": len(active_cards),
+            "active_loan_count": len(active_loans),
+            "total_credit_limit": total_credit_limit,
+            "total_card_debt": total_card_debt,
+            "total_available_credit": total_available_credit,
+            "overall_utilization_pct": overall_utilization,
+            "total_remaining_bill": total_remaining_bill,
+            "total_loan_principal": total_loan_principal,
+            "total_loan_month_remaining": total_loan_month_rem,
+            "total_debt": round(total_card_debt + total_loan_principal, 2),
+            "total_fee_spent": total_fee_spent,
+        },
+    }
+
+
+@app.post("/api/debt/cards")
+def create_credit_card(payload: CreditCardCreate) -> Dict[str, Any]:
+    ts = now_iso()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO credit_cards
+            (name, bank_name, last4, account_id, credit_limit, current_debt, statement_bill_amount, paid_amount_this_cycle, min_payment, statement_day, due_day, grace_days, swipe_fee_rate, status, notes, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                payload.name.strip(),
+                payload.bank_name.strip(),
+                payload.last4.strip(),
+                payload.account_id,
+                round(payload.credit_limit, 2),
+                round(payload.current_debt, 2),
+                round(payload.statement_bill_amount, 2),
+                round(payload.paid_amount_this_cycle, 2),
+                round(payload.min_payment, 2),
+                payload.statement_day,
+                payload.due_day,
+                payload.grace_days,
+                round(payload.swipe_fee_rate, 5),
+                payload.status,
+                payload.notes.strip(),
+                ts,
+                ts,
+            ),
+        )
+        row = conn.execute("SELECT * FROM credit_cards WHERE id = ?", (cur.lastrowid,)).fetchone()
+        return enrich_credit_card(_row_to_dict(row))
+
+
+@app.patch("/api/debt/cards/{card_id}")
+def update_credit_card(card_id: int, payload: CreditCardUpdate) -> Dict[str, Any]:
+    updates = payload.model_dump(exclude_unset=True)
+    if not updates:
+        raise HTTPException(status_code=400, detail="无更新字段")
+    updates["updated_at"] = now_iso()
+    sets = ", ".join(f"{k} = ?" for k in updates.keys())
+    params = list(updates.values()) + [card_id]
+    with get_conn() as conn:
+        cur = conn.execute(f"UPDATE credit_cards SET {sets} WHERE id = ?", params)
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="信用卡不存在")
+        row = conn.execute("SELECT * FROM credit_cards WHERE id = ?", (card_id,)).fetchone()
+        return enrich_credit_card(_row_to_dict(row))
+
+
+@app.delete("/api/debt/cards/{card_id}")
+def delete_credit_card(card_id: int) -> Dict[str, bool]:
+    with get_conn() as conn:
+        cur = conn.execute("DELETE FROM credit_cards WHERE id = ?", (card_id,))
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="信用卡不存在")
+        return {"deleted": True}
+
+
+@app.post("/api/debt/loans")
+def create_loan(payload: LoanCreate) -> Dict[str, Any]:
+    ts = now_iso()
+    rem_principal = payload.remaining_principal if payload.remaining_principal > 0 else payload.total_principal
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO loans
+            (name, lender, total_principal, remaining_principal, monthly_payment, paid_this_month, due_day, apr, remaining_periods, account_id, status, notes, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                payload.name.strip(),
+                payload.lender.strip(),
+                round(payload.total_principal, 2),
+                round(rem_principal, 2),
+                round(payload.monthly_payment, 2),
+                round(payload.paid_this_month, 2),
+                payload.due_day,
+                round(payload.apr, 2),
+                payload.remaining_periods,
+                payload.account_id,
+                payload.status,
+                payload.notes.strip(),
+                ts,
+                ts,
+            ),
+        )
+        row = conn.execute("SELECT * FROM loans WHERE id = ?", (cur.lastrowid,)).fetchone()
+        return enrich_loan(_row_to_dict(row))
+
+
+@app.patch("/api/debt/loans/{loan_id}")
+def update_loan(loan_id: int, payload: LoanUpdate) -> Dict[str, Any]:
+    updates = payload.model_dump(exclude_unset=True)
+    if not updates:
+        raise HTTPException(status_code=400, detail="无更新字段")
+    updates["updated_at"] = now_iso()
+    sets = ", ".join(f"{k} = ?" for k in updates.keys())
+    params = list(updates.values()) + [loan_id]
+    with get_conn() as conn:
+        cur = conn.execute(f"UPDATE loans SET {sets} WHERE id = ?", params)
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="贷款记录不存在")
+        row = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
+        return enrich_loan(_row_to_dict(row))
+
+
+@app.delete("/api/debt/loans/{loan_id}")
+def delete_loan(loan_id: int) -> Dict[str, bool]:
+    with get_conn() as conn:
+        cur = conn.execute("DELETE FROM loans WHERE id = ?", (loan_id,))
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="贷款记录不存在")
+        return {"deleted": True}
+
+
+@app.post("/api/debt/plan")
+def plan_debt_repayment(payload: DebtPlanRequest) -> Dict[str, Any]:
+    with get_conn() as conn:
+        state = _load_debt_state(conn)
+    cash = state["suggested_cash"] if payload.available_cash is None else float(payload.available_cash)
+    return plan_optimal_repayment_paths(
+        cards=state["cards"],
+        loans=state["loans"],
+        available_cash=cash,
+        horizon_days=payload.horizon_days,
+        reserve_ratio=payload.reserve_ratio,
+        strategy=payload.strategy,
+        allow_relay=payload.allow_relay,
+    )
+
+
+@app.post("/api/debt/operations")
+def execute_debt_operation(payload: DebtOperationCreate) -> Dict[str, Any]:
+    ts = now_iso()
+    op_date = (payload.op_date or datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")).strip()
+    amt = round(float(payload.amount), 2)
+    fee = round(float(payload.fee_amount or 0.0), 2)
+
+    with get_conn() as conn:
+        if payload.op_type == "swipe_repay_card":
+            if not payload.source_card_id or not payload.target_card_id:
+                raise HTTPException(status_code=400, detail="刷卡还卡需要指定来源信用卡和目标信用卡")
+            if payload.source_card_id == payload.target_card_id:
+                raise HTTPException(status_code=400, detail="来源卡与目标卡不能相同")
+            src = conn.execute("SELECT * FROM credit_cards WHERE id = ?", (payload.source_card_id,)).fetchone()
+            tgt = conn.execute("SELECT * FROM credit_cards WHERE id = ?", (payload.target_card_id,)).fetchone()
+            if not src or not tgt:
+                raise HTTPException(status_code=404, detail="信用卡不存在")
+            conn.execute(
+                "UPDATE credit_cards SET current_debt = ROUND(current_debt + ?, 2), updated_at = ? WHERE id = ?",
+                (amt, ts, payload.source_card_id),
+            )
+            conn.execute(
+                """UPDATE credit_cards
+                SET current_debt = MAX(0, ROUND(current_debt - ?, 2)),
+                    paid_amount_this_cycle = ROUND(paid_amount_this_cycle + ?, 2),
+                    updated_at = ?
+                WHERE id = ?""",
+                (amt, amt, ts, payload.target_card_id),
+            )
+            desc = payload.note.strip() or f"刷「{src['name']}」还「{tgt['name']}」¥{amt:.2f}（手续费 ¥{fee:.2f}）"
+            tx_amt = fee
+            tx_cat = "手续费"
+
+        elif payload.op_type == "cash_repay_card":
+            if not payload.target_card_id:
+                raise HTTPException(status_code=400, detail="请指定还款目标信用卡")
+            tgt = conn.execute("SELECT * FROM credit_cards WHERE id = ?", (payload.target_card_id,)).fetchone()
+            if not tgt:
+                raise HTTPException(status_code=404, detail="目标信用卡不存在")
+            conn.execute(
+                """UPDATE credit_cards
+                SET current_debt = MAX(0, ROUND(current_debt - ?, 2)),
+                    paid_amount_this_cycle = ROUND(paid_amount_this_cycle + ?, 2),
+                    updated_at = ?
+                WHERE id = ?""",
+                (amt, amt, ts, payload.target_card_id),
+            )
+            if payload.source_account_id:
+                _apply_tx_to_account(conn, payload.source_account_id, "expense", amt)
+            desc = payload.note.strip() or f"现金还信用卡「{tgt['name']}」¥{amt:.2f}"
+            tx_amt = amt
+            tx_cat = "信用卡还款"
+
+        elif payload.op_type == "repay_loan":
+            if not payload.target_loan_id:
+                raise HTTPException(status_code=400, detail="请指定还款目标贷款")
+            loan = conn.execute("SELECT * FROM loans WHERE id = ?", (payload.target_loan_id,)).fetchone()
+            if not loan:
+                raise HTTPException(status_code=404, detail="贷款记录不存在")
+            conn.execute(
+                """UPDATE loans
+                SET paid_this_month = ROUND(paid_this_month + ?, 2),
+                    remaining_principal = MAX(0, ROUND(remaining_principal - ?, 2)),
+                    updated_at = ?
+                WHERE id = ?""",
+                (amt, amt, ts, payload.target_loan_id),
+            )
+            if payload.source_account_id:
+                _apply_tx_to_account(conn, payload.source_account_id, "expense", amt)
+            desc = payload.note.strip() or f"偿还贷款「{loan['name']}」¥{amt:.2f}"
+            tx_amt = amt
+            tx_cat = "贷款月供"
+
+        elif payload.op_type == "swipe_cash_out":
+            if not payload.source_card_id:
+                raise HTTPException(status_code=400, detail="请指定刷出资金的信用卡")
+            src = conn.execute("SELECT * FROM credit_cards WHERE id = ?", (payload.source_card_id,)).fetchone()
+            if not src:
+                raise HTTPException(status_code=404, detail="来源信用卡不存在")
+            conn.execute(
+                "UPDATE credit_cards SET current_debt = ROUND(current_debt + ?, 2), updated_at = ? WHERE id = ?",
+                (amt, ts, payload.source_card_id),
+            )
+            loan_name = ""
+            if payload.target_loan_id:
+                loan = conn.execute("SELECT * FROM loans WHERE id = ?", (payload.target_loan_id,)).fetchone()
+                if loan:
+                    loan_name = loan["name"]
+                    conn.execute(
+                        """UPDATE loans
+                        SET paid_this_month = ROUND(paid_this_month + ?, 2),
+                            remaining_principal = MAX(0, ROUND(remaining_principal - ?, 2)),
+                            updated_at = ?
+                        WHERE id = ?""",
+                        (amt, amt, ts, payload.target_loan_id),
+                    )
+            desc = payload.note.strip() or (
+                f"刷「{src['name']}」周转偿还贷款「{loan_name}」¥{amt:.2f}（手续费 ¥{fee:.2f}）"
+                if loan_name
+                else f"刷「{src['name']}」周转 ¥{amt:.2f}（手续费 ¥{fee:.2f}）"
+            )
+            tx_amt = fee
+            tx_cat = "手续费"
+        else:
+            raise HTTPException(status_code=400, detail="不支持的操作类型")
+
+        tx_id = None
+        if payload.sync_to_finance and tx_amt > 0:
+            cur_tx = conn.execute(
+                """INSERT INTO transactions
+                (type, amount, category, account_id, description, occurred_at, settlement_id, source_type, external_ref, created_at)
+                VALUES ('expense', ?, ?, ?, ?, ?, NULL, 'debt_plan', '', ?)""",
+                (tx_amt, tx_cat, payload.source_account_id, desc, op_date, ts),
+            )
+            tx_id = cur_tx.lastrowid
+
+        cur_op = conn.execute(
+            """INSERT INTO debt_operations
+            (op_type, source_card_id, source_account_id, target_card_id, target_loan_id, amount, fee_amount, op_date, note, tx_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                payload.op_type,
+                payload.source_card_id,
+                payload.source_account_id,
+                payload.target_card_id,
+                payload.target_loan_id,
+                amt,
+                fee,
+                op_date,
+                desc,
+                tx_id,
+                ts,
+            ),
+        )
+        op_row = _row_to_dict(conn.execute("SELECT * FROM debt_operations WHERE id = ?", (cur_op.lastrowid,)).fetchone())
+        return op_row
+
+
+@app.delete("/api/debt/operations/{op_id}")
+def undo_debt_operation(op_id: int) -> Dict[str, bool]:
+    ts = now_iso()
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM debt_operations WHERE id = ?", (op_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="操作记录不存在")
+        op = _row_to_dict(row)
+        amt = float(op["amount"])
+        op_type = op["op_type"]
+
+        if op_type == "swipe_repay_card":
+            if op.get("source_card_id"):
+                conn.execute(
+                    "UPDATE credit_cards SET current_debt = MAX(0, ROUND(current_debt - ?, 2)), updated_at = ? WHERE id = ?",
+                    (amt, ts, op["source_card_id"]),
+                )
+            if op.get("target_card_id"):
+                conn.execute(
+                    """UPDATE credit_cards
+                    SET current_debt = ROUND(current_debt + ?, 2),
+                        paid_amount_this_cycle = MAX(0, ROUND(paid_amount_this_cycle - ?, 2)),
+                        updated_at = ?
+                    WHERE id = ?""",
+                    (amt, amt, ts, op["target_card_id"]),
+                )
+        elif op_type == "cash_repay_card":
+            if op.get("target_card_id"):
+                conn.execute(
+                    """UPDATE credit_cards
+                    SET current_debt = ROUND(current_debt + ?, 2),
+                        paid_amount_this_cycle = MAX(0, ROUND(paid_amount_this_cycle - ?, 2)),
+                        updated_at = ?
+                    WHERE id = ?""",
+                    (amt, amt, ts, op["target_card_id"]),
+                )
+            if op.get("source_account_id"):
+                _apply_tx_to_account(conn, op["source_account_id"], "expense", amt, reverse=True)
+        elif op_type == "repay_loan":
+            if op.get("target_loan_id"):
+                conn.execute(
+                    """UPDATE loans
+                    SET paid_this_month = MAX(0, ROUND(paid_this_month - ?, 2)),
+                        remaining_principal = ROUND(remaining_principal + ?, 2),
+                        updated_at = ?
+                    WHERE id = ?""",
+                    (amt, amt, ts, op["target_loan_id"]),
+                )
+            if op.get("source_account_id"):
+                _apply_tx_to_account(conn, op["source_account_id"], "expense", amt, reverse=True)
+        elif op_type == "swipe_cash_out":
+            if op.get("source_card_id"):
+                conn.execute(
+                    "UPDATE credit_cards SET current_debt = MAX(0, ROUND(current_debt - ?, 2)), updated_at = ? WHERE id = ?",
+                    (amt, ts, op["source_card_id"]),
+                )
+            if op.get("target_loan_id"):
+                conn.execute(
+                    """UPDATE loans
+                    SET paid_this_month = MAX(0, ROUND(paid_this_month - ?, 2)),
+                        remaining_principal = ROUND(remaining_principal + ?, 2),
+                        updated_at = ?
+                    WHERE id = ?""",
+                    (amt, amt, ts, op["target_loan_id"]),
+                )
+
+        if op.get("tx_id"):
+            conn.execute("DELETE FROM transactions WHERE id = ?", (op["tx_id"],))
+        conn.execute("DELETE FROM debt_operations WHERE id = ?", (op_id,))
+        return {"deleted": True}
+
+
+@app.post("/api/debt/sync-reminders")
+async def sync_debt_reminders(within_days: int = Query(5, ge=1, le=30)) -> Dict[str, Any]:
+    ts = now_iso()
+    created: List[Dict[str, Any]] = []
+    with get_conn() as conn:
+        state = _load_debt_state(conn)
+        for c in state["cards"]:
+            if c["status"] != "active" or c["remaining_bill"] <= 0:
+                continue
+            if c["days_until_due"] <= within_days:
+                source_ref = f"信用卡 #{c['id']} ({c['next_due_date']})"
+                exists = conn.execute(
+                    "SELECT id FROM reminders WHERE source_type = 'debt_bill' AND source_ref = ? AND status = 'pending'",
+                    (source_ref,),
+                ).fetchone()
+                if not exists:
+                    cur = conn.execute(
+                        """INSERT INTO reminders
+                        (title, description, due_at, priority, category, status, source_type, source_ref, linked_amount, linked_tx_type, created_at, updated_at)
+                        VALUES (?, ?, ?, 'high', 'finance', 'pending', 'debt_bill', ?, ?, 'expense', ?, ?)""",
+                        (
+                            f"信用卡还款：{c['name']} 剩余 ¥{c['remaining_bill']:.2f}",
+                            f"还款日：{c['next_due_date']}（还有 {c['days_until_due']} 天，宽限期 {c['grace_days']} 天），当前总欠款 ¥{c['current_debt']:.2f}",
+                            f"{c['next_due_date']}T10:00",
+                            source_ref,
+                            c["remaining_bill"],
+                            ts,
+                            ts,
+                        ),
+                    )
+                    created.append(_row_to_dict(conn.execute("SELECT * FROM reminders WHERE id = ?", (cur.lastrowid,)).fetchone()))
+
+        for l in state["loans"]:
+            if l["status"] != "active" or l["remaining_month_payment"] <= 0:
+                continue
+            if l["days_until_due"] <= within_days:
+                source_ref = f"贷款 #{l['id']} ({l['next_due_date']})"
+                exists = conn.execute(
+                    "SELECT id FROM reminders WHERE source_type = 'debt_bill' AND source_ref = ? AND status = 'pending'",
+                    (source_ref,),
+                ).fetchone()
+                if not exists:
+                    cur = conn.execute(
+                        """INSERT INTO reminders
+                        (title, description, due_at, priority, category, status, source_type, source_ref, linked_amount, linked_tx_type, created_at, updated_at)
+                        VALUES (?, ?, ?, 'high', 'finance', 'pending', 'debt_bill', ?, ?, 'expense', ?, ?)""",
+                        (
+                            f"贷款月供：{l['name']} 应还 ¥{l['remaining_month_payment']:.2f}",
+                            f"还款日：{l['next_due_date']}（还有 {l['days_until_due']} 天，无宽限期请优先确保储蓄卡余额充足）",
+                            f"{l['next_due_date']}T09:30",
+                            source_ref,
+                            l["remaining_month_payment"],
+                            ts,
+                            ts,
+                        ),
+                    )
+                    created.append(_row_to_dict(conn.execute("SELECT * FROM reminders WHERE id = ?", (cur.lastrowid,)).fetchone()))
+
+    if created:
+        await _push_new_reminders_bark(created, prefix="💳 还款日临近：")
     return {"created_count": len(created), "reminders": created}
 
 
