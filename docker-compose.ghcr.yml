@@ -26,4 +26,4 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       # 若镜像为私有（已通过 sudo docker login ghcr.io 登录），请取消下方注释以提供认证凭据：
       # - /root/.docker/config.json:/config.json:ro
-    command: --cleanup --interval 300 lifehub
+    command: --cleanup --debug --interval 300 lifehub
