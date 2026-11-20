@@ -138,7 +138,7 @@ export const RemindersChatView: React.FC<Props> = ({ onRefreshDashboard, onNotif
     setChatInput('');
     setMessages((prev) => [
       ...prev,
-      { id: tempId, role: 'user', content: text, created_at: new Date().toISOString() },
+      { id: tempId, role: 'user', content: text, actions: [], created_at: new Date().toISOString() },
     ]);
     setSending(true);
     try {
