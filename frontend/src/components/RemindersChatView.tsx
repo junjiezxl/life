@@ -134,7 +134,12 @@ export const RemindersChatView: React.FC<Props> = ({ onRefreshDashboard, onNotif
     e.preventDefault();
     if (!chatInput.trim() || sending) return;
     const text = chatInput.trim();
+    const tempId = -Date.now();
     setChatInput('');
+    setMessages((prev) => [
+      ...prev,
+      { id: tempId, role: 'user', content: text, created_at: new Date().toISOString() },
+    ]);
     setSending(true);
     try {
       await api.sendChat(text);
@@ -142,6 +147,8 @@ export const RemindersChatView: React.FC<Props> = ({ onRefreshDashboard, onNotif
       await loadReminders();
       onRefreshDashboard();
     } catch (err) {
+      setMessages((prev) => prev.filter((m) => m.id !== tempId));
+      setChatInput(text);
       onNotify(err instanceof Error ? err.message : '发送失败');
     } finally {
       setSending(false);
