@@ -26,6 +26,7 @@ export const SettingsView: React.FC<Props> = ({
   } | null>(null);
   const [emailTestResult, setEmailTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [barkTestResult, setBarkTestResult] = useState<{ ok: boolean; message: string } | null>(null);
+  const [ctraderTestResult, setCtraderTestResult] = useState<{ ok: boolean; message: string } | null>(null);
 
   // Account security state
   const [newUsername, setNewUsername] = useState(currentUsername);
@@ -86,6 +87,19 @@ export const SettingsView: React.FC<Props> = ({
     await api.updateSettings(settings);
     const res = await api.testBark();
     setBarkTestResult(res);
+  };
+
+  const handleTestCTrader = async () => {
+    await api.updateSettings(settings);
+    try {
+      const res = await api.testCTrader();
+      setCtraderTestResult({ ok: res.ok, message: res.message });
+    } catch (err) {
+      setCtraderTestResult({
+        ok: false,
+        message: err instanceof Error ? err.message : 'cTrader 连接失败',
+      });
+    }
   };
 
   const handleReset = async (reseed: boolean) => {
@@ -607,6 +621,121 @@ export const SettingsView: React.FC<Props> = ({
           >
             {barkTestResult.ok ? <CheckCircle2 className="h-4 w-4" /> : <XCircle className="h-4 w-4" />}
             <span>{barkTestResult.message}</span>
+          </div>
+        )}
+      </div>
+
+      {/* cTrader OpenAPI */}
+      <div className="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-xs space-y-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <h3 className="text-sm font-semibold text-slate-900">cTrader OpenAPI 配置（订单拉取与实时推送）</h3>
+            <p className="text-xs text-slate-500">
+              替代原有的文件配置，直接在页面管理 cTrader API Key、账户与自动同步推送。
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={handleTestCTrader}
+            className="rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-1.5 text-xs font-medium text-amber-700 hover:bg-amber-100 cursor-pointer"
+          >
+            测试连接
+          </button>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-6 text-xs text-slate-700">
+          <label className="inline-flex items-center gap-2 font-medium cursor-pointer">
+            <input
+              type="checkbox"
+              checked={settings.ctrader_auto_sync_enabled === '1'}
+              onChange={(e) => updateField('ctrader_auto_sync_enabled', e.target.checked ? '1' : '0')}
+            />
+            <span>开启后台自动拉取新订单</span>
+          </label>
+          <label className="inline-flex items-center gap-2 font-medium cursor-pointer">
+            <input
+              type="checkbox"
+              checked={settings.ctrader_bark_push_enabled !== '0'}
+              onChange={(e) => updateField('ctrader_bark_push_enabled', e.target.checked ? '1' : '0')}
+            />
+            <span>新成交订单通过 Bark 实时推送</span>
+          </label>
+        </div>
+
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+          <div>
+            <label className="mb-1 block text-xs font-medium text-slate-600">Client ID</label>
+            <input
+              type="text"
+              value={settings.ctrader_client_id || ''}
+              onChange={(e) => updateField('ctrader_client_id', e.target.value)}
+              placeholder="cTrader OpenAPI Client ID"
+              className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-amber-500"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs font-medium text-slate-600">Client Secret</label>
+            <input
+              type="password"
+              value={settings.ctrader_client_secret || ''}
+              onChange={(e) => updateField('ctrader_client_secret', e.target.value)}
+              placeholder="cTrader OpenAPI Client Secret"
+              className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-amber-500"
+            />
+          </div>
+          <div className="md:col-span-2">
+            <label className="mb-1 block text-xs font-medium text-slate-600">Access Token</label>
+            <input
+              type="password"
+              value={settings.ctrader_access_token || ''}
+              onChange={(e) => updateField('ctrader_access_token', e.target.value)}
+              placeholder="cTrader OpenAPI Access Token"
+              className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-amber-500"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs font-medium text-slate-600">Account ID（账户号 / ctidTraderAccountId）</label>
+            <input
+              type="text"
+              value={settings.ctrader_account_id || ''}
+              onChange={(e) => updateField('ctrader_account_id', e.target.value)}
+              placeholder="例如 1396743"
+              className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-amber-500"
+            />
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="mb-1 block text-xs font-medium text-slate-600">环境</label>
+              <select
+                value={settings.ctrader_environment || 'demo'}
+                onChange={(e) => updateField('ctrader_environment', e.target.value)}
+                className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm outline-none focus:border-amber-500"
+              >
+                <option value="demo">Demo（模拟）</option>
+                <option value="live">Live（实盘）</option>
+              </select>
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-slate-600">轮询间隔（秒）</label>
+              <input
+                type="number"
+                min={15}
+                value={settings.ctrader_sync_interval_sec || '60'}
+                onChange={(e) => updateField('ctrader_sync_interval_sec', e.target.value)}
+                className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-amber-500"
+              />
+            </div>
+          </div>
+        </div>
+
+        {ctraderTestResult && (
+          <div
+            className={`flex items-center gap-2 rounded-xl px-4 py-2.5 text-xs ${
+              ctraderTestResult.ok ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-700'
+            }`}
+          >
+            {ctraderTestResult.ok ? <CheckCircle2 className="h-4 w-4" /> : <XCircle className="h-4 w-4" />}
+            <span>{ctraderTestResult.message}</span>
           </div>
         )}
       </div>

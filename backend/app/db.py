@@ -62,6 +62,14 @@ DEFAULT_SETTINGS: Dict[str, str] = {
     "bark_sound": "bell",
     "bark_push_on_create": "1",
     "bark_due_advance_min": "15",
+    "ctrader_client_id": "",
+    "ctrader_client_secret": "",
+    "ctrader_access_token": "",
+    "ctrader_account_id": "",
+    "ctrader_environment": "demo",
+    "ctrader_auto_sync_enabled": "0",
+    "ctrader_sync_interval_sec": "60",
+    "ctrader_bark_push_enabled": "1",
 }
 
 
@@ -163,6 +171,27 @@ def init_db(seed_demo: bool = True) -> None:
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
                 actions_json TEXT DEFAULT '[]',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS ctrader_deals (
+                deal_id TEXT PRIMARY KEY,
+                order_id TEXT DEFAULT '',
+                position_id TEXT DEFAULT '',
+                account_id TEXT NOT NULL DEFAULT '',
+                symbol_id INTEGER DEFAULT 0,
+                symbol_name TEXT DEFAULT '',
+                side TEXT DEFAULT '',
+                volume REAL NOT NULL DEFAULT 0,
+                price REAL NOT NULL DEFAULT 0,
+                commission REAL NOT NULL DEFAULT 0,
+                swap REAL NOT NULL DEFAULT 0,
+                gross_profit REAL NOT NULL DEFAULT 0,
+                net_profit REAL NOT NULL DEFAULT 0,
+                status TEXT DEFAULT '',
+                executed_at TEXT NOT NULL,
+                pushed_at TEXT DEFAULT '',
+                raw_json TEXT DEFAULT '{}',
                 created_at TEXT NOT NULL
             );
 

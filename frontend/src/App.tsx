@@ -14,6 +14,8 @@ import {
 import { api, setUnauthorizedHandler } from './api';
 import { DashboardView } from './components/DashboardView';
 import { FinanceSettlementView } from './components/FinanceSettlementView';
+import { CTraderOrdersView } from './components/CTraderOrdersView';
+import { Activity } from 'lucide-react';
 import { LoginView } from './components/LoginView';
 import { NotesExtractorView } from './components/NotesExtractorView';
 import { PhoneNumbersView } from './components/PhoneNumbersView';
@@ -27,6 +29,7 @@ const NAV_ITEMS: Array<{ key: TabKey; label: string; icon: React.ComponentType<{
   { key: 'notes', label: '思源笔记提取', icon: FileText },
   { key: 'phones', label: '手机号码管理', icon: Smartphone },
   { key: 'finance', label: '个人财务 & 结账', icon: Wallet },
+  { key: 'ctrader', label: 'cTrader 订单', icon: Activity },
   { key: 'settings', label: '系统设置', icon: Settings },
 ];
 
@@ -272,6 +275,12 @@ export function App() {
             )}
             {activeTab === 'finance' && (
               <FinanceSettlementView onRefreshDashboard={loadDashboard} onNotify={notify} />
+            )}
+            {activeTab === 'ctrader' && (
+              <CTraderOrdersView
+                onNotify={notify}
+                onNavigateSettings={() => setActiveTab('settings')}
+              />
             )}
             {activeTab === 'settings' && (
               <SettingsView

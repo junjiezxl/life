@@ -1,4 +1,46 @@
-export type TabKey = 'dashboard' | 'reminders' | 'notes' | 'phones' | 'finance' | 'settings';
+export type TabKey = 'dashboard' | 'reminders' | 'notes' | 'phones' | 'finance' | 'ctrader' | 'settings';
+
+export interface CTraderDeal {
+  deal_id: string;
+  order_id: string;
+  position_id: string;
+  account_id: string;
+  symbol_id: number;
+  symbol_name: string;
+  side: string;
+  volume: number;
+  price: number;
+  commission: number;
+  swap: number;
+  gross_profit: number;
+  net_profit: number;
+  status: string;
+  executed_at: string;
+  pushed_at: string;
+}
+
+export interface CTraderStats {
+  total_deals: number;
+  total_net_profit: number;
+  total_volume: number;
+  win_rate: number;
+}
+
+export interface CTraderDealsResponse {
+  deals: CTraderDeal[];
+  stats: CTraderStats;
+}
+
+export interface CTraderSyncResponse {
+  ok: boolean;
+  account_id: string;
+  environment: string;
+  fetched: number;
+  inserted: number;
+  updated: number;
+  pushed: number;
+  synced_at: string;
+}
 
 export interface Reminder {
   id: number;

@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .db import get_all_settings, get_conn, init_db, now_iso, reset_all_data, update_settings
 from .models import (
+    CTraderSyncRequest,
     AccountCreate,
     AccountUpdate,
     AuthChangePasswordRequest,
@@ -65,6 +66,11 @@ from .services.auth_service import (
     update_user_credentials,
 )
 from .services.bark_service import format_reminder_bark_message, send_bark_push
+from .services.ctrader_service import (
+    list_ctrader_deals,
+    sync_ctrader_deals,
+    test_ctrader_connection,
+)
 from .services.bill_parser import parse_bill_file
 from .services.debt_planner_service import (
     enrich_credit_card,
@@ -278,14 +284,53 @@ async def _bark_due_reminder_loop() -> None:
         await asyncio.sleep(60)
 
 
+async def _ctrader_auto_sync_loop() -> None:
+    while True:
+        await asyncio.sleep(30)
+        try:
+            settings = get_all_settings()
+            if settings.get("ctrader_auto_sync_enabled") != "1":
+                continue
+            interval_sec = max(15, int(settings.get("ctrader_sync_interval_sec") or "60"))
+            await sync_ctrader_deals(days=3, push_new=True)
+            await asyncio.sleep(max(0, interval_sec - 30))
+        except Exception:
+            pass
+
+
 @app.on_event("startup")
 async def on_startup() -> None:
     init_db(seed_demo=True)
     asyncio.create_task(_email_auto_sync_loop())
     asyncio.create_task(_bark_due_reminder_loop())
+    asyncio.create_task(_ctrader_auto_sync_loop())
 
 
 # ---------------- Auth & Health ----------------
+
+
+# ---------------- cTrader Orders ----------------
+
+
+@app.get("/api/ctrader/deals")
+def api_ctrader_deals(limit: int = 200) -> Dict[str, Any]:
+    return list_ctrader_deals(limit=limit)
+
+
+@app.post("/api/ctrader/sync")
+async def api_ctrader_sync(payload: CTraderSyncRequest) -> Dict[str, Any]:
+    try:
+        return await sync_ctrader_deals(days=payload.days, push_new=payload.push_new)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/ctrader/test")
+async def api_ctrader_test() -> Dict[str, Any]:
+    try:
+        return await test_ctrader_connection()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/health")

@@ -187,6 +187,19 @@ class SettingsUpdateRequest(BaseModel):
     bark_sound: Optional[str] = None
     bark_push_on_create: Optional[str] = None
     bark_due_advance_min: Optional[str] = None
+    ctrader_client_id: Optional[str] = None
+    ctrader_client_secret: Optional[str] = None
+    ctrader_access_token: Optional[str] = None
+    ctrader_account_id: Optional[str] = None
+    ctrader_environment: Optional[str] = None
+    ctrader_auto_sync_enabled: Optional[str] = None
+    ctrader_sync_interval_sec: Optional[str] = None
+    ctrader_bark_push_enabled: Optional[str] = None
+
+
+class CTraderSyncRequest(BaseModel):
+    days: int = Field(default=7, ge=1, le=90)
+    push_new: bool = True
 
 
 class PhoneNumberCreate(BaseModel):

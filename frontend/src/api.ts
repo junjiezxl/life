@@ -360,6 +360,16 @@ export const api = {
     request<AppSettings>('/api/settings', { method: 'PUT', body: JSON.stringify(updates) }),
   testAi: () => request<{ ok: boolean; provider: string; message: string }>('/api/settings/test-ai', { method: 'POST' }),
   testBark: () => request<{ ok: boolean; message: string }>('/api/settings/test-bark', { method: 'POST' }),
+  getCTraderDeals: (limit = 200) => request<import('./types').CTraderDealsResponse>(`/api/ctrader/deals?limit=${limit}`),
+  syncCTraderDeals: (days = 7, pushNew = true) =>
+    request<import('./types').CTraderSyncResponse>('/api/ctrader/sync', {
+      method: 'POST',
+      body: JSON.stringify({ days, push_new: pushNew }),
+    }),
+  testCTrader: () =>
+    request<{ ok: boolean; account_id: string; environment: string; message: string }>('/api/ctrader/test', {
+      method: 'POST',
+    }),
   resetData: (reseed = false) =>
     request<{ ok: boolean; reseeded: boolean }>(`/api/settings/reset-data?reseed=${reseed}`, { method: 'POST' }),
 };
