@@ -862,21 +862,32 @@ export const PhoneNumbersView: React.FC<Props> = ({ onRefreshDashboard, onNotify
           暂无手机号码记录，点击右上角「新增手机号码」开始管理你的国内外号码与保号规则。
         </div>
       ) : (
-        <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
-          {filteredItems.map((item) => {
-            const st = STATUS_META[item.status] || STATUS_META.active;
-            const daysLeft = item.keep_alive_days_left;
-            const services = item.bound_services
-              ? item.bound_services.split(/[,，、]/).map((s) => s.trim()).filter(Boolean)
-              : [];
+        <div className="space-y-3">
+          {(() => {
+            const visibleIds = new Set(filteredItems.map((x) => x.id));
+            const topLevelItems =
+              regionFilter === 'subcards'
+                ? filteredItems
+                : filteredItems.filter((x) => !x.parent_phone_id || !visibleIds.has(x.parent_phone_id));
 
-            return (
-              <div
-                key={item.id}
-                className={`rounded-2xl border bg-white p-5 shadow-xs space-y-4 ${
-                  item.parent_phone_id ? 'border-slate-200/80 border-l-4 border-l-indigo-400' : 'border-slate-200/80'
-                }`}
-              >
+            const renderPhoneRow = (item: PhoneNumber, isNestedSub = false) => {
+              const st = STATUS_META[item.status] || STATUS_META.active;
+              const daysLeft = item.keep_alive_days_left;
+              const services = item.bound_services
+                ? item.bound_services.split(/[,，、]/).map((s) => s.trim()).filter(Boolean)
+                : [];
+
+              return (
+                <div
+                  key={item.id}
+                  className={`rounded-2xl border bg-white p-4 shadow-xs space-y-3 ${
+                    isNestedSub
+                      ? 'border-indigo-100 bg-slate-50/50 border-l-4 border-l-violet-400'
+                      : item.parent_phone_id
+                        ? 'border-slate-200/80 border-l-4 border-l-indigo-400'
+                        : 'border-slate-200/80'
+                  }`}
+                >
                 {/* Header */}
                 <div className="flex items-start justify-between gap-3">
                   <div>
@@ -1116,7 +1127,25 @@ export const PhoneNumbersView: React.FC<Props> = ({ onRefreshDashboard, onNotify
                 )}
               </div>
             );
-          })}
+            };
+
+            return topLevelItems.map((item) => {
+              const subItems =
+                regionFilter === 'subcards'
+                  ? []
+                  : filteredItems.filter((x) => x.parent_phone_id === item.id);
+              return (
+                <div key={item.id} className="space-y-2">
+                  {renderPhoneRow(item, false)}
+                  {subItems.length > 0 && (
+                    <div className="ml-6 pl-4 border-l-2 border-indigo-200 space-y-2">
+                      {subItems.map((sub) => renderPhoneRow(sub, true))}
+                    </div>
+                  )}
+                </div>
+              );
+            });
+          })()}
         </div>
       )}
     </div>
