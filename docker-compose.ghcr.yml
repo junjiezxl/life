@@ -17,11 +17,13 @@ services:
     volumes:
       - ./data:/app/backend/data
 
-  # 可选：开启后每 5 分钟检查一次镜像更新，实现 git push 后飞牛自动更新重启
-  # watchtower:
-  #   image: containrrr/watchtower:latest
-  #   container_name: lifehub-watchtower
-  #   restart: unless-stopped
-  #   volumes:
-  #     - /var/run/docker.sock:/var/run/docker.sock
-  #   command: --cleanup --interval 300 lifehub
+  # 每 5 分钟检查一次镜像更新，实现 git push 后飞牛自动更新重启（仅作用于 lifehub 容器）
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: lifehub-watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # 若镜像为私有（已通过 sudo docker login ghcr.io 登录），请取消下方注释以提供认证凭据：
+      # - /root/.docker/config.json:/config.json:ro
+    command: --cleanup --interval 300 lifehub

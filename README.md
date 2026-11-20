@@ -86,8 +86,8 @@ cd frontend && npm run dev
 
 在飞牛 **「Docker -> Compose -> 新增项目」** 中直接填入 [`docker-compose.ghcr.yml`](docker-compose.ghcr.yml) 内容即可启动（无需下载源码到本地编译）：
 
-- 若 `junjiezxl/life` 为**私有仓库**，需先在飞牛 SSH 中执行一次 `docker login ghcr.io`（使用 GitHub PAT 登录），或在 GitHub Packages 中将该镜像设为 Public。
-- 如需 `git push` 后自动更新容器，可取消 `docker-compose.ghcr.yml` 中 `watchtower` 段的注释。
+- 默认已启用 `watchtower`（仅每 5 分钟检查更新 `lifehub` 容器并自动清理旧镜像），实现 `git push` 后自动更新重启；若无需自动更新可删去或注释掉 `watchtower` 段。
+- 若 `junjiezxl/life` 为**私有仓库**，需先在飞牛 SSH 中执行一次 `docker login ghcr.io`（使用 GitHub PAT 登录），并取消 `watchtower` 中 `config.json` 挂载行的注释；或在 GitHub Packages 中将该镜像设为 Public。
 
 ### 方式 B：从源码本地构建
 
