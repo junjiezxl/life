@@ -80,6 +80,17 @@ cd frontend && npm run dev
 
 适用于群晖、飞牛 fnOS、威联通、绿联等支持 Docker Compose 的 NAS：
 
+### 方式 A：使用 GitHub Actions 预构建镜像（推荐，适合飞牛 fnOS）
+
+仓库已配置 `.github/workflows/docker-publish.yml`，每次推送到 `main` 分支后会自动测试并构建推送 `ghcr.io/junjiezxl/life:latest`。
+
+在飞牛 **「Docker -> Compose -> 新增项目」** 中直接填入 [`docker-compose.ghcr.yml`](docker-compose.ghcr.yml) 内容即可启动（无需下载源码到本地编译）：
+
+- 若 `junjiezxl/life` 为**私有仓库**，需先在飞牛 SSH 中执行一次 `docker login ghcr.io`（使用 GitHub PAT 登录），或在 GitHub Packages 中将该镜像设为 Public。
+- 如需 `git push` 后自动更新容器，可取消 `docker-compose.ghcr.yml` 中 `watchtower` 段的注释。
+
+### 方式 B：从源码本地构建
+
 ```bash
 git clone https://github.com/junjiezxl/life.git lifehub
 cd lifehub
@@ -89,6 +100,6 @@ docker compose up -d --build
 启动后访问：`http://<NAS_IP>:8000`
 
 - **数据持久化**：SQLite 数据库自动保存在项目同级 `./data/life_hub.db`（映射到容器 `/app/backend/data`）。如需迁移本机已有数据，将本机 `backend/data/life_hub.db` 复制到 `./data/life_hub.db` 即可。
-- **更新版本**：执行 `git pull && docker compose up -d --build`，数据卷不受影响。
+- **更新版本**：使用方式 A 可在 Docker 界面重新拉取镜像或配合 Watchtower 自动更新；使用方式 B 执行 `git pull && docker compose up -d --build`，数据卷不受影响。
 - **思源笔记连接**：容器内建议使用「直连思源内核 API (`siyuan_api`)」，地址填写 NAS/宿主机局域网 IP（如 `http://192.168.1.x:6806`）。
 - **外网访问安全**：已内置登录鉴权（PBKDF2 密码哈希 + `HttpOnly` 会话 Cookie + 登录防爆破锁定）。首次启动可通过页面向导初始化管理员账号，或在部署到公网前直接通过环境变量预设初始账号密码：`LIFEHUB_AUTH_USERNAME`（默认 `admin`）与 `LIFEHUB_AUTH_PASSWORD`；公网部署请务必配合 HTTPS 反向代理（如 Nginx / Caddy / Cloudflare）。

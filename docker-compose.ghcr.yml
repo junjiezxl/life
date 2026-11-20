@@ -1,0 +1,27 @@
+services:
+  lifehub:
+    image: ghcr.io/junjiezxl/life:latest
+    container_name: lifehub
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - TZ=Asia/Shanghai
+      - LIFEHUB_DB_PATH=/app/backend/data/life_hub.db
+      # 部署到公网时建议预设管理员账号密码（也可首次打开网页初始化）：
+      # - LIFEHUB_AUTH_USERNAME=admin
+      # - LIFEHUB_AUTH_PASSWORD=change_me_strong_password
+      # 如需通过局域网代理访问 Gemini / 外部服务，可取消下方注释：
+      # - HTTP_PROXY=http://192.168.1.10:7890
+      # - HTTPS_PROXY=http://192.168.1.10:7890
+    volumes:
+      - ./data:/app/backend/data
+
+  # 可选：开启后每 5 分钟检查一次镜像更新，实现 git push 后飞牛自动更新重启
+  # watchtower:
+  #   image: containrrr/watchtower:latest
+  #   container_name: lifehub-watchtower
+  #   restart: unless-stopped
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #   command: --cleanup --interval 300 lifehub
