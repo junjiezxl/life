@@ -118,7 +118,7 @@ class _CTraderAsyncClient:
         await self.writer.drain()
 
         resp_proto = await asyncio.wait_for(fut, timeout=timeout)
-        if resp_proto.payloadType == self.oa_msgs.PROTO_OA_ERROR_RES:
+        if resp_proto.payloadType == self.oa_msgs.ProtoOAErrorRes().payloadType:
             err = self.oa_msgs.ProtoOAErrorRes()
             err.ParseFromString(resp_proto.payload)
             raise RuntimeError(f"cTrader OpenAPI 错误 [{err.errorCode}]: {err.description}")
