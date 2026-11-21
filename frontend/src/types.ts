@@ -26,6 +26,8 @@ export interface CTraderStats {
   total_net_profit: number;
   total_volume: number;
   win_rate: number;
+  latest_executed_at?: string;
+  earliest_executed_at?: string;
 }
 
 export interface CTraderDealsResponse {
@@ -33,15 +35,42 @@ export interface CTraderDealsResponse {
   stats: CTraderStats;
 }
 
-export interface CTraderSyncResponse {
-  ok: boolean;
-  account_id: string;
-  environment: string;
-  fetched: number;
+export interface CTraderSyncStatus {
+  running: boolean;
+  mode: string;
+  phase: string;
+  from_time: string;
+  to_time: string;
+  chunks_done: number;
+  chunks_total: number;
+  deals_fetched: number;
+  labels_done: number;
+  labels_total: number;
   inserted: number;
   updated: number;
   pushed: number;
-  synced_at: string;
+  started_at: string;
+  finished_at: string;
+  last_error: string | null;
+  last_result: CTraderSyncResponse | null;
+}
+
+export interface CTraderSyncResponse {
+  ok?: boolean;
+  mode?: string;
+  sync_strategy?: string;
+  account_id?: string;
+  environment?: string;
+  from_time?: string;
+  to_time?: string;
+  fetched?: number;
+  inserted?: number;
+  updated?: number;
+  pushed?: number;
+  synced_at?: string;
+  started?: boolean;
+  already_running?: boolean;
+  status?: CTraderSyncStatus;
 }
 
 export interface CTraderQuote {

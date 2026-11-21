@@ -360,11 +360,28 @@ export const api = {
     request<AppSettings>('/api/settings', { method: 'PUT', body: JSON.stringify(updates) }),
   testAi: () => request<{ ok: boolean; provider: string; message: string }>('/api/settings/test-ai', { method: 'POST' }),
   testBark: () => request<{ ok: boolean; message: string }>('/api/settings/test-bark', { method: 'POST' }),
-  getCTraderDeals: (limit = 200) => request<import('./types').CTraderDealsResponse>(`/api/ctrader/deals?limit=${limit}`),
-  syncCTraderDeals: (days = 7, pushNew = true) =>
+  getCTraderDeals: (limit = 5000) => request<import('./types').CTraderDealsResponse>(`/api/ctrader/deals?limit=${limit}`),
+  getCTraderSyncStatus: () => request<import('./types').CTraderSyncStatus>('/api/ctrader/sync/status'),
+  syncCTraderDeals: (options?: {
+    mode?: 'incremental' | 'range';
+    days?: number;
+    start_date?: string;
+    end_date?: string;
+    overlap_seconds?: number;
+    push_new?: boolean;
+    background?: boolean;
+  }) =>
     request<import('./types').CTraderSyncResponse>('/api/ctrader/sync', {
       method: 'POST',
-      body: JSON.stringify({ days, push_new: pushNew }),
+      body: JSON.stringify({
+        mode: options?.mode ?? 'incremental',
+        days: options?.days ?? 7,
+        start_date: options?.start_date || undefined,
+        end_date: options?.end_date || undefined,
+        overlap_seconds: options?.overlap_seconds ?? 3,
+        push_new: options?.push_new,
+        background: options?.background ?? false,
+      }),
     }),
   testCTrader: () =>
     request<{ ok: boolean; account_id: string; environment: string; message: string }>('/api/ctrader/test', {

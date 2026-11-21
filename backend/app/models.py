@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 
 
@@ -201,8 +201,13 @@ class SettingsUpdateRequest(BaseModel):
 
 
 class CTraderSyncRequest(BaseModel):
-    days: int = Field(default=7, ge=1, le=90)
-    push_new: bool = True
+    mode: Literal["incremental", "range"] = "incremental"
+    days: int = Field(default=7, ge=1, le=3650)
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    overlap_seconds: int = Field(default=3, ge=0, le=300)
+    push_new: Optional[bool] = None
+    background: bool = False
 
 
 class CTraderMarketActionRequest(BaseModel):

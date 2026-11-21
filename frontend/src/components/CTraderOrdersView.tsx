@@ -3,6 +3,7 @@ import {
   Activity,
   Check,
   Copy,
+  History,
   Play,
   Radio,
   RefreshCw,
@@ -14,7 +15,7 @@ import {
   TrendingUp,
 } from 'lucide-react';
 import { api } from '../api';
-import { CTraderDeal, CTraderMarketStatus, CTraderQuote } from '../types';
+import { CTraderDeal, CTraderMarketStatus, CTraderQuote, CTraderStats, CTraderSyncStatus } from '../types';
 
 interface CTraderOrdersViewProps {
   onNotify: (msg: string) => void;
@@ -32,9 +33,14 @@ export const CTraderOrdersView: React.FC<CTraderOrdersViewProps> = ({
 }) => {
   const [subTab, setSubTab] = useState<'orders' | 'market'>('orders');
   const [deals, setDeals] = useState<CTraderDeal[]>([]);
+  const [dealStats, setDealStats] = useState<CTraderStats | null>(null);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
-  const [days, setDays] = useState(7);
+  const [syncStatus, setSyncStatus] = useState<CTraderSyncStatus | null>(null);
+  const [showHistoryPanel, setShowHistoryPanel] = useState(false);
+  const [historyStartDate, setHistoryStartDate] = useState<string>('2026-10-01');
+  const [historyEndDate, setHistoryEndDate] = useState<string>(() => new Date().toISOString().slice(0, 10));
+  const [historyPushBark, setHistoryPushBark] = useState(false);
 
   // Market live tick state
   const [marketStatus, setMarketStatus] = useState<CTraderMarketStatus | null>(null);
@@ -59,8 +65,9 @@ export const CTraderOrdersView: React.FC<CTraderOrdersViewProps> = ({
 
   const loadDeals = useCallback(async () => {
     try {
-      const res = await api.getCTraderDeals(2000);
+      const res = await api.getCTraderDeals(5000);
       setDeals(res.deals);
+      setDealStats(res.stats);
     } catch (err) {
       onNotify(err instanceof Error ? err.message : '加载 cTrader 订单失败');
     } finally {
@@ -68,11 +75,49 @@ export const CTraderOrdersView: React.FC<CTraderOrdersViewProps> = ({
     }
   }, [onNotify]);
 
+  const pollSyncStatus = useCallback(async () => {
+    try {
+      const st = await api.getCTraderSyncStatus();
+      setSyncStatus(st);
+      return st;
+    } catch {
+      return null;
+    }
+  }, []);
+
   useEffect(() => {
     loadDeals();
+    pollSyncStatus();
     const timer = window.setInterval(loadDeals, 15000);
     return () => window.clearInterval(timer);
-  }, [loadDeals]);
+  }, [loadDeals, pollSyncStatus]);
+
+  useEffect(() => {
+    if (!syncStatus?.running) return;
+    let active = true;
+    const timer = window.setInterval(async () => {
+      if (!active) return;
+      const st = await pollSyncStatus();
+      if (!st || !active) return;
+      if (st.phase === 'enriching_labels') {
+        loadDeals();
+      }
+      if (!st.running) {
+        await loadDeals();
+        if (st.last_error) {
+          onNotify(`历史拉取异常：${st.last_error}`);
+        } else if (st.last_result) {
+          onNotify(
+            `历史拉取完成：共获取 ${st.last_result.fetched ?? 0} 笔，新增 ${st.last_result.inserted ?? 0} 笔，更新 ${st.last_result.updated ?? 0} 笔`,
+          );
+        }
+      }
+    }, 1000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [syncStatus?.running, pollSyncStatus, loadDeals, onNotify]);
 
   const loadMarketData = useCallback(async (withTicks = false) => {
     try {
@@ -230,15 +275,58 @@ export const CTraderOrdersView: React.FC<CTraderOrdersViewProps> = ({
   const handleSync = async () => {
     setSyncing(true);
     try {
-      const res = await api.syncCTraderDeals(days, true);
+      const res = await api.syncCTraderDeals({
+        mode: 'incremental',
+        days: 7,
+        overlap_seconds: 3,
+        push_new: true,
+      });
+      const strategyLabel =
+        res.sync_strategy === 'incremental_from_last' ? '增量（上一笔提前3秒）' : '首次7天回补';
       onNotify(
-        `同步完成：拉取 ${res.fetched} 笔，新增 ${res.inserted} 笔，推送 ${res.pushed} 条`
+        `${strategyLabel}完成：拉取 ${res.fetched ?? 0} 笔，新增 ${res.inserted ?? 0} 笔，推送 ${res.pushed ?? 0} 条`,
       );
       await loadDeals();
+      await pollSyncStatus();
     } catch (err) {
       onNotify(err instanceof Error ? err.message : '拉取 cTrader 订单失败');
     } finally {
       setSyncing(false);
+    }
+  };
+
+  const applyHistoryDaysPreset = (presetDays: number) => {
+    const end = new Date();
+    const start = new Date(end.getTime() - presetDays * 86400 * 1000);
+    setHistoryStartDate(start.toISOString().slice(0, 10));
+    setHistoryEndDate(end.toISOString().slice(0, 10));
+  };
+
+  const handleHistoryBackfill = async () => {
+    if (!historyStartDate) {
+      onNotify('请先选择开始日期');
+      return;
+    }
+    try {
+      const res = await api.syncCTraderDeals({
+        mode: 'range',
+        start_date: historyStartDate,
+        end_date: historyEndDate || undefined,
+        push_new: historyPushBark,
+        background: true,
+      });
+      if (res.status) {
+        setSyncStatus(res.status);
+      } else {
+        await pollSyncStatus();
+      }
+      if (res.already_running) {
+        onNotify('已有拉取任务正在执行，请等待完成');
+      } else {
+        onNotify(`已启动 ${historyStartDate} 至 ${historyEndDate || '今天'} 历史全量拉取`);
+      }
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : '启动历史数据拉取失败');
     }
   };
 
@@ -413,23 +501,27 @@ export const CTraderOrdersView: React.FC<CTraderOrdersViewProps> = ({
           </div>
           {subTab === 'orders' && (
             <>
-              <select
-                value={days}
-                onChange={(e) => setDays(Number(e.target.value))}
-                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 outline-none"
-              >
-                <option value={1}>最近 1 天</option>
-                <option value={7}>最近 7 天</option>
-                <option value={30}>最近 30 天</option>
-              </select>
               <button
                 type="button"
                 onClick={handleSync}
-                disabled={syncing}
+                disabled={syncing || !!syncStatus?.running}
+                title="自动从库内最新一笔成交时间提前 3 秒开始增量拉取"
                 className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-4 py-2 text-xs font-medium text-white hover:bg-amber-600 disabled:opacity-60 cursor-pointer"
               >
                 <RefreshCw className={`h-3.5 w-3.5 ${syncing ? 'animate-spin' : ''}`} />
-                {syncing ? '拉取中...' : '立即拉取订单'}
+                {syncing ? '增量拉取中...' : '增量拉取最新'}
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowHistoryPanel((v) => !v)}
+                className={`inline-flex items-center gap-1.5 rounded-xl border px-3.5 py-2 text-xs font-medium transition cursor-pointer ${
+                  showHistoryPanel || syncStatus?.running
+                    ? 'border-amber-300 bg-amber-50 text-amber-800'
+                    : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                }`}
+              >
+                <History className="h-3.5 w-3.5" />
+                拉取历史数据
               </button>
             </>
           )}
@@ -726,6 +818,145 @@ export const CTraderOrdersView: React.FC<CTraderOrdersViewProps> = ({
         </div>
       ) : (
         <>
+
+      {/* Historical Backfill & Sync Progress Panel */}
+      {(showHistoryPanel || syncStatus?.running) && (
+        <div className="rounded-2xl border border-amber-200/80 bg-amber-50/40 p-4 shadow-xs space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h3 className="text-sm font-semibold text-slate-900 flex items-center gap-1.5">
+                <History className="h-4 w-4 text-amber-600" />
+                拉取指定周期历史成交数据（自动按 7 天分段 + 限频防截断）
+              </h3>
+              <p className="text-[11px] text-slate-500 mt-0.5">
+                默认「增量拉取最新」从库内最后一笔提前 3 秒开始，避免同一毫秒并发遗漏；如需补齐更早记录，可在此拉取完整区间。
+                {dealStats && dealStats.total_deals > 0 && (
+                  <span className="ml-1 text-slate-700 font-medium">
+                    当前库内共 {dealStats.total_deals} 笔（
+                    {(dealStats.earliest_executed_at || '').replace('T', ' ').slice(0, 16) || '—'} ~{' '}
+                    {(dealStats.latest_executed_at || '').replace('T', ' ').slice(0, 16) || '—'}）
+                  </span>
+                )}
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+              <button
+                type="button"
+                onClick={() => {
+                  setHistoryStartDate('2026-10-01');
+                  setHistoryEndDate(new Date().toISOString().slice(0, 10));
+                }}
+                className="rounded-lg border border-amber-200 bg-white px-2.5 py-1 font-medium text-amber-800 hover:bg-amber-100 cursor-pointer"
+              >
+                2026-10-01 至今
+              </button>
+              <button
+                type="button"
+                onClick={() => applyHistoryDaysPreset(30)}
+                className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-slate-700 hover:bg-slate-100 cursor-pointer"
+              >
+                最近 30 天
+              </button>
+              <button
+                type="button"
+                onClick={() => applyHistoryDaysPreset(60)}
+                className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-slate-700 hover:bg-slate-100 cursor-pointer"
+              >
+                最近 60 天
+              </button>
+              <button
+                type="button"
+                onClick={() => applyHistoryDaysPreset(90)}
+                className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-slate-700 hover:bg-slate-100 cursor-pointer"
+              >
+                最近 90 天
+              </button>
+              <button
+                type="button"
+                onClick={() => applyHistoryDaysPreset(180)}
+                className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-slate-700 hover:bg-slate-100 cursor-pointer"
+              >
+                最近 180 天
+              </button>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-end gap-3">
+            <div>
+              <label className="mb-1 block text-[11px] font-medium text-slate-600">开始日期</label>
+              <input
+                type="date"
+                value={historyStartDate}
+                onChange={(e) => setHistoryStartDate(e.target.value)}
+                className="rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-700 outline-none focus:border-amber-500"
+              />
+            </div>
+            <div>
+              <label className="mb-1 block text-[11px] font-medium text-slate-600">结束日期</label>
+              <input
+                type="date"
+                value={historyEndDate}
+                onChange={(e) => setHistoryEndDate(e.target.value)}
+                className="rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-700 outline-none focus:border-amber-500"
+              />
+            </div>
+            <label className="inline-flex items-center gap-1.5 text-xs text-slate-600 pb-1.5 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={historyPushBark}
+                onChange={(e) => setHistoryPushBark(e.target.checked)}
+              />
+              <span>新入库历史订单也发 Bark 推送</span>
+            </label>
+            <button
+              type="button"
+              onClick={handleHistoryBackfill}
+              disabled={!!syncStatus?.running}
+              className="ml-auto inline-flex items-center gap-1.5 rounded-xl bg-amber-600 px-4 py-2 text-xs font-medium text-white hover:bg-amber-700 disabled:opacity-60 cursor-pointer"
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${syncStatus?.running ? 'animate-spin' : ''}`} />
+              {syncStatus?.running ? '后台全量拉取中...' : '拉取指定周期全部数据'}
+            </button>
+          </div>
+
+          {syncStatus && (syncStatus.running || syncStatus.phase === 'completed' || syncStatus.last_error) && (
+            <div className="rounded-xl border border-slate-200/80 bg-white px-3.5 py-2.5 text-xs space-y-1">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="font-medium text-slate-800">
+                  {syncStatus.running
+                    ? syncStatus.phase === 'fetching_deals'
+                      ? `正在分段拉取历史成交（第 ${syncStatus.chunks_done}/${Math.max(1, syncStatus.chunks_total)} 段）...`
+                      : syncStatus.phase === 'enriching_labels'
+                        ? `已保存 ${syncStatus.deals_fetched} 笔成交，正在补充算法标签（${syncStatus.labels_done}/${syncStatus.labels_total}）...`
+                        : '正在连接 cTrader OpenAPI...'
+                    : syncStatus.last_error
+                      ? `拉取失败：${syncStatus.last_error}`
+                      : `最近一次同步完成：共获取 ${syncStatus.last_result?.fetched ?? syncStatus.deals_fetched} 笔，新增 ${syncStatus.last_result?.inserted ?? syncStatus.inserted} 笔，更新 ${syncStatus.last_result?.updated ?? syncStatus.updated} 笔`}
+                </span>
+                {syncStatus.deals_fetched > 0 && (
+                  <span className="font-mono text-[11px] text-slate-500">
+                    已获取 {syncStatus.deals_fetched} 笔 · 新增 {syncStatus.inserted} / 更新 {syncStatus.updated}
+                  </span>
+                )}
+              </div>
+              {syncStatus.running && syncStatus.chunks_total > 0 && (
+                <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-100">
+                  <div
+                    className="h-full bg-amber-500 transition-all duration-300"
+                    style={{
+                      width: `${
+                        syncStatus.phase === 'enriching_labels' && syncStatus.labels_total > 0
+                          ? Math.round((syncStatus.labels_done / syncStatus.labels_total) * 100)
+                          : Math.round((syncStatus.chunks_done / syncStatus.chunks_total) * 100)
+                      }%`,
+                    }}
+                  />
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Filters */}
       <div className="rounded-2xl border border-slate-200/80 bg-white p-4 shadow-xs space-y-3">

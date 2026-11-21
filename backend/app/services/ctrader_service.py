@@ -1,7 +1,8 @@
 """cTrader OpenAPI integration service for LifeHub.
 
 Reads cTrader credentials from LifeHub's SQLite settings (configured via the UI),
-pulls historical/recent deals over cTrader OpenAPI (asyncio SSL port 5035),
+pulls historical/incremental deals over cTrader OpenAPI (asyncio SSL port 5035)
+with 7-day window chunking, 1ms hasMore bisection, and 5 req/s rate limiting,
 persists them to `ctrader_deals`, and pushes newly discovered deals via Bark.
 """
 from __future__ import annotations
@@ -9,20 +10,54 @@ from __future__ import annotations
 import asyncio
 import datetime
 import json
+import logging
 import ssl
 import struct
+import time
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..db import get_all_settings, get_conn, now_iso
 from .bark_service import send_bark_push
+
+logger = logging.getLogger("lifehub.ctrader_sync")
+
+_DEAL_CHUNK_MS = 7 * 86400 * 1000
+_HISTORY_MIN_INTERVAL_SEC = 0.21
+_IGNORED_DEAL_STATUSES = {4, 5, 6, 7}  # REJECTED, INTERNALLY_REJECTED, ERROR, MISSED
+
+_sync_lock = asyncio.Lock()
+_sync_task: Optional[asyncio.Task] = None
+_sync_state: Dict[str, Any] = {
+    "running": False,
+    "mode": "incremental",
+    "phase": "idle",
+    "from_time": "",
+    "to_time": "",
+    "chunks_done": 0,
+    "chunks_total": 0,
+    "deals_fetched": 0,
+    "labels_done": 0,
+    "labels_total": 0,
+    "inserted": 0,
+    "updated": 0,
+    "pushed": 0,
+    "started_at": "",
+    "finished_at": "",
+    "last_error": None,
+    "last_result": None,
+}
+
+
+def get_ctrader_sync_status() -> Dict[str, Any]:
+    return dict(_sync_state)
 
 
 def _load_ctrader_sdk():
     try:
         from ctrader_open_api import EndPoints
-        from ctrader_open_api.messages import OpenApiMessages_pb2 as oa_msgs
         from ctrader_open_api.messages import OpenApiCommonMessages_pb2 as common_msgs
+        from ctrader_open_api.messages import OpenApiMessages_pb2 as oa_msgs
         from ctrader_open_api.messages import OpenApiModelMessages_pb2 as model_msgs
         return EndPoints, oa_msgs, common_msgs, model_msgs
     except ImportError as exc:
@@ -31,8 +66,67 @@ def _load_ctrader_sdk():
         ) from exc
 
 
+def _ms_to_local_iso(ms: int) -> str:
+    if ms <= 0:
+        return ""
+    return (
+        datetime.datetime.fromtimestamp(ms / 1000.0, tz=datetime.timezone.utc)
+        .astimezone()
+        .isoformat(timespec="seconds")
+    )
+
+
+def _iso_to_ms(value: str) -> int:
+    s = (value or "").strip()
+    if not s:
+        return 0
+    try:
+        dt = datetime.datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.datetime.now().astimezone().tzinfo)
+        return int(dt.timestamp() * 1000)
+    except ValueError:
+        return 0
+
+
+def parse_date_bounds_ms(
+    start_date: Optional[str],
+    end_date: Optional[str],
+    days: int = 7,
+    now_ms: Optional[int] = None,
+) -> Tuple[int, int]:
+    """Convert YYYY-MM-DD local date bounds (or fallback days) into UTC millisecond range."""
+    current_ms = (
+        now_ms
+        if now_ms is not None
+        else int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
+    )
+    local_tz = datetime.datetime.now().astimezone().tzinfo
+
+    to_ms = current_ms
+    if end_date and end_date.strip():
+        d_end = datetime.date.fromisoformat(end_date.strip()[:10])
+        dt_end = datetime.datetime(
+            d_end.year, d_end.month, d_end.day, 23, 59, 59, 999000, tzinfo=local_tz
+        )
+        to_ms = min(current_ms, int(dt_end.timestamp() * 1000))
+
+    if start_date and start_date.strip():
+        d_start = datetime.date.fromisoformat(start_date.strip()[:10])
+        dt_start = datetime.datetime(
+            d_start.year, d_start.month, d_start.day, 0, 0, 0, 0, tzinfo=local_tz
+        )
+        from_ms = int(dt_start.timestamp() * 1000)
+    else:
+        from_ms = max(0, to_ms - (max(1, days) * 86400 * 1000))
+
+    if from_ms > to_ms:
+        raise ValueError("开始日期不能晚于结束日期")
+    return from_ms, to_ms
+
+
 class _CTraderAsyncClient:
-    """Minimal asyncio TCP/SSL client for cTrader OpenAPI protobuf protocol."""
+    """Async TCP/SSL client for cTrader OpenAPI protobuf protocol."""
 
     def __init__(
         self,
@@ -61,7 +155,9 @@ class _CTraderAsyncClient:
         self.writer: Optional[asyncio.StreamWriter] = None
         self._pending: Dict[str, asyncio.Future] = {}
         self._read_task: Optional[asyncio.Task] = None
+        self._heartbeat_task: Optional[asyncio.Task] = None
         self.ctid_trader_account_id: Optional[int] = None
+        self._last_history_req_at: float = 0.0
 
     async def __aenter__(self) -> "_CTraderAsyncClient":
         ssl_ctx = ssl.create_default_context()
@@ -70,38 +166,78 @@ class _CTraderAsyncClient:
             timeout=15.0,
         )
         self._read_task = asyncio.create_task(self._read_loop())
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         await self.authenticate()
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except BaseException:
+                pass
+            self._heartbeat_task = None
         if self._read_task:
             self._read_task.cancel()
             try:
                 await self._read_task
             except BaseException:
                 pass
+            self._read_task = None
         if self.writer:
             self.writer.close()
             try:
                 await self.writer.wait_closed()
             except BaseException:
                 pass
+            self.writer = None
+        for fut in list(self._pending.values()):
+            if not fut.done():
+                fut.set_exception(ConnectionResetError("cTrader 连接已关闭"))
+        self._pending.clear()
+
+    async def _heartbeat_loop(self) -> None:
+        try:
+            hb_type = self.common_msgs.ProtoHeartbeatEvent().payloadType
+            while self.writer is not None:
+                await asyncio.sleep(10.0)
+                if self.writer is None:
+                    break
+                proto = self.common_msgs.ProtoMessage()
+                proto.payloadType = hb_type
+                data = proto.SerializeToString()
+                self.writer.write(struct.pack(">I", len(data)) + data)
+                await self.writer.drain()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
 
     async def _read_loop(self) -> None:
         assert self.reader is not None
+        hb_type = self.common_msgs.ProtoHeartbeatEvent().payloadType
         while True:
             header = await self.reader.readexactly(4)
             (length,) = struct.unpack(">I", header)
             payload = await self.reader.readexactly(length)
             proto = self.common_msgs.ProtoMessage()
             proto.ParseFromString(payload)
+            if proto.payloadType == hb_type:
+                if self.writer is not None:
+                    hb_resp = self.common_msgs.ProtoMessage()
+                    hb_resp.payloadType = hb_type
+                    raw = hb_resp.SerializeToString()
+                    self.writer.write(struct.pack(">I", len(raw)) + raw)
+                    await self.writer.drain()
+                continue
             msg_id = proto.clientMsgId
             if msg_id and msg_id in self._pending:
                 fut = self._pending.pop(msg_id)
                 if not fut.done():
                     fut.set_result(proto)
 
-    async def _send_req(self, msg: Any, timeout: float = 15.0) -> Any:
+    async def _send_req(self, msg: Any, timeout: float = 20.0) -> Any:
         assert self.writer is not None
         msg_id = uuid.uuid4().hex[:16]
         proto = self.common_msgs.ProtoMessage()
@@ -124,6 +260,13 @@ class _CTraderAsyncClient:
             raise RuntimeError(f"cTrader OpenAPI 错误 [{err.errorCode}]: {err.description}")
         return resp_proto
 
+    async def _throttle_history(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self._last_history_req_at
+        if elapsed < _HISTORY_MIN_INTERVAL_SEC:
+            await asyncio.sleep(_HISTORY_MIN_INTERVAL_SEC - elapsed)
+        self._last_history_req_at = time.monotonic()
+
     async def authenticate(self) -> None:
         app_req = self.oa_msgs.ProtoOAApplicationAuthReq()
         app_req.clientId = self.client_id
@@ -141,16 +284,27 @@ class _CTraderAsyncClient:
             raise RuntimeError("当前 Access Token 下未找到任何 cTrader 账户")
 
         target = None
+        want_live = self.environment == "live"
         if self.configured_account_id:
             for a in accounts:
-                if (
+                id_match = (
                     str(a.ctidTraderAccountId) == self.configured_account_id
                     or str(getattr(a, "traderLogin", "")) == self.configured_account_id
-                ):
+                )
+                if id_match and bool(getattr(a, "isLive", False)) == want_live:
                     target = a
                     break
+            if target is None:
+                for a in accounts:
+                    if (
+                        str(a.ctidTraderAccountId) == self.configured_account_id
+                        or str(getattr(a, "traderLogin", "")) == self.configured_account_id
+                    ):
+                        target = a
+                        break
         if target is None:
-            target = accounts[0]
+            env_matches = [a for a in accounts if bool(getattr(a, "isLive", False)) == want_live]
+            target = env_matches[0] if env_matches else accounts[0]
 
         self.ctid_trader_account_id = int(target.ctidTraderAccountId)
 
@@ -168,15 +322,21 @@ class _CTraderAsyncClient:
         res.ParseFromString(proto.payload)
         return {int(s.symbolId): str(s.symbolName) for s in res.symbol}
 
-    async def fetch_order_labels(self, order_ids: List[int]) -> Dict[str, Tuple[str, str]]:
+    async def fetch_order_labels(
+        self,
+        order_ids: List[int],
+        progress_cb: Optional[Callable[[int, int], None]] = None,
+    ) -> Dict[str, Tuple[str, str]]:
         assert self.ctid_trader_account_id is not None
         result: Dict[str, Tuple[str, str]] = {}
-        for oid in order_ids:
+        total = len(order_ids)
+        for idx, oid in enumerate(order_ids, start=1):
+            await self._throttle_history()
             try:
                 req = self.oa_msgs.ProtoOAOrderDetailsReq()
                 req.ctidTraderAccountId = self.ctid_trader_account_id
                 req.orderId = oid
-                proto = await self._send_req(req, timeout=5.0)
+                proto = await self._send_req(req, timeout=8.0)
                 res = self.oa_msgs.ProtoOAOrderDetailsRes()
                 res.ParseFromString(proto.payload)
                 order_obj = getattr(res, "order", None)
@@ -184,22 +344,25 @@ class _CTraderAsyncClient:
                 label = str(getattr(trade_data, "label", "") or "").strip()
                 comment = str(getattr(trade_data, "comment", "") or "").strip()
                 result[str(oid)] = (label, comment)
-            except Exception:
-                continue
+            except Exception as exc:
+                logger.debug("Order details unavailable for order %s: %s", oid, exc)
+            if progress_cb:
+                progress_cb(idx, total)
         return result
 
     async def _fetch_deals_range(self, from_ms: int, to_ms: int) -> List[Any]:
         assert self.ctid_trader_account_id is not None
+        await self._throttle_history()
         req = self.oa_msgs.ProtoOADealListReq()
         req.ctidTraderAccountId = self.ctid_trader_account_id
         req.fromTimestamp = from_ms
         req.toTimestamp = to_ms
-        req.maxRows = 500
+        req.maxRows = 1000
         proto = await self._send_req(req, timeout=20.0)
         res = self.oa_msgs.ProtoOADealListRes()
         res.ParseFromString(proto.payload)
         raw_deals = list(res.deal)
-        if getattr(res, "hasMore", False) and (to_ms - from_ms) > 60_000:
+        if getattr(res, "hasMore", False) and (to_ms - from_ms) > 1:
             mid_ms = (from_ms + to_ms) // 2
             left = await self._fetch_deals_range(from_ms, mid_ms)
             right = await self._fetch_deals_range(mid_ms + 1, to_ms)
@@ -207,40 +370,72 @@ class _CTraderAsyncClient:
             return list(by_id.values())
         return raw_deals
 
-    async def fetch_deals(self, days: int = 7) -> List[Dict[str, Any]]:
-        assert self.ctid_trader_account_id is not None
-        symbol_map = await self.fetch_symbols()
-        now_ms = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
-        from_ms = now_ms - (max(1, days) * 86400 * 1000)
+    async def fetch_raw_deals_chunked(
+        self,
+        from_ms: int,
+        to_ms: int,
+        progress_cb: Optional[Callable[[int, int, int], None]] = None,
+    ) -> List[Any]:
+        """Fetch all raw deals in <= 7-day chunks to avoid broker window limits."""
+        chunks: List[Tuple[int, int]] = []
+        cursor = from_ms
+        while cursor <= to_ms:
+            chunk_end = min(to_ms, cursor + _DEAL_CHUNK_MS - 1)
+            chunks.append((cursor, chunk_end))
+            cursor = chunk_end + 1
 
-        raw_deals = await self._fetch_deals_range(from_ms, now_ms)
+        by_id: Dict[str, Any] = {}
+        total_chunks = len(chunks)
+        for idx, (c_start, c_end) in enumerate(chunks, start=1):
+            chunk_deals = await self._fetch_deals_range(c_start, c_end)
+            for d in chunk_deals:
+                status_val = int(getattr(d, "dealStatus", 0) or 0)
+                filled = float(getattr(d, "filledVolume", 0) or getattr(d, "volume", 0) or 0)
+                if status_val in _IGNORED_DEAL_STATUSES or filled <= 0:
+                    continue
+                by_id[str(d.dealId)] = d
+            if progress_cb:
+                progress_cb(idx, total_chunks, len(by_id))
 
-        unique_order_ids = list({int(d.orderId) for d in raw_deals if getattr(d, "orderId", 0)})
-        order_meta = await self.fetch_order_labels(unique_order_ids) if unique_order_ids else {}
+        return sorted(
+            by_id.values(),
+            key=lambda d: (int(getattr(d, "executionTimestamp", 0) or 0), int(getattr(d, "dealId", 0) or 0)),
+        )
 
+    def decode_raw_deals(
+        self,
+        raw_deals: List[Any],
+        symbol_map: Dict[int, str],
+        order_meta: Dict[str, Tuple[str, str]],
+    ) -> List[Dict[str, Any]]:
         deals: List[Dict[str, Any]] = []
         for d in raw_deals:
             money_digits = int(getattr(d, "moneyDigits", 2) or 2)
             scale = 10 ** money_digits
-            close_detail = getattr(d, "closePositionDetail", None)
+
+            has_close = (
+                d.HasField("closePositionDetail")
+                if hasattr(d, "HasField") and hasattr(d, "DESCRIPTOR") and "closePositionDetail" in d.DESCRIPTOR.fields_by_name
+                else getattr(d, "closePositionDetail", None) is not None
+            )
+            close_detail = getattr(d, "closePositionDetail", None) if has_close else None
+
             gross = 0.0
             swap = 0.0
+            fee = 0.0
             commission = float(getattr(d, "commission", 0) or 0) / scale
-            if close_detail and getattr(close_detail, "grossProfit", 0):
-                gross = float(close_detail.grossProfit) / scale
-                swap = float(getattr(close_detail, "swap", 0) or 0) / scale
-                if getattr(close_detail, "commission", 0):
-                    commission = float(close_detail.commission) / scale
+            if close_detail is not None:
+                close_digits = int(getattr(close_detail, "moneyDigits", 0) or money_digits)
+                close_scale = 10 ** close_digits
+                gross = float(getattr(close_detail, "grossProfit", 0) or 0) / close_scale
+                swap = float(getattr(close_detail, "swap", 0) or 0) / close_scale
+                commission = float(getattr(close_detail, "commission", 0) or 0) / close_scale
+                fee = abs(float(getattr(close_detail, "pnlConversionFee", 0) or 0)) / close_scale
 
-            net_profit = gross + swap + commission
+            net_profit = gross + swap + commission - fee
             exec_ms = int(getattr(d, "executionTimestamp", 0) or 0)
-            exec_iso = (
-                datetime.datetime.fromtimestamp(exec_ms / 1000.0, tz=datetime.timezone.utc)
-                .astimezone()
-                .isoformat(timespec="seconds")
-                if exec_ms > 0
-                else now_iso()
-            )
+            exec_iso = _ms_to_local_iso(exec_ms) if exec_ms > 0 else now_iso()
+
             side_val = int(getattr(d, "tradeSide", 0) or 0)
             side = "BUY" if side_val == 1 else ("SELL" if side_val == 2 else str(side_val))
             sym_id = int(getattr(d, "symbolId", 0) or 0)
@@ -248,7 +443,11 @@ class _CTraderAsyncClient:
             vol = float(getattr(d, "filledVolume", 0) or getattr(d, "volume", 0) or 0) / 10000000.0
 
             oid_str = str(getattr(d, "orderId", "") or "")
-            label_val, comment_val = order_meta.get(oid_str, ("", ""))
+            direct_label = str(getattr(d, "label", "") or "").strip()
+            direct_comment = str(getattr(d, "comment", "") or "").strip()
+            meta_label, meta_comment = order_meta.get(oid_str, ("", ""))
+            label_val = direct_label or meta_label
+            comment_val = direct_comment or meta_comment
 
             deals.append(
                 {
@@ -269,6 +468,7 @@ class _CTraderAsyncClient:
                     "label": label_val,
                     "comment": comment_val,
                     "executed_at": exec_iso,
+                    "execution_ms": exec_ms,
                     "raw_json": json.dumps(
                         {
                             "dealId": str(d.dealId),
@@ -283,6 +483,23 @@ class _CTraderAsyncClient:
                 }
             )
         return deals
+
+    async def fetch_deals(
+        self,
+        days: int = 7,
+        from_ms: Optional[int] = None,
+        to_ms: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        assert self.ctid_trader_account_id is not None
+        symbol_map = await self.fetch_symbols()
+        now_ms = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
+        end_ms = to_ms if to_ms is not None else now_ms
+        start_ms = from_ms if from_ms is not None else max(0, end_ms - (max(1, days) * 86400 * 1000))
+
+        raw_deals = await self.fetch_raw_deals_chunked(start_ms, end_ms)
+        unique_order_ids = list({int(d.orderId) for d in raw_deals if getattr(d, "orderId", 0)})
+        order_meta = await self.fetch_order_labels(unique_order_ids) if unique_order_ids else {}
+        return self.decode_raw_deals(raw_deals, symbol_map, order_meta)
 
 
 def _get_ctrader_credentials(settings: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -303,23 +520,69 @@ def _get_ctrader_credentials(settings: Optional[Dict[str, str]] = None) -> Dict[
     }
 
 
-async def test_ctrader_connection() -> Dict[str, Any]:
-    creds = _get_ctrader_credentials()
-    async with _CTraderAsyncClient(**creds) as client:
-        return {
-            "ok": True,
-            "account_id": str(client.ctid_trader_account_id),
-            "environment": client.environment,
-            "message": f"cTrader OpenAPI 连接成功（账户 {client.ctid_trader_account_id}，环境 {client.environment}）",
-        }
+def _get_latest_deal_ms(account_id: str) -> int:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT MAX(execution_ms) AS max_ms FROM ctrader_deals WHERE account_id = ? AND execution_ms > 0",
+            (account_id,),
+        ).fetchone()
+        if row and row["max_ms"]:
+            return int(row["max_ms"])
+        row2 = conn.execute(
+            "SELECT executed_at FROM ctrader_deals WHERE account_id = ? ORDER BY executed_at DESC LIMIT 1",
+            (account_id,),
+        ).fetchone()
+        if row2 and row2["executed_at"]:
+            parsed = _iso_to_ms(row2["executed_at"])
+            if parsed > 0:
+                return parsed
+        row3 = conn.execute(
+            "SELECT MAX(execution_ms) AS max_ms FROM ctrader_deals WHERE execution_ms > 0"
+        ).fetchone()
+        if row3 and row3["max_ms"]:
+            return int(row3["max_ms"])
+        row4 = conn.execute(
+            "SELECT executed_at FROM ctrader_deals ORDER BY executed_at DESC LIMIT 1"
+        ).fetchone()
+        if row4 and row4["executed_at"]:
+            return _iso_to_ms(row4["executed_at"])
+    return 0
 
 
-async def sync_ctrader_deals(days: int = 7, push_new: bool = True) -> Dict[str, Any]:
-    cfg = get_all_settings()
-    creds = _get_ctrader_credentials(cfg)
-    async with _CTraderAsyncClient(**creds) as client:
-        deals = await client.fetch_deals(days=days)
+def _get_cached_order_labels() -> Dict[str, Tuple[str, str]]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT order_id, label, comment FROM ctrader_deals WHERE order_id != '' AND label != ''"
+        ).fetchall()
+    return {str(r["order_id"]): (str(r["label"]), str(r["comment"] or "")) for r in rows}
 
+
+def _apply_position_label_inheritance(deals: List[Dict[str, Any]]) -> None:
+    """Propagate unique position label to closing/partial deals missing a direct order tag."""
+    pos_tags: Dict[str, set[Tuple[str, str]]] = {}
+    for d in deals:
+        pid = d.get("position_id") or ""
+        lbl = (d.get("label") or "").strip()
+        if pid and lbl:
+            pos_tags.setdefault(pid, set()).add((lbl, (d.get("comment") or "").strip()))
+
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT position_id, label, comment FROM ctrader_deals WHERE position_id != '' AND label != ''"
+        ).fetchall()
+    for r in rows:
+        pos_tags.setdefault(str(r["position_id"]), set()).add(
+            (str(r["label"]), str(r["comment"] or ""))
+        )
+
+    for d in deals:
+        if not (d.get("label") or "").strip():
+            tags = pos_tags.get(d.get("position_id") or "", set())
+            if len(tags) == 1:
+                d["label"], d["comment"] = next(iter(tags))
+
+
+def _upsert_deals(deals: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
     inserted_deals: List[Dict[str, Any]] = []
     updated_count = 0
     now_str = now_iso()
@@ -329,15 +592,19 @@ async def sync_ctrader_deals(days: int = 7, push_new: bool = True) -> Dict[str, 
             existing = conn.execute(
                 "SELECT deal_id FROM ctrader_deals WHERE deal_id = ?", (d["deal_id"],)
             ).fetchone()
+            exec_ms = int(d.get("execution_ms") or _iso_to_ms(d.get("executed_at", "")))
             if existing:
                 conn.execute(
                     """
                     UPDATE ctrader_deals
                     SET symbol_name = ?, side = ?, volume = ?, price = ?,
                         commission = ?, swap = ?, gross_profit = ?, net_profit = ?,
-                        status = ?, label = CASE WHEN ? != '' THEN ? ELSE label END,
+                        status = ?,
+                        label = CASE WHEN ? != '' THEN ? ELSE label END,
                         comment = CASE WHEN ? != '' THEN ? ELSE comment END,
-                        executed_at = ?, raw_json = ?
+                        executed_at = ?,
+                        execution_ms = CASE WHEN ? > 0 THEN ? ELSE execution_ms END,
+                        raw_json = ?
                     WHERE deal_id = ?
                     """,
                     (
@@ -355,6 +622,8 @@ async def sync_ctrader_deals(days: int = 7, push_new: bool = True) -> Dict[str, 
                         d["comment"],
                         d["comment"],
                         d["executed_at"],
+                        exec_ms,
+                        exec_ms,
                         d["raw_json"],
                         d["deal_id"],
                     ),
@@ -366,8 +635,8 @@ async def sync_ctrader_deals(days: int = 7, push_new: bool = True) -> Dict[str, 
                     INSERT INTO ctrader_deals (
                         deal_id, order_id, position_id, account_id, symbol_id, symbol_name,
                         side, volume, price, commission, swap, gross_profit, net_profit,
-                        status, label, comment, executed_at, pushed_at, raw_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
+                        status, label, comment, executed_at, execution_ms, pushed_at, raw_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
                     """,
                     (
                         d["deal_id"],
@@ -387,52 +656,291 @@ async def sync_ctrader_deals(days: int = 7, push_new: bool = True) -> Dict[str, 
                         d["label"],
                         d["comment"],
                         d["executed_at"],
+                        exec_ms,
                         d["raw_json"],
                         now_str,
                     ),
                 )
                 inserted_deals.append(d)
+    return inserted_deals, updated_count
 
-    pushed_count = 0
-    if (
-        push_new
-        and inserted_deals
-        and cfg.get("ctrader_bark_push_enabled") == "1"
-        and cfg.get("bark_enabled") == "1"
-    ):
-        for d in inserted_deals[:5]:
-            pnl_sign = "+" if d["net_profit"] >= 0 else ""
-            title = f"cTrader 成交: {d['symbol_name']} {d['side']}"
-            body = (
-                f"手数: {d['volume']} | 价格: {d['price']} | "
-                f"净盈亏: {pnl_sign}{d['net_profit']:.2f} | 时间: {d['executed_at']}"
+
+def _update_order_labels_in_db(order_meta: Dict[str, Tuple[str, str]]) -> None:
+    if not order_meta:
+        return
+    with get_conn() as conn:
+        for oid, (label, comment) in order_meta.items():
+            if not label and not comment:
+                continue
+            conn.execute(
+                """
+                UPDATE ctrader_deals
+                SET label = CASE WHEN ? != '' THEN ? ELSE label END,
+                    comment = CASE WHEN ? != '' THEN ? ELSE comment END
+                WHERE order_id = ?
+                """,
+                (label, label, comment, comment, oid),
             )
-            res = await send_bark_push(title=title, body=body, settings=cfg, priority="high", group="cTrader")
-            if res.get("ok"):
-                pushed_count += 1
-                with get_conn() as conn:
-                    conn.execute(
-                        "UPDATE ctrader_deals SET pushed_at = ? WHERE deal_id = ?",
-                        (now_iso(), d["deal_id"]),
+        # Also propagate unique position labels within newly enriched positions
+        rows = conn.execute(
+            "SELECT DISTINCT position_id, label, comment FROM ctrader_deals WHERE position_id != '' AND label != ''"
+        ).fetchall()
+        pos_tags: Dict[str, set[Tuple[str, str]]] = {}
+        for r in rows:
+            pos_tags.setdefault(str(r["position_id"]), set()).add(
+                (str(r["label"]), str(r["comment"] or ""))
+            )
+        for pid, tags in pos_tags.items():
+            if len(tags) == 1:
+                lbl, cmt = next(iter(tags))
+                conn.execute(
+                    "UPDATE ctrader_deals SET label = ?, comment = CASE WHEN ? != '' THEN ? ELSE comment END WHERE position_id = ? AND label = ''",
+                    (lbl, cmt, cmt, pid),
+                )
+
+
+async def test_ctrader_connection() -> Dict[str, Any]:
+    creds = _get_ctrader_credentials()
+    async with _CTraderAsyncClient(**creds) as client:
+        return {
+            "ok": True,
+            "account_id": str(client.ctid_trader_account_id),
+            "environment": client.environment,
+            "message": f"cTrader OpenAPI 连接成功（账户 {client.ctid_trader_account_id}，环境 {client.environment}）",
+        }
+
+
+async def sync_ctrader_deals(
+    days: int = 7,
+    push_new: Optional[bool] = None,
+    *,
+    mode: str = "incremental",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    overlap_seconds: int = 3,
+) -> Dict[str, Any]:
+    if mode not in ("incremental", "range"):
+        raise ValueError("同步模式必须为 incremental 或 range")
+    should_push = (mode == "incremental") if push_new is None else bool(push_new)
+
+    async with _sync_lock:
+        cfg = get_all_settings()
+        creds = _get_ctrader_credentials(cfg)
+
+        _sync_state.update(
+            {
+                "running": True,
+                "mode": mode,
+                "phase": "connecting",
+                "chunks_done": 0,
+                "chunks_total": 0,
+                "deals_fetched": 0,
+                "labels_done": 0,
+                "labels_total": 0,
+                "inserted": 0,
+                "updated": 0,
+                "pushed": 0,
+                "started_at": now_iso(),
+                "finished_at": "",
+                "last_error": None,
+            }
+        )
+
+        try:
+            async with _CTraderAsyncClient(**creds) as client:
+                account_id_str = str(client.ctid_trader_account_id)
+                now_ms = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
+
+                if mode == "range":
+                    from_ms, to_ms = parse_date_bounds_ms(start_date, end_date, days=days, now_ms=now_ms)
+                    sync_strategy = "range"
+                else:
+                    last_ms = _get_latest_deal_ms(account_id_str)
+                    to_ms = now_ms
+                    if last_ms > 0:
+                        from_ms = max(0, last_ms - max(0, overlap_seconds) * 1000)
+                        sync_strategy = "incremental_from_last"
+                    else:
+                        from_ms = max(0, now_ms - max(1, days) * 86400 * 1000)
+                        sync_strategy = "initial_days_fallback"
+
+                _sync_state["from_time"] = _ms_to_local_iso(from_ms)
+                _sync_state["to_time"] = _ms_to_local_iso(to_ms)
+                _sync_state["phase"] = "fetching_deals"
+
+                symbol_map = await client.fetch_symbols()
+
+                def on_chunk_progress(done: int, total: int, fetched_count: int) -> None:
+                    _sync_state["chunks_done"] = done
+                    _sync_state["chunks_total"] = total
+                    _sync_state["deals_fetched"] = fetched_count
+
+                raw_deals = await client.fetch_raw_deals_chunked(
+                    from_ms, to_ms, progress_cb=on_chunk_progress
+                )
+                _sync_state["deals_fetched"] = len(raw_deals)
+
+                cached_labels = _get_cached_order_labels()
+                deals = client.decode_raw_deals(raw_deals, symbol_map, cached_labels)
+                _apply_position_label_inheritance(deals)
+
+                # Save deals immediately so large backfills are visible & durable right away
+                inserted_deals, updated_count = _upsert_deals(deals)
+                _sync_state["inserted"] = len(inserted_deals)
+                _sync_state["updated"] = updated_count
+
+                # Enrich missing order labels in batches with rate-limiting
+                missing_order_ids = sorted(
+                    {
+                        int(d["order_id"])
+                        for d in deals
+                        if d.get("order_id")
+                        and str(d["order_id"]).isdigit()
+                        and not (d.get("label") or "").strip()
+                        and str(d["order_id"]) not in cached_labels
+                    }
+                )
+                if missing_order_ids:
+                    _sync_state["phase"] = "enriching_labels"
+                    _sync_state["labels_total"] = len(missing_order_ids)
+                    batch_size = 25
+                    done_count = 0
+                    for start_idx in range(0, len(missing_order_ids), batch_size):
+                        batch = missing_order_ids[start_idx : start_idx + batch_size]
+
+                        def on_label_progress(idx_in_batch: int, _batch_len: int, offset: int = start_idx) -> None:
+                            _sync_state["labels_done"] = offset + idx_in_batch
+
+                        batch_meta = await client.fetch_order_labels(batch, progress_cb=on_label_progress)
+                        _update_order_labels_in_db(batch_meta)
+                        for d in deals:
+                            oid = d.get("order_id") or ""
+                            if oid in batch_meta and not (d.get("label") or "").strip():
+                                d["label"], d["comment"] = batch_meta[oid]
+                        done_count += len(batch)
+                        _sync_state["labels_done"] = done_count
+                    _apply_position_label_inheritance(deals)
+
+            pushed_count = 0
+            if (
+                should_push
+                and inserted_deals
+                and cfg.get("ctrader_bark_push_enabled") == "1"
+                and cfg.get("bark_enabled") == "1"
+            ):
+                _sync_state["phase"] = "pushing_bark"
+                for d in inserted_deals[:5]:
+                    pnl_sign = "+" if d["net_profit"] >= 0 else ""
+                    title = f"cTrader 成交: {d['symbol_name']} {d['side']}"
+                    body = (
+                        f"手数: {d['volume']} | 价格: {d['price']} | "
+                        f"净盈亏: {pnl_sign}{d['net_profit']:.2f} | 时间: {d['executed_at']}"
                     )
+                    res = await send_bark_push(
+                        title=title, body=body, settings=cfg, priority="high", group="cTrader"
+                    )
+                    if res.get("ok"):
+                        pushed_count += 1
+                        with get_conn() as conn:
+                            conn.execute(
+                                "UPDATE ctrader_deals SET pushed_at = ? WHERE deal_id = ?",
+                                (now_iso(), d["deal_id"]),
+                            )
 
-    return {
-        "ok": True,
-        "account_id": str(creds["account_id"] or (deals[0]["account_id"] if deals else "")),
-        "environment": creds["environment"],
-        "fetched": len(deals),
-        "inserted": len(inserted_deals),
-        "updated": updated_count,
-        "pushed": pushed_count,
-        "synced_at": now_str,
-    }
+            result = {
+                "ok": True,
+                "mode": mode,
+                "sync_strategy": sync_strategy,
+                "account_id": str(creds["account_id"] or account_id_str),
+                "environment": creds["environment"],
+                "from_time": _ms_to_local_iso(from_ms),
+                "to_time": _ms_to_local_iso(to_ms),
+                "fetched": len(deals),
+                "inserted": len(inserted_deals),
+                "updated": updated_count,
+                "pushed": pushed_count,
+                "synced_at": now_iso(),
+            }
+            _sync_state.update(
+                {
+                    "running": False,
+                    "phase": "completed",
+                    "pushed": pushed_count,
+                    "finished_at": result["synced_at"],
+                    "last_error": None,
+                    "last_result": result,
+                }
+            )
+            return result
+        except Exception as exc:
+            _sync_state.update(
+                {
+                    "running": False,
+                    "phase": "error",
+                    "finished_at": now_iso(),
+                    "last_error": str(exc),
+                }
+            )
+            raise
 
 
-def list_ctrader_deals(limit: int = 2000) -> Dict[str, Any]:
+def start_background_ctrader_sync(
+    days: int = 7,
+    push_new: Optional[bool] = None,
+    *,
+    mode: str = "range",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    overlap_seconds: int = 3,
+) -> Dict[str, Any]:
+    global _sync_task
+    if _sync_state.get("running") or (_sync_task is not None and not _sync_task.done()):
+        return {"started": False, "already_running": True, "status": get_ctrader_sync_status()}
+
+    # Validate date bounds synchronously before launching background task
+    if mode == "range":
+        parse_date_bounds_ms(start_date, end_date, days=days)
+
+    async def _runner() -> None:
+        try:
+            await sync_ctrader_deals(
+                days=days,
+                push_new=push_new,
+                mode=mode,
+                start_date=start_date,
+                end_date=end_date,
+                overlap_seconds=overlap_seconds,
+            )
+        except Exception as exc:
+            logger.warning("Background cTrader sync failed: %s", exc)
+
+    _sync_state.update(
+        {
+            "running": True,
+            "mode": mode,
+            "phase": "starting",
+            "chunks_done": 0,
+            "chunks_total": 0,
+            "deals_fetched": 0,
+            "labels_done": 0,
+            "labels_total": 0,
+            "inserted": 0,
+            "updated": 0,
+            "pushed": 0,
+            "started_at": now_iso(),
+            "finished_at": "",
+            "last_error": None,
+        }
+    )
+    _sync_task = asyncio.create_task(_runner())
+    return {"started": True, "already_running": False, "status": get_ctrader_sync_status()}
+
+
+def list_ctrader_deals(limit: int = 5000) -> Dict[str, Any]:
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT * FROM ctrader_deals ORDER BY executed_at DESC LIMIT ?",
-            (max(1, min(limit, 5000)),),
+            "SELECT * FROM ctrader_deals ORDER BY executed_at DESC, execution_ms DESC LIMIT ?",
+            (max(1, min(limit, 10000)),),
         ).fetchall()
         deals = [dict(r) for r in rows]
         agg = conn.execute(
@@ -441,7 +949,9 @@ def list_ctrader_deals(limit: int = 2000) -> Dict[str, Any]:
                 COUNT(*) AS total_deals,
                 COALESCE(SUM(net_profit), 0) AS total_net_profit,
                 COALESCE(SUM(volume), 0) AS total_volume,
-                COALESCE(SUM(CASE WHEN net_profit > 0 THEN 1 ELSE 0 END), 0) AS win_count
+                COALESCE(SUM(CASE WHEN net_profit > 0 THEN 1 ELSE 0 END), 0) AS win_count,
+                MAX(executed_at) AS latest_executed_at,
+                MIN(executed_at) AS earliest_executed_at
             FROM ctrader_deals
             """
         ).fetchone()
@@ -454,5 +964,7 @@ def list_ctrader_deals(limit: int = 2000) -> Dict[str, Any]:
             "total_net_profit": round(float(agg["total_net_profit"] or 0), 2),
             "total_volume": round(float(agg["total_volume"] or 0), 4),
             "win_rate": round((win_count / total) * 100, 1) if total > 0 else 0.0,
+            "latest_executed_at": str(agg["latest_executed_at"] or ""),
+            "earliest_executed_at": str(agg["earliest_executed_at"] or ""),
         },
     }

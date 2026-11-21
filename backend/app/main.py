@@ -69,7 +69,9 @@ from .services.auth_service import (
 )
 from .services.bark_service import format_reminder_bark_message, send_bark_push
 from .services.ctrader_service import (
+    get_ctrader_sync_status,
     list_ctrader_deals,
+    start_background_ctrader_sync,
     sync_ctrader_deals,
     test_ctrader_connection,
 )
@@ -295,7 +297,7 @@ async def _ctrader_auto_sync_loop() -> None:
             if settings.get("ctrader_auto_sync_enabled") != "1":
                 continue
             interval_sec = max(15, int(settings.get("ctrader_sync_interval_sec") or "60"))
-            await sync_ctrader_deals(days=3, push_new=True)
+            await sync_ctrader_deals(days=3, push_new=True, mode="incremental", overlap_seconds=3)
             await asyncio.sleep(max(0, interval_sec - 30))
         except Exception:
             pass
@@ -350,14 +352,35 @@ def _is_market_authorized(
 
 
 @app.get("/api/ctrader/deals")
-def api_ctrader_deals(limit: int = 200) -> Dict[str, Any]:
+def api_ctrader_deals(limit: int = 5000) -> Dict[str, Any]:
     return list_ctrader_deals(limit=limit)
+
+
+@app.get("/api/ctrader/sync/status")
+def api_ctrader_sync_status() -> Dict[str, Any]:
+    return get_ctrader_sync_status()
 
 
 @app.post("/api/ctrader/sync")
 async def api_ctrader_sync(payload: CTraderSyncRequest) -> Dict[str, Any]:
     try:
-        return await sync_ctrader_deals(days=payload.days, push_new=payload.push_new)
+        if payload.background:
+            return start_background_ctrader_sync(
+                days=payload.days,
+                push_new=payload.push_new,
+                mode=payload.mode,
+                start_date=payload.start_date,
+                end_date=payload.end_date,
+                overlap_seconds=payload.overlap_seconds,
+            )
+        return await sync_ctrader_deals(
+            days=payload.days,
+            push_new=payload.push_new,
+            mode=payload.mode,
+            start_date=payload.start_date,
+            end_date=payload.end_date,
+            overlap_seconds=payload.overlap_seconds,
+        )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

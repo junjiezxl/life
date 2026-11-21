@@ -733,6 +733,166 @@ class TestLifeHubAPI(unittest.TestCase):
         # Clear token setting cleanly
         self.client.put("/api/settings", json={"ctrader_market_api_token": ""})
 
+    def test_15_ctrader_incremental_and_chunked_history_sync(self):
+        from unittest.mock import patch
+        from ctrader_open_api.messages import OpenApiModelMessages_pb2 as model_pb
+        from app.db import get_conn
+        from app.services import ctrader_service
+
+        # Configure dummy cTrader credentials
+        self.client.put(
+            "/api/settings",
+            json={
+                "ctrader_client_id": "cid",
+                "ctrader_client_secret": "csec",
+                "ctrader_access_token": "tok",
+                "ctrader_account_id": "999001",
+                "ctrader_environment": "demo",
+            },
+        )
+        with get_conn() as conn:
+            conn.execute("DELETE FROM ctrader_deals")
+
+        from_ms, to_ms = ctrader_service.parse_date_bounds_ms("2026-10-01", "2026-11-21")
+        self.assertGreater(to_ms - from_ms, 50 * 86400 * 1000)
+
+        requested_windows = []
+        label_calls = []
+
+        orig_client_cls = ctrader_service._CTraderAsyncClient
+
+        class FakeAsyncClient:
+            def __init__(self, **kwargs):
+                self.ctid_trader_account_id = 999001
+                self.environment = "demo"
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def fetch_symbols(self):
+                return {1: "XAUUSD"}
+
+            async def fetch_raw_deals_chunked(self, start_ms, end_ms, progress_cb=None):
+                requested_windows.append((start_ms, end_ms))
+                # Verify 7-day chunk splitting would produce >= 8 chunks for Oct 1 -> Nov 21
+                d1 = model_pb.ProtoOADeal(
+                    dealId=101,
+                    orderId=201,
+                    positionId=301,
+                    symbolId=1,
+                    tradeSide=model_pb.BUY,
+                    filledVolume=1000,
+                    executionPrice=3500.0,
+                    executionTimestamp=1760000000000,
+                    dealStatus=model_pb.FILLED,
+                    moneyDigits=2,
+                    commission=-8,
+                )
+                # Breakeven close deal (grossProfit=0, swap=-50 -> -$0.50, commission=-8 -> -$0.08)
+                d2 = model_pb.ProtoOADeal(
+                    dealId=102,
+                    orderId=202,
+                    positionId=301,
+                    symbolId=1,
+                    tradeSide=model_pb.SELL,
+                    filledVolume=1000,
+                    executionPrice=3500.0,
+                    executionTimestamp=1760000050000,
+                    dealStatus=model_pb.FILLED,
+                    moneyDigits=2,
+                    closePositionDetail=model_pb.ProtoOAClosePositionDetail(
+                        entryPrice=3500.0,
+                        grossProfit=0,
+                        swap=-50,
+                        commission=-8,
+                        balance=1000000,
+                        moneyDigits=2,
+                    ),
+                )
+                if progress_cb:
+                    progress_cb(1, 1, 2)
+                if len(requested_windows) == 1:
+                    return [d1, d2]
+                # Second call (incremental): return d2 again (same-timestamp overlap) + new deal d3
+                d3 = model_pb.ProtoOADeal(
+                    dealId=103,
+                    orderId=203,
+                    positionId=302,
+                    symbolId=1,
+                    tradeSide=model_pb.BUY,
+                    filledVolume=1000,
+                    executionPrice=3510.0,
+                    executionTimestamp=1760000055000,
+                    dealStatus=model_pb.FILLED,
+                    moneyDigits=2,
+                )
+                return [d2, d3]
+
+            async def fetch_order_labels(self, order_ids, progress_cb=None):
+                label_calls.append(list(order_ids))
+                res = {}
+                for oid in order_ids:
+                    if oid == 201:
+                        res["201"] = ("GS2.1117.abc", "")
+                    elif oid == 203:
+                        res["203"] = ("GS2.1122.xyz", "")
+                    else:
+                        res[str(oid)] = ("", "")
+                if progress_cb:
+                    progress_cb(len(order_ids), len(order_ids))
+                return res
+
+            def decode_raw_deals(self, raw_deals, symbol_map, order_meta):
+                return orig_client_cls.decode_raw_deals(self, raw_deals, symbol_map, order_meta)
+
+        with patch.object(ctrader_service, "_CTraderAsyncClient", FakeAsyncClient):
+            # 1. Range historical backfill from 2026-10-01 to 2026-11-21
+            r1 = self.client.post(
+                "/api/ctrader/sync",
+                json={
+                    "mode": "range",
+                    "start_date": "2026-10-01",
+                    "end_date": "2026-11-21",
+                    "background": False,
+                },
+            )
+            self.assertEqual(r1.status_code, 200, r1.text)
+            body1 = r1.json()
+            self.assertEqual(body1["mode"], "range")
+            self.assertEqual(body1["fetched"], 2)
+            self.assertEqual(body1["inserted"], 2)
+            self.assertEqual(body1["pushed"], 0)  # silent backfill by default
+
+            # Verify breakeven close deal kept swap+commission (-0.58) & inherited position label
+            deals1 = self.client.get("/api/ctrader/deals").json()["deals"]
+            self.assertEqual(len(deals1), 2)
+            close_deal = next(d for d in deals1 if d["deal_id"] == "102")
+            self.assertEqual(close_deal["net_profit"], -0.58)
+            self.assertEqual(close_deal["label"], "GS2.1117.abc")
+
+            # 2. Default incremental sync starts from latest deal (1760000050000) - 3s = 1760000047000
+            r2 = self.client.post("/api/ctrader/sync", json={"mode": "incremental"})
+            self.assertEqual(r2.status_code, 200)
+            body2 = r2.json()
+            self.assertEqual(body2["sync_strategy"], "incremental_from_last")
+            self.assertEqual(requested_windows[1][0], 1760000050000 - 3000)
+            self.assertEqual(body2["inserted"], 1)
+            self.assertEqual(body2["updated"], 1)  # overlapping deal 102 updated without duplicating
+
+            # Cached order 202/201 were not re-queried if labeled; only new 203 queried
+            self.assertNotIn(201, label_calls[1])
+            self.assertIn(203, label_calls[1])
+
+            deals2 = self.client.get("/api/ctrader/deals").json()
+            self.assertEqual(deals2["stats"]["total_deals"], 3)
+
+        st_resp = self.client.get("/api/ctrader/sync/status")
+        self.assertEqual(st_resp.status_code, 200)
+        self.assertEqual(st_resp.json()["phase"], "completed")
+
 
 if __name__ == "__main__":
     unittest.main()

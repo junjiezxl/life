@@ -195,6 +195,7 @@ def init_db(seed_demo: bool = True) -> None:
                 label TEXT DEFAULT '',
                 comment TEXT DEFAULT '',
                 executed_at TEXT NOT NULL,
+                execution_ms INTEGER NOT NULL DEFAULT 0,
                 pushed_at TEXT DEFAULT '',
                 raw_json TEXT DEFAULT '{}',
                 created_at TEXT NOT NULL
@@ -325,6 +326,9 @@ def init_db(seed_demo: bool = True) -> None:
             conn.execute("ALTER TABLE ctrader_deals ADD COLUMN label TEXT DEFAULT ''")
         if "comment" not in ctrader_cols:
             conn.execute("ALTER TABLE ctrader_deals ADD COLUMN comment TEXT DEFAULT ''")
+        if "execution_ms" not in ctrader_cols:
+            conn.execute("ALTER TABLE ctrader_deals ADD COLUMN execution_ms INTEGER NOT NULL DEFAULT 0")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ctrader_deals_exec_ms ON ctrader_deals(account_id, execution_ms DESC)")
         if "bark_notified_at" not in rem_cols:
             conn.execute("ALTER TABLE reminders ADD COLUMN bark_notified_at TEXT DEFAULT ''")
 
