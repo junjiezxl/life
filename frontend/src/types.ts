@@ -15,6 +15,8 @@ export interface CTraderDeal {
   gross_profit: number;
   net_profit: number;
   status: string;
+  label?: string;
+  comment?: string;
   executed_at: string;
   pushed_at: string;
 }

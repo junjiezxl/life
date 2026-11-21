@@ -168,6 +168,26 @@ class _CTraderAsyncClient:
         res.ParseFromString(proto.payload)
         return {int(s.symbolId): str(s.symbolName) for s in res.symbol}
 
+    async def fetch_order_labels(self, order_ids: List[int]) -> Dict[str, Tuple[str, str]]:
+        assert self.ctid_trader_account_id is not None
+        result: Dict[str, Tuple[str, str]] = {}
+        for oid in order_ids[:150]:
+            try:
+                req = self.oa_msgs.ProtoOAOrderDetailsReq()
+                req.ctidTraderAccountId = self.ctid_trader_account_id
+                req.orderId = oid
+                proto = await self._send_req(req, timeout=5.0)
+                res = self.oa_msgs.ProtoOAOrderDetailsRes()
+                res.ParseFromString(proto.payload)
+                order_obj = getattr(res, "order", None)
+                trade_data = getattr(order_obj, "tradeData", None) if order_obj else None
+                label = str(getattr(trade_data, "label", "") or "").strip()
+                comment = str(getattr(trade_data, "comment", "") or "").strip()
+                result[str(oid)] = (label, comment)
+            except Exception:
+                continue
+        return result
+
     async def fetch_deals(self, days: int = 7) -> List[Dict[str, Any]]:
         assert self.ctid_trader_account_id is not None
         symbol_map = await self.fetch_symbols()
@@ -182,6 +202,9 @@ class _CTraderAsyncClient:
         proto = await self._send_req(req, timeout=20.0)
         res = self.oa_msgs.ProtoOADealListRes()
         res.ParseFromString(proto.payload)
+
+        unique_order_ids = list({int(d.orderId) for d in res.deal if getattr(d, "orderId", 0)})
+        order_meta = await self.fetch_order_labels(unique_order_ids) if unique_order_ids else {}
 
         deals: List[Dict[str, Any]] = []
         for d in res.deal:
@@ -212,10 +235,13 @@ class _CTraderAsyncClient:
             sym_name = symbol_map.get(sym_id, f"SYM_{sym_id}")
             vol = float(getattr(d, "filledVolume", 0) or getattr(d, "volume", 0) or 0) / 10000000.0
 
+            oid_str = str(getattr(d, "orderId", "") or "")
+            label_val, comment_val = order_meta.get(oid_str, ("", ""))
+
             deals.append(
                 {
                     "deal_id": str(d.dealId),
-                    "order_id": str(getattr(d, "orderId", "") or ""),
+                    "order_id": oid_str,
                     "position_id": str(getattr(d, "positionId", "") or ""),
                     "account_id": str(self.ctid_trader_account_id),
                     "symbol_id": sym_id,
@@ -228,6 +254,8 @@ class _CTraderAsyncClient:
                     "gross_profit": round(gross, 2),
                     "net_profit": round(net_profit, 2),
                     "status": str(getattr(d, "dealStatus", "") or ""),
+                    "label": label_val,
+                    "comment": comment_val,
                     "executed_at": exec_iso,
                     "raw_json": json.dumps(
                         {
@@ -295,7 +323,9 @@ async def sync_ctrader_deals(days: int = 7, push_new: bool = True) -> Dict[str, 
                     UPDATE ctrader_deals
                     SET symbol_name = ?, side = ?, volume = ?, price = ?,
                         commission = ?, swap = ?, gross_profit = ?, net_profit = ?,
-                        status = ?, executed_at = ?, raw_json = ?
+                        status = ?, label = CASE WHEN ? != '' THEN ? ELSE label END,
+                        comment = CASE WHEN ? != '' THEN ? ELSE comment END,
+                        executed_at = ?, raw_json = ?
                     WHERE deal_id = ?
                     """,
                     (
@@ -308,6 +338,10 @@ async def sync_ctrader_deals(days: int = 7, push_new: bool = True) -> Dict[str, 
                         d["gross_profit"],
                         d["net_profit"],
                         d["status"],
+                        d["label"],
+                        d["label"],
+                        d["comment"],
+                        d["comment"],
                         d["executed_at"],
                         d["raw_json"],
                         d["deal_id"],
@@ -320,8 +354,8 @@ async def sync_ctrader_deals(days: int = 7, push_new: bool = True) -> Dict[str, 
                     INSERT INTO ctrader_deals (
                         deal_id, order_id, position_id, account_id, symbol_id, symbol_name,
                         side, volume, price, commission, swap, gross_profit, net_profit,
-                        status, executed_at, pushed_at, raw_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
+                        status, label, comment, executed_at, pushed_at, raw_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
                     """,
                     (
                         d["deal_id"],
@@ -338,6 +372,8 @@ async def sync_ctrader_deals(days: int = 7, push_new: bool = True) -> Dict[str, 
                         d["gross_profit"],
                         d["net_profit"],
                         d["status"],
+                        d["label"],
+                        d["comment"],
                         d["executed_at"],
                         d["raw_json"],
                         now_str,

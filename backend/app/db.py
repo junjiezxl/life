@@ -189,6 +189,8 @@ def init_db(seed_demo: bool = True) -> None:
                 gross_profit REAL NOT NULL DEFAULT 0,
                 net_profit REAL NOT NULL DEFAULT 0,
                 status TEXT DEFAULT '',
+                label TEXT DEFAULT '',
+                comment TEXT DEFAULT '',
                 executed_at TEXT NOT NULL,
                 pushed_at TEXT DEFAULT '',
                 raw_json TEXT DEFAULT '{}',
@@ -315,6 +317,11 @@ def init_db(seed_demo: bool = True) -> None:
             conn.execute("ALTER TABLE phone_numbers ADD COLUMN parent_phone_id INTEGER REFERENCES phone_numbers(id) ON DELETE SET NULL")
 
         rem_cols = {r["name"] for r in conn.execute("PRAGMA table_info(reminders)").fetchall()}
+        ctrader_cols = {r["name"] for r in conn.execute("PRAGMA table_info(ctrader_deals)").fetchall()}
+        if "label" not in ctrader_cols:
+            conn.execute("ALTER TABLE ctrader_deals ADD COLUMN label TEXT DEFAULT ''")
+        if "comment" not in ctrader_cols:
+            conn.execute("ALTER TABLE ctrader_deals ADD COLUMN comment TEXT DEFAULT ''")
         if "bark_notified_at" not in rem_cols:
             conn.execute("ALTER TABLE reminders ADD COLUMN bark_notified_at TEXT DEFAULT ''")
 
