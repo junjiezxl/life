@@ -862,290 +862,187 @@ export const PhoneNumbersView: React.FC<Props> = ({ onRefreshDashboard, onNotify
           暂无手机号码记录，点击右上角「新增手机号码」开始管理你的国内外号码与保号规则。
         </div>
       ) : (
-        <div className="space-y-3">
-          {(() => {
-            const visibleIds = new Set(filteredItems.map((x) => x.id));
-            const topLevelItems =
-              regionFilter === 'subcards'
-                ? filteredItems
-                : filteredItems.filter((x) => !x.parent_phone_id || !visibleIds.has(x.parent_phone_id));
+        <div className="rounded-2xl border border-slate-200/80 bg-white shadow-xs overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead className="bg-slate-50 text-slate-500 border-b border-slate-200/80">
+                <tr>
+                  <th className="px-4 py-3 font-medium">名称 / 归属</th>
+                  <th className="px-4 py-3 font-medium">手机号码</th>
+                  <th className="px-4 py-3 font-medium">状态</th>
+                  <th className="px-4 py-3 font-medium">月费 / 余额</th>
+                  <th className="px-4 py-3 font-medium">保号提醒</th>
+                  <th className="px-4 py-3 font-medium text-right">操作</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {(() => {
+                  const visibleIds = new Set(filteredItems.map((x) => x.id));
+                  const topLevelItems =
+                    regionFilter === 'subcards'
+                      ? filteredItems
+                      : filteredItems.filter((x) => !x.parent_phone_id || !visibleIds.has(x.parent_phone_id));
 
-            const renderPhoneRow = (item: PhoneNumber, isNestedSub = false) => {
-              const st = STATUS_META[item.status] || STATUS_META.active;
-              const daysLeft = item.keep_alive_days_left;
-              const services = item.bound_services
-                ? item.bound_services.split(/[,，、]/).map((s) => s.trim()).filter(Boolean)
-                : [];
+                  const renderRow = (item: PhoneNumber, isNestedSub = false) => {
+                    const st = STATUS_META[item.status] || STATUS_META.active;
+                    const daysLeft = item.keep_alive_days_left;
+                    const currSymbol = CURRENCY_SYMBOLS[item.currency] || `${item.currency} `;
 
-              return (
-                <div
-                  key={item.id}
-                  className={`rounded-2xl border bg-white p-4 shadow-xs space-y-3 ${
-                    isNestedSub
-                      ? 'border-indigo-100 bg-slate-50/50 border-l-4 border-l-violet-400'
-                      : item.parent_phone_id
-                        ? 'border-slate-200/80 border-l-4 border-l-indigo-400'
-                        : 'border-slate-200/80'
-                  }`}
-                >
-                {/* Header */}
-                <div className="flex items-start justify-between gap-3">
-                  <div>
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="rounded-lg bg-indigo-50 px-2 py-0.5 text-[11px] font-medium text-indigo-700">
-                        {item.country_region}
-                      </span>
-                      {item.parent_phone_id ? (
-                        <span className="inline-flex items-center gap-1 rounded-md bg-violet-50 border border-violet-200 px-2 py-0.5 text-[11px] font-medium text-violet-700">
-                          <GitBranch className="h-3 w-3" /> 副卡
-                        </span>
-                      ) : (item.sub_cards_count || 0) > 0 ? (
-                        <span className="inline-flex items-center gap-1 rounded-md bg-indigo-600 px-2 py-0.5 text-[11px] font-medium text-white">
-                          主卡 · {item.sub_cards_count} 张副卡
-                        </span>
-                      ) : null}
-                      <h3 className="text-base font-bold text-slate-900">{item.label}</h3>
-                      <span className={`rounded-md border px-2 py-0.5 text-[11px] font-medium ${st.cls}`}>
-                        {st.label}
-                      </span>
-                    </div>
-                    {item.parent_phone_id && item.parent_label && (
-                      <div className="mt-1.5 inline-flex items-center gap-1.5 rounded-lg bg-violet-50/70 px-2.5 py-1 text-[11px] text-violet-700">
-                        <GitBranch className="h-3 w-3" />
-                        <span>
-                          归属主号：<span className="font-semibold">{item.parent_label}</span> ({maskNumber(item.parent_number || '', maskNumbers)})
-                        </span>
-                      </div>
-                    )}
-                    <div className="mt-1.5 flex flex-wrap items-center gap-2 text-xs text-slate-500">
-                      <span>{item.carrier || '未填运营商'}</span>
-                      <span>·</span>
-                      <span>{SIM_TYPE_LABELS[item.sim_type] || item.sim_type}</span>
-                      {item.device_slot && (
-                        <>
-                          <span>·</span>
-                          <span>{item.device_slot}</span>
-                        </>
-                      )}
-                    </div>
-                  </div>
-
-                  <div className="flex items-center gap-1 shrink-0">
-                    {!item.parent_phone_id && (
-                      <button
-                        onClick={() => openCreateSubCard(item)}
-                        title="在此主号下添加副卡"
-                        className="inline-flex items-center gap-1 rounded-lg border border-indigo-200 bg-indigo-50 px-2 py-1 text-[11px] font-medium text-indigo-700 hover:bg-indigo-100 cursor-pointer"
+                    return (
+                      <tr
+                        key={item.id}
+                        className={
+                          isNestedSub
+                            ? 'bg-violet-50/25 hover:bg-violet-50/50'
+                            : 'hover:bg-slate-50/70'
+                        }
                       >
-                        <GitBranch className="h-3 w-3" /> + 副卡
-                      </button>
-                    )}
-                    <button
-                      onClick={() => openEditForm(item)}
-                      title="编辑"
-                      className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700 cursor-pointer"
-                    >
-                      <Edit3 className="h-4 w-4" />
-                    </button>
-                    <button
-                      onClick={async () => {
-                        const msg =
-                          (item.sub_cards_count || 0) > 0
-                            ? `确定删除主卡「${item.label}」吗？其名下的 ${item.sub_cards_count} 张副卡将自动转为独立号码。`
-                            : `确定删除「${item.label}」吗？`;
-                        if (!window.confirm(msg)) return;
-                        await api.deletePhoneNumber(item.id);
-                        await loadAll();
-                        onRefreshDashboard();
-                      }}
-                      title="删除"
-                      className="rounded-lg p-1.5 text-slate-400 hover:bg-rose-50 hover:text-rose-600 cursor-pointer"
-                    >
-                      <Trash2 className="h-4 w-4" />
-                    </button>
-                  </div>
-                </div>
-
-                {/* Number Row */}
-                <div className="flex items-center justify-between rounded-xl bg-slate-50 px-3.5 py-2.5">
-                  <span className="font-mono text-base font-semibold tracking-wide text-slate-900">
-                    {maskNumber(item.phone_number, maskNumbers)}
-                  </span>
-                  <button
-                    onClick={() => {
-                      navigator.clipboard?.writeText(item.phone_number);
-                      onNotify(`已复制号码 ${item.phone_number}`);
-                    }}
-                    className="inline-flex items-center gap-1 rounded-lg bg-white border border-slate-200 px-2.5 py-1 text-[11px] text-slate-600 hover:bg-slate-100 cursor-pointer"
-                  >
-                    <Copy className="h-3 w-3" /> 复制
-                  </button>
-                </div>
-
-                {/* Fee & Comm Cost Grid */}
-                <div className="grid grid-cols-3 gap-2.5 text-xs">
-                  <div className="rounded-xl border border-slate-100 bg-slate-50/50 p-3">
-                    <div className="text-slate-400">套餐月费</div>
-                    <div className="mt-1 font-semibold text-slate-900">
-                      {formatCurrency(item.monthly_fee, item.currency)}
-                    </div>
-                    {item.currency !== 'CNY' && (
-                      <div className="text-[10px] text-slate-400">约 {formatMoney(item.monthly_fee_cny)}</div>
-                    )}
-                  </div>
-                  <div className="rounded-xl border border-slate-100 bg-slate-50/50 p-3">
-                    <div className="text-slate-400">当前余额</div>
-                    <div className="mt-1 font-semibold text-emerald-600">
-                      {formatCurrency(item.balance, item.currency)}
-                    </div>
-                    <div className="text-[10px] text-slate-400">每月 {item.billing_day} 号扣费</div>
-                  </div>
-                  <div className="rounded-xl border border-slate-100 bg-slate-50/50 p-3">
-                    <div className="text-slate-400">额外 / 累计通信费</div>
-                    <div className="mt-1 font-semibold text-slate-900">
-                      {formatCurrency(item.extra_comm_cost, item.currency)}
-                    </div>
-                    <div className="text-[10px] text-slate-400">
-                      累计 {formatCurrency(item.total_comm_spent, item.currency)}
-                    </div>
-                  </div>
-                </div>
-
-                {/* Keep-Alive Rule Box */}
-                <div className="rounded-xl border border-teal-100 bg-teal-50/40 p-3.5 space-y-2 text-xs">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <span className="font-semibold text-teal-800 flex items-center gap-1.5">
-                      <ShieldCheck className="h-4 w-4" /> 保号规则
-                      {item.keep_alive_cycle_days > 0 && `（每 ${item.keep_alive_cycle_days} 天 · 提前 ${item.remind_before_days ?? 7} 天提醒）`}
-                    </span>
-                    {daysLeft !== null && (
-                      <span
-                        className={`rounded-md px-2 py-0.5 text-[11px] font-medium ${
-                          daysLeft <= 0
-                            ? 'bg-rose-100 text-rose-700'
-                            : daysLeft <= (item.remind_before_days ?? 7)
-                              ? 'bg-amber-100 text-amber-800'
-                              : 'bg-teal-100 text-teal-800'
-                        }`}
-                      >
-                        {daysLeft < 0
-                          ? `已逾期 ${Math.abs(daysLeft)} 天`
-                          : daysLeft === 0
-                            ? '今日截止保号'
-                            : `剩余 ${daysLeft} 天`}
-                      </span>
-                    )}
-                  </div>
-                  <p className="text-slate-700">
-                    {item.keep_alive_rule || '未设置保号规则说明'}
-                  </p>
-                  <div className="flex flex-wrap items-center justify-between gap-2 pt-1 text-[11px] text-slate-500">
-                    <div className="flex flex-wrap gap-3">
-                      {item.last_keep_alive_date && <span>上次保号：{item.last_keep_alive_date}</span>}
-                      {item.next_keep_alive_date && <span>下次截止：{item.next_keep_alive_date}</span>}
-                      {item.expiry_date && <span>有效期至：{item.expiry_date}</span>}
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <button
-                        onClick={() => handleKeepAlive(item)}
-                        className="inline-flex items-center gap-1 rounded-lg bg-teal-600 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-teal-700 cursor-pointer"
-                      >
-                        <CheckCircle2 className="h-3 w-3" /> 保号打卡
-                      </button>
-                      <button
-                        onClick={() => setCostPhone(item)}
-                        className="inline-flex items-center gap-1 rounded-lg bg-white border border-slate-200 px-2.5 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-50 cursor-pointer"
-                      >
-                        <Coins className="h-3 w-3" /> 记通信费/充值
-                      </button>
-                    </div>
-                  </div>
-                </div>
-
-                {/* Sub-cards attached to this primary card */}
-                {!item.parent_phone_id && item.sub_cards && item.sub_cards.length > 0 && (
-                  <div className="rounded-xl border border-indigo-100 bg-indigo-50/40 p-3 space-y-2">
-                    <div className="flex items-center justify-between text-[11px] font-semibold text-indigo-800">
-                      <span className="inline-flex items-center gap-1.5">
-                        <GitBranch className="h-3.5 w-3.5" /> 名下挂载副卡 ({item.sub_cards.length})
-                      </span>
-                      <span className="font-normal text-indigo-600">
-                        副卡月费合计 {formatMoney(item.sub_cards.reduce((acc, s) => acc + s.monthly_fee_cny, 0))}
-                      </span>
-                    </div>
-                    <div className="space-y-1.5">
-                      {item.sub_cards.map((sub) => {
-                        const fullSub = data.items.find((x) => x.id === sub.id);
-                        const subSt = STATUS_META[sub.status] || STATUS_META.active;
-                        return (
-                          <div
-                            key={sub.id}
-                            className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-white border border-indigo-100/80 px-3 py-2 text-xs"
-                          >
-                            <div className="flex flex-wrap items-center gap-2 min-w-0">
-                              <span className="font-medium text-slate-800">{sub.label}</span>
-                              <span className="font-mono text-slate-600">{maskNumber(sub.phone_number, maskNumbers)}</span>
-                              <span className={`rounded px-1.5 py-0.5 text-[10px] border ${subSt.cls}`}>{subSt.label}</span>
-                              {sub.device_slot && <span className="text-[11px] text-slate-400">· {sub.device_slot}</span>}
-                            </div>
-                            <div className="flex items-center gap-2 shrink-0">
-                              <span className="text-[11px] font-medium text-slate-700">
-                                {sub.monthly_fee_cny > 0 ? `${formatMoney(sub.monthly_fee_cny)}/月` : '共享主卡'}
-                              </span>
-                              {fullSub && (
-                                <button
-                                  type="button"
-                                  onClick={() => openEditForm(fullSub)}
-                                  className="text-[11px] text-indigo-600 hover:underline cursor-pointer"
-                                >
-                                  编辑
-                                </button>
-                              )}
+                        <td className="px-4 py-3">
+                          <div className={`flex items-center gap-2 ${isNestedSub ? 'pl-5' : ''}`}>
+                            {isNestedSub && (
+                              <span className="text-violet-400 font-mono select-none">↳</span>
+                            )}
+                            <div>
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                <span className="font-semibold text-slate-900">{item.label}</span>
+                                {item.parent_phone_id ? (
+                                  <span className="inline-flex items-center gap-0.5 rounded bg-violet-50 border border-violet-200 px-1.5 py-0.5 text-[10px] font-medium text-violet-700">
+                                    副卡
+                                  </span>
+                                ) : (item.sub_cards_count || 0) > 0 ? (
+                                  <span className="inline-flex items-center gap-0.5 rounded bg-indigo-600 px-1.5 py-0.5 text-[10px] font-medium text-white">
+                                    主卡·{item.sub_cards_count}
+                                  </span>
+                                ) : null}
+                              </div>
+                              <div className="mt-0.5 text-[11px] text-slate-400">
+                                {item.country_region} · {item.carrier || '未知运营商'} ·{' '}
+                                {SIM_TYPE_LABELS[item.sim_type] || item.sim_type}
+                                {item.device_slot ? ` · ${item.device_slot}` : ''}
+                              </div>
                             </div>
                           </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                )}
-
-                {/* Bound services & notes */}
-                {(services.length > 0 || item.notes) && (
-                  <div className="space-y-2 text-xs">
-                    {services.length > 0 && (
-                      <div className="flex flex-wrap items-center gap-1.5">
-                        <span className="text-slate-400">绑定服务：</span>
-                        {services.map((s) => (
-                          <span key={s} className="rounded-md bg-slate-100 px-2 py-0.5 text-[11px] text-slate-700">
-                            {s}
+                        </td>
+                        <td className="px-4 py-3 whitespace-nowrap">
+                          <div className="inline-flex items-center gap-1.5">
+                            <span className="font-mono font-semibold text-slate-900">
+                              {maskNumber(item.phone_number, maskNumbers)}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => handleCopy(item.phone_number, item.label)}
+                              title="复制号码"
+                              className="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700 cursor-pointer"
+                            >
+                              <Copy className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 whitespace-nowrap">
+                          <span className={`rounded-md border px-2 py-0.5 text-[11px] font-medium ${st.cls}`}>
+                            {st.label}
                           </span>
-                        ))}
-                      </div>
-                    )}
-                    {item.notes && <div className="text-[11px] text-slate-500">备注：{item.notes}</div>}
-                  </div>
-                )}
-              </div>
-            );
-            };
+                        </td>
+                        <td className="px-4 py-3 whitespace-nowrap">
+                          <div className="font-semibold text-slate-900">
+                            {currSymbol}
+                            {Number(item.monthly_fee || 0).toFixed(2)}/月
+                          </div>
+                          <div className="text-[11px] text-slate-500">
+                            余额 {currSymbol}
+                            {Number(item.balance || 0).toFixed(2)}
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 whitespace-nowrap">
+                          {daysLeft !== null && daysLeft !== undefined ? (
+                            <span
+                              className={`rounded-md px-2 py-0.5 text-[11px] font-medium ${
+                                daysLeft <= (item.remind_before_days || 7)
+                                  ? 'bg-rose-50 text-rose-700'
+                                  : 'bg-emerald-50 text-emerald-700'
+                              }`}
+                            >
+                              {daysLeft <= 0 ? `已到期 ${Math.abs(daysLeft)} 天` : `剩 ${daysLeft} 天`}
+                            </span>
+                          ) : (
+                            <span className="text-slate-400">{item.keep_alive_rule || '未设置'}</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 whitespace-nowrap text-right">
+                          <div className="inline-flex items-center gap-1">
+                            {!item.parent_phone_id && (
+                              <button
+                                type="button"
+                                onClick={() => openCreateSubCard(item)}
+                                title="添加副卡"
+                                className="rounded-lg border border-indigo-200 bg-indigo-50 px-2 py-1 text-[11px] font-medium text-indigo-700 hover:bg-indigo-100 cursor-pointer"
+                              >
+                                +副卡
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => handleCheckIn(item)}
+                              title="保号打卡"
+                              className="rounded-lg border border-emerald-200 bg-emerald-50 px-2 py-1 text-[11px] font-medium text-emerald-700 hover:bg-emerald-100 cursor-pointer"
+                            >
+                              打卡
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => openCostForm(item)}
+                              title="记通信费 / 充值"
+                              className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-50 cursor-pointer"
+                            >
+                              记账
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => openEditForm(item)}
+                              title="编辑"
+                              className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700 cursor-pointer"
+                            >
+                              <Edit3 className="h-3.5 w-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                const msg =
+                                  (item.sub_cards_count || 0) > 0
+                                    ? `确定删除主卡「${item.label}」吗？其名下的 ${item.sub_cards_count} 张副卡将自动转为独立号码。`
+                                    : `确定删除「${item.label}」吗？`;
+                                if (!window.confirm(msg)) return;
+                                await api.deletePhoneNumber(item.id);
+                                await loadAll();
+                                onRefreshDashboard();
+                              }}
+                              title="删除"
+                              className="rounded-lg p-1.5 text-slate-400 hover:bg-rose-50 hover:text-rose-600 cursor-pointer"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  };
 
-            return topLevelItems.map((item) => {
-              const subItems =
-                regionFilter === 'subcards'
-                  ? []
-                  : filteredItems.filter((x) => x.parent_phone_id === item.id);
-              return (
-                <div key={item.id} className="space-y-2">
-                  {renderPhoneRow(item, false)}
-                  {subItems.length > 0 && (
-                    <div className="ml-6 pl-4 border-l-2 border-indigo-200 space-y-2">
-                      {subItems.map((sub) => renderPhoneRow(sub, true))}
-                    </div>
-                  )}
-                </div>
-              );
-            });
-          })()}
+                  return topLevelItems.map((item) => {
+                    const subItems =
+                      regionFilter === 'subcards'
+                        ? []
+                        : filteredItems.filter((x) => x.parent_phone_id === item.id);
+                    return (
+                      <React.Fragment key={item.id}>
+                        {renderRow(item, false)}
+                        {subItems.map((sub) => renderRow(sub, true))}
+                      </React.Fragment>
+                    );
+                  });
+                })()}
+              </tbody>
+            </table>
+          </div>
         </div>
       )}
     </div>
