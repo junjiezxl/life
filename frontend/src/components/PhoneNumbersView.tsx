@@ -990,7 +990,7 @@ export const PhoneNumbersView: React.FC<Props> = ({ onRefreshDashboard, onNotify
                             </button>
                             <button
                               type="button"
-                              onClick={() => setCostTarget(item)}
+                              onClick={() => setCostPhone(item)}
                               title="记通信费 / 充值"
                               className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-50 cursor-pointer"
                             >
