@@ -44,6 +44,44 @@ export interface CTraderSyncResponse {
   synced_at: string;
 }
 
+export interface CTraderQuote {
+  source: string;
+  symbol: string;
+  bid: number;
+  ask: number;
+  spread: number;
+  timestamp: number;
+  datetime_utc: string;
+}
+
+export interface CTraderMarketStatus {
+  running: boolean;
+  connected: boolean;
+  authenticated: boolean;
+  enabled: boolean;
+  configured: boolean;
+  status: 'stopped' | 'unconfigured' | 'connecting' | 'streaming' | 'reconnecting';
+  mode: string;
+  environment: string;
+  account_id: string;
+  symbols: string[];
+  subscribed_symbols: string[];
+  has_api_token: boolean;
+  uptime_sec: number;
+  ticks_per_sec: number;
+  tick_counts: Record<string, number>;
+  total_ticks: number;
+  active_ws_clients: number;
+  last_error: string | null;
+  quotes: Record<string, CTraderQuote>;
+}
+
+export interface CTraderRecentTicksResponse {
+  symbol: string;
+  ticks: CTraderQuote[];
+  status: CTraderMarketStatus;
+}
+
 export interface Reminder {
   id: number;
   title: string;

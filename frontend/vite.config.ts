@@ -11,6 +11,23 @@ export default defineConfig({
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,
       },
+      '/quotes': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+      '/quote': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+      '/status': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+      '/ws': {
+        target: 'ws://127.0.0.1:8000',
+        ws: true,
+        changeOrigin: true,
+      },
     },
   },
 })

@@ -21,7 +21,7 @@ import { NotesExtractorView } from './components/NotesExtractorView';
 import { PhoneNumbersView } from './components/PhoneNumbersView';
 import { RemindersChatView } from './components/RemindersChatView';
 import { SettingsView } from './components/SettingsView';
-import type { DashboardData, TabKey } from './types';
+import type { CTraderMarketStatus, DashboardData, TabKey } from './types';
 
 const NAV_ITEMS: Array<{ key: TabKey; label: string; icon: React.ComponentType<{ className?: string }> }> = [
   { key: 'dashboard', label: '展示面板', icon: LayoutDashboard },
@@ -29,7 +29,7 @@ const NAV_ITEMS: Array<{ key: TabKey; label: string; icon: React.ComponentType<{
   { key: 'notes', label: '思源笔记提取', icon: FileText },
   { key: 'phones', label: '手机号码管理', icon: Smartphone },
   { key: 'finance', label: '个人财务 & 结账', icon: Wallet },
-  { key: 'ctrader', label: 'cTrader 订单', icon: Activity },
+  { key: 'ctrader', label: 'cTrader 行情 & 订单', icon: Activity },
   { key: 'settings', label: '系统设置', icon: Settings },
 ];
 
@@ -44,6 +44,7 @@ export function App() {
   const [setupRequired, setSetupRequired] = useState(false);
   const [username, setUsername] = useState<string>('admin');
   const [authNotice, setAuthNotice] = useState<string | null>(null);
+  const [marketStatus, setMarketStatus] = useState<CTraderMarketStatus | null>(null);
 
   const notify = (msg: string) => {
     setToast(msg);
@@ -88,11 +89,31 @@ export function App() {
       setAuthenticated(false);
       setSetupRequired(false);
       setDashboard(null);
+      setMarketStatus(null);
       setAuthNotice('登录状态已失效，请重新登录');
     });
     checkAuthAndLoad();
     return () => setUnauthorizedHandler(null);
   }, []);
+
+  useEffect(() => {
+    if (!authenticated) return;
+    let active = true;
+    const pullMarket = async () => {
+      try {
+        const st = await api.getCTraderMarketStatus();
+        if (active) setMarketStatus(st);
+      } catch {
+        // ignore transient polling errors
+      }
+    };
+    pullMarket();
+    const timer = window.setInterval(pullMarket, 2000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [authenticated]);
 
   const handleAuthenticated = async (loggedInUser: string) => {
     setUsername(loggedInUser);
@@ -186,6 +207,58 @@ export function App() {
         </nav>
 
         <div className="hidden lg:block mt-auto p-4 border-t border-slate-100 space-y-2.5 text-[11px] text-slate-500">
+          {marketStatus && (marketStatus.configured || Object.keys(marketStatus.quotes || {}).length > 0) && (() => {
+            const quotes = marketStatus.quotes || {};
+            const keys = Object.keys(quotes);
+            const primaryKey =
+              keys.find((k) => k.toUpperCase() === 'XAUUSD') ||
+              keys.find((k) => k.toUpperCase().startsWith('XAUUSD')) ||
+              keys.find((k) => k.toUpperCase() === 'GOLD') ||
+              keys[0];
+            const q = primaryKey ? quotes[primaryKey] : null;
+            const ageSec = q ? (Date.now() - q.timestamp) / 1000 : null;
+            const fresh = ageSec !== null && ageSec >= -5 && ageSec <= 15 && marketStatus.status === 'streaming';
+            return (
+              <button
+                type="button"
+                onClick={() => setActiveTab('ctrader')}
+                className="w-full text-left rounded-xl border border-slate-200/80 bg-slate-50/80 p-2.5 hover:border-amber-300 hover:bg-amber-50/30 transition cursor-pointer space-y-1.5"
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-slate-800">{q?.symbol || marketStatus.symbols[0] || 'XAUUSD'}</span>
+                  <span
+                    className={`rounded-full px-1.5 py-0.5 text-[10px] font-medium ${
+                      fresh
+                        ? 'bg-emerald-100 text-emerald-700'
+                        : marketStatus.status === 'connecting' || marketStatus.status === 'reconnecting'
+                          ? 'bg-amber-100 text-amber-700'
+                          : 'bg-slate-200 text-slate-600'
+                    }`}
+                  >
+                    {fresh
+                      ? '实时'
+                      : marketStatus.status === 'connecting'
+                        ? '连接中'
+                        : marketStatus.status === 'reconnecting'
+                          ? '重连中'
+                          : q
+                            ? '停更'
+                            : '待机'}
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 gap-2 font-mono">
+                  <div>
+                    <div className="text-[10px] text-slate-400">Bid 卖出</div>
+                    <div className="text-xs font-bold text-emerald-700">{q ? q.bid.toFixed(2) : '—'}</div>
+                  </div>
+                  <div>
+                    <div className="text-[10px] text-slate-400">Ask 买入</div>
+                    <div className="text-xs font-bold text-rose-700">{q ? q.ask.toFixed(2) : '—'}</div>
+                  </div>
+                </div>
+              </button>
+            );
+          })()}
           {dashboard && (
             <>
               <div className="flex items-center justify-between">

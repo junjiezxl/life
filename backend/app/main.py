@@ -2,16 +2,18 @@ import asyncio
 import hashlib
 import json
 import os
+import secrets
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .db import get_all_settings, get_conn, init_db, now_iso, reset_all_data, update_settings
 from .models import (
+    CTraderMarketActionRequest,
     CTraderSyncRequest,
     AccountCreate,
     AccountUpdate,
@@ -71,6 +73,7 @@ from .services.ctrader_service import (
     sync_ctrader_deals,
     test_ctrader_connection,
 )
+from .services.ctrader_market_service import market_service
 from .services.bill_parser import parse_bill_file
 from .services.debt_planner_service import (
     enrich_credit_card,
@@ -304,12 +307,46 @@ async def on_startup() -> None:
     asyncio.create_task(_email_auto_sync_loop())
     asyncio.create_task(_bark_due_reminder_loop())
     asyncio.create_task(_ctrader_auto_sync_loop())
+    await market_service.ensure_started_from_settings()
+
+
+@app.on_event("shutdown")
+async def on_shutdown() -> None:
+    await market_service.stop()
 
 
 # ---------------- Auth & Health ----------------
 
 
-# ---------------- cTrader Orders ----------------
+# ---------------- cTrader Orders & Live Market Tick ----------------
+
+
+def _is_market_authorized(
+    headers: Any,
+    query_params: Any,
+    cookies: Any,
+    session_user: Any = None,
+) -> bool:
+    configured = market_service.get_api_token()
+    if not configured:
+        return True
+    if session_user:
+        return True
+    cookie_token = (cookies.get(SESSION_COOKIE_NAME) or "").strip() if cookies else ""
+    if cookie_token:
+        with get_conn() as conn:
+            if get_session_user(conn, cookie_token):
+                return True
+    auth_header = (headers.get("authorization") or "") if headers else ""
+    scheme, _, bearer = auth_header.partition(" ")
+    supplied = bearer.strip() if scheme.lower() == "bearer" else ""
+    if not supplied and headers:
+        supplied = (headers.get("x-api-key") or "").strip()
+    if not supplied and query_params:
+        supplied = (query_params.get("token") or "").strip()
+    if not supplied:
+        return False
+    return secrets.compare_digest(supplied.encode("utf-8"), configured.encode("utf-8"))
 
 
 @app.get("/api/ctrader/deals")
@@ -331,6 +368,107 @@ async def api_ctrader_test() -> Dict[str, Any]:
         return await test_ctrader_connection()
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/ctrader/market/status")
+def api_ctrader_market_status() -> Dict[str, Any]:
+    return market_service.get_detailed_status()
+
+
+@app.get("/api/ctrader/market/ticks")
+def api_ctrader_market_ticks(symbol: str = "", limit: int = Query(50, ge=1, le=300)) -> Dict[str, Any]:
+    return {
+        "symbol": symbol.upper().strip() or "ALL",
+        "ticks": market_service.get_recent_ticks(symbol=symbol, limit=limit),
+        "status": market_service.get_detailed_status(),
+    }
+
+
+@app.post("/api/ctrader/market/start")
+async def api_ctrader_market_start(payload: Optional[CTraderMarketActionRequest] = None) -> Dict[str, Any]:
+    updates: Dict[str, str] = {"ctrader_market_enabled": "1"}
+    if payload and payload.symbols is not None and payload.symbols.strip():
+        updates["ctrader_market_symbols"] = payload.symbols.strip()
+    update_settings(updates)
+    await market_service.restart()
+    return {"ok": True, "status": market_service.get_detailed_status()}
+
+
+@app.post("/api/ctrader/market/stop")
+async def api_ctrader_market_stop() -> Dict[str, Any]:
+    update_settings({"ctrader_market_enabled": "0"})
+    await market_service.stop()
+    return {"ok": True, "status": market_service.get_detailed_status()}
+
+
+@app.post("/api/ctrader/market/restart")
+async def api_ctrader_market_restart() -> Dict[str, Any]:
+    update_settings({"ctrader_market_enabled": "1"})
+    await market_service.restart()
+    return {"ok": True, "status": market_service.get_detailed_status()}
+
+
+# ---------------- Public / Token-Protected Market Feed APIs (gold.36xt.com compat) ----------------
+
+
+@app.get("/status")
+def market_public_status(request: Request) -> Dict[str, Any]:
+    if not _is_market_authorized(request.headers, request.query_params, request.cookies, getattr(request.state, "auth_user", None)):
+        raise HTTPException(status_code=401, detail="访问实时行情接口需要有效的 Token")
+    return market_service.get_public_status()
+
+
+@app.get("/quotes")
+def market_public_quotes(request: Request) -> Dict[str, Any]:
+    if not _is_market_authorized(request.headers, request.query_params, request.cookies, getattr(request.state, "auth_user", None)):
+        raise HTTPException(status_code=401, detail="访问实时行情接口需要有效的 Token")
+    return market_service.get_all_quotes()
+
+
+@app.get("/quote/{symbol}")
+def market_public_single_quote(symbol: str, request: Request) -> Dict[str, Any]:
+    if not _is_market_authorized(request.headers, request.query_params, request.cookies, getattr(request.state, "auth_user", None)):
+        raise HTTPException(status_code=401, detail="访问实时行情接口需要有效的 Token")
+    res = market_service.get_single_quote(symbol)
+    if res is None:
+        raise HTTPException(status_code=404, detail=f"Symbol '{symbol.upper().strip()}' not found in memory cache.")
+    return res
+
+
+@app.websocket("/ws")
+async def market_ws_all(ws: WebSocket) -> None:
+    if not _is_market_authorized(ws.headers, ws.query_params, ws.cookies):
+        await ws.close(code=1008, reason="Unauthorized")
+        return
+    await ws.accept()
+    market_service.bind_loop(asyncio.get_running_loop())
+    market_service.all_subscribers.add(ws)
+    try:
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        market_service.all_subscribers.discard(ws)
+
+
+@app.websocket("/ws/{symbol}")
+async def market_ws_symbol(ws: WebSocket, symbol: str) -> None:
+    if not _is_market_authorized(ws.headers, ws.query_params, ws.cookies):
+        await ws.close(code=1008, reason="Unauthorized")
+        return
+    sym = symbol.upper().strip()
+    await ws.accept()
+    market_service.bind_loop(asyncio.get_running_loop())
+    subs = market_service.symbol_subscribers.setdefault(sym, set())
+    subs.add(ws)
+    try:
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        subs.discard(ws)
 
 
 @app.get("/api/health")
@@ -2483,9 +2621,12 @@ def get_settings_endpoint() -> Dict[str, str]:
 
 
 @app.put("/api/settings")
-def update_settings_endpoint(payload: SettingsUpdateRequest) -> Dict[str, str]:
+async def update_settings_endpoint(payload: SettingsUpdateRequest) -> Dict[str, str]:
     updates = {k: v for k, v in payload.model_dump().items() if v is not None}
-    return update_settings(updates)
+    saved = update_settings(updates)
+    if any(k.startswith("ctrader_") for k in updates):
+        await market_service.on_settings_updated()
+    return saved
 
 
 @app.post("/api/settings/test-ai")

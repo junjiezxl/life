@@ -195,11 +195,18 @@ class SettingsUpdateRequest(BaseModel):
     ctrader_auto_sync_enabled: Optional[str] = None
     ctrader_sync_interval_sec: Optional[str] = None
     ctrader_bark_push_enabled: Optional[str] = None
+    ctrader_market_enabled: Optional[str] = None
+    ctrader_market_symbols: Optional[str] = None
+    ctrader_market_api_token: Optional[str] = None
 
 
 class CTraderSyncRequest(BaseModel):
     days: int = Field(default=7, ge=1, le=90)
     push_new: bool = True
+
+
+class CTraderMarketActionRequest(BaseModel):
+    symbols: Optional[str] = None
 
 
 class PhoneNumberCreate(BaseModel):

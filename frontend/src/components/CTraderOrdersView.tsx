@@ -1,7 +1,20 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Activity, RefreshCw, RotateCcw, Search, Settings, TrendingDown, TrendingUp } from 'lucide-react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Activity,
+  Check,
+  Copy,
+  Play,
+  Radio,
+  RefreshCw,
+  RotateCcw,
+  Search,
+  Settings,
+  Square,
+  TrendingDown,
+  TrendingUp,
+} from 'lucide-react';
 import { api } from '../api';
-import { CTraderDeal } from '../types';
+import { CTraderDeal, CTraderMarketStatus, CTraderQuote } from '../types';
 
 interface CTraderOrdersViewProps {
   onNotify: (msg: string) => void;
@@ -17,10 +30,23 @@ export const CTraderOrdersView: React.FC<CTraderOrdersViewProps> = ({
   onNotify,
   onNavigateSettings,
 }) => {
+  const [subTab, setSubTab] = useState<'orders' | 'market'>('orders');
   const [deals, setDeals] = useState<CTraderDeal[]>([]);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
   const [days, setDays] = useState(7);
+
+  // Market live tick state
+  const [marketStatus, setMarketStatus] = useState<CTraderMarketStatus | null>(null);
+  const [recentTicks, setRecentTicks] = useState<CTraderQuote[]>([]);
+  const [symbolsInput, setSymbolsInput] = useState<string>('XAUUSD,EURUSD');
+  const [symbolsDirty, setSymbolsDirty] = useState(false);
+  const [tickSymbolFilter, setTickSymbolFilter] = useState<string>('ALL');
+  const [marketBusy, setMarketBusy] = useState(false);
+  const [wsConnected, setWsConnected] = useState(false);
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [apiTestOutput, setApiTestOutput] = useState<string | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
 
   // Filters
   const [algoFilter, setAlgoFilter] = useState<string>('ALL');
@@ -47,6 +73,159 @@ export const CTraderOrdersView: React.FC<CTraderOrdersViewProps> = ({
     const timer = window.setInterval(loadDeals, 15000);
     return () => window.clearInterval(timer);
   }, [loadDeals]);
+
+  const loadMarketData = useCallback(async (withTicks = false) => {
+    try {
+      if (withTicks) {
+        const res = await api.getCTraderRecentTicks(tickSymbolFilter === 'ALL' ? '' : tickSymbolFilter, 80);
+        setMarketStatus(res.status);
+        setRecentTicks(res.ticks);
+        if (!symbolsDirty && res.status.symbols?.length) {
+          setSymbolsInput(res.status.symbols.join(','));
+        }
+      } else {
+        const st = await api.getCTraderMarketStatus();
+        setMarketStatus(st);
+        if (!symbolsDirty && st.symbols?.length) {
+          setSymbolsInput(st.symbols.join(','));
+        }
+      }
+    } catch {
+      // ignore transient polling failure
+    }
+  }, [tickSymbolFilter, symbolsDirty]);
+
+  useEffect(() => {
+    loadMarketData(subTab === 'market');
+    const timer = window.setInterval(
+      () => loadMarketData(subTab === 'market' && !wsConnected),
+      subTab === 'market' ? 1500 : 3000,
+    );
+    return () => window.clearInterval(timer);
+  }, [loadMarketData, subTab, wsConnected]);
+
+  useEffect(() => {
+    if (subTab !== 'market' || !marketStatus?.running) {
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+      setWsConnected(false);
+      return;
+    }
+
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${proto}//${window.location.host}/ws`;
+    let closedByCleanup = false;
+    const ws = new WebSocket(wsUrl);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      setWsConnected(true);
+    };
+    ws.onmessage = (ev) => {
+      try {
+        const tick = JSON.parse(ev.data) as CTraderQuote;
+        if (!tick || !tick.symbol) return;
+        setMarketStatus((prev) => {
+          if (!prev) return prev;
+          const nextCounts = { ...prev.tick_counts, [tick.symbol]: (prev.tick_counts[tick.symbol] || 0) + 1 };
+          return {
+            ...prev,
+            quotes: { ...prev.quotes, [tick.symbol]: tick },
+            tick_counts: nextCounts,
+            total_ticks: prev.total_ticks + 1,
+          };
+        });
+        setRecentTicks((prev) => {
+          if (
+            tickSymbolFilter !== 'ALL' &&
+            tick.symbol.toUpperCase() !== tickSymbolFilter.toUpperCase() &&
+            !tick.symbol.toUpperCase().startsWith(tickSymbolFilter.toUpperCase())
+          ) {
+            return prev;
+          }
+          return [tick, ...prev].slice(0, 80);
+        });
+      } catch {
+        // ignore invalid payload
+      }
+    };
+    ws.onclose = () => {
+      setWsConnected(false);
+      if (wsRef.current === ws) wsRef.current = null;
+    };
+    ws.onerror = () => {
+      if (!closedByCleanup) setWsConnected(false);
+    };
+
+    return () => {
+      closedByCleanup = true;
+      ws.close();
+      if (wsRef.current === ws) wsRef.current = null;
+      setWsConnected(false);
+    };
+  }, [subTab, marketStatus?.running, tickSymbolFilter]);
+
+  const handleMarketStart = async () => {
+    setMarketBusy(true);
+    try {
+      const res = await api.startCTraderMarket(symbolsInput.trim() || undefined);
+      setMarketStatus(res.status);
+      setSymbolsDirty(false);
+      onNotify('实时 Tick 行情采集已启动');
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : '启动实时 Tick 失败');
+    } finally {
+      setMarketBusy(false);
+    }
+  };
+
+  const handleMarketStop = async () => {
+    setMarketBusy(true);
+    try {
+      const res = await api.stopCTraderMarket();
+      setMarketStatus(res.status);
+      onNotify('已停止实时 Tick 行情采集');
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : '停止实时 Tick 失败');
+    } finally {
+      setMarketBusy(false);
+    }
+  };
+
+  const handleMarketRestart = async () => {
+    setMarketBusy(true);
+    try {
+      const res = await api.restartCTraderMarket();
+      setMarketStatus(res.status);
+      onNotify('已重新连接 cTrader 实时 Tick 行情');
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : '重连实时 Tick 失败');
+    } finally {
+      setMarketBusy(false);
+    }
+  };
+
+  const copyEndpoint = async (key: string, text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedKey(key);
+      window.setTimeout(() => setCopiedKey((curr) => (curr === key ? null : curr)), 2000);
+    } catch {
+      onNotify('复制失败，请手动复制');
+    }
+  };
+
+  const handleTestQuotesApi = async () => {
+    try {
+      const resp = await fetch('/quotes', { cache: 'no-store', credentials: 'same-origin' });
+      const data = await resp.json();
+      setApiTestOutput(JSON.stringify(data, null, 2));
+    } catch (err) {
+      setApiTestOutput(`请求失败: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
 
   const handleSync = async () => {
     setSyncing(true);
@@ -174,41 +353,86 @@ export const CTraderOrdersView: React.FC<CTraderOrdersViewProps> = ({
     setSearchText('');
   };
 
+  const quoteEntries = useMemo(() => {
+    const q = marketStatus?.quotes || {};
+    return Object.values(q).sort((a, b) => a.symbol.localeCompare(b.symbol));
+  }, [marketStatus]);
+
+  const statusMeta = useMemo(() => {
+    const s = marketStatus?.status || 'stopped';
+    if (s === 'streaming') return { label: '实时推送中', cls: 'bg-emerald-100 text-emerald-700 border-emerald-200' };
+    if (s === 'connecting') return { label: '连接中...', cls: 'bg-amber-100 text-amber-700 border-amber-200' };
+    if (s === 'reconnecting') return { label: '断线重连中', cls: 'bg-amber-100 text-amber-700 border-amber-200' };
+    if (s === 'unconfigured') return { label: '未配置凭据', cls: 'bg-slate-100 text-slate-600 border-slate-200' };
+    return { label: '已停止', cls: 'bg-slate-100 text-slate-600 border-slate-200' };
+  }, [marketStatus?.status]);
+
+  const httpOrigin = typeof window !== 'undefined' ? window.location.origin : '';
+  const wsOrigin =
+    typeof window !== 'undefined'
+      ? `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`
+      : '';
+
   return (
     <div className="space-y-5">
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
           <h2 className="text-xl font-bold text-slate-900 flex items-center gap-2">
             <Activity className="h-5 w-5 text-amber-500" />
-            cTrader 交易订单
-            <span className="rounded-full bg-slate-100 px-2.5 py-0.5 text-xs font-medium text-slate-600">
-              {filteredDeals.length} 笔
+            cTrader 实时行情 & 订单
+            <span className={`rounded-full border px-2.5 py-0.5 text-[11px] font-medium ${statusMeta.cls}`}>
+              {statusMeta.label}
             </span>
           </h2>
           <p className="text-xs text-slate-500 mt-1">
-            从 cTrader OpenAPI 拉取成交订单，支持按算法编号/标签筛选汇总与 Bark 实时推送（每 15 秒自动刷新）。
+            订阅 cTrader 实时 Tick 行情并对外提供 REST / WebSocket 接口，同时支持订单拉取、筛选汇总与 Bark 推送。
           </p>
         </div>
 
-        <div className="flex items-center gap-2">
-          <select
-            value={days}
-            onChange={(e) => setDays(Number(e.target.value))}
-            className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 outline-none"
-          >
-            <option value={1}>最近 1 天</option>
-            <option value={7}>最近 7 天</option>
-            <option value={30}>最近 30 天</option>
-          </select>
-          <button
-            type="button"
-            onClick={handleSync}
-            disabled={syncing}
-            className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-4 py-2 text-xs font-medium text-white hover:bg-amber-600 disabled:opacity-60 cursor-pointer"
-          >
-            <RefreshCw className={`h-3.5 w-3.5 ${syncing ? 'animate-spin' : ''}`} />
-            {syncing ? '拉取中...' : '立即拉取订单'}
-          </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="inline-flex rounded-xl border border-slate-200 bg-white p-1">
+            <button
+              type="button"
+              onClick={() => setSubTab('orders')}
+              className={`rounded-lg px-3 py-1.5 text-xs font-medium transition cursor-pointer ${
+                subTab === 'orders' ? 'bg-amber-500 text-white' : 'text-slate-600 hover:bg-slate-100'
+              }`}
+            >
+              交易订单 ({filteredDeals.length})
+            </button>
+            <button
+              type="button"
+              onClick={() => setSubTab('market')}
+              className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition cursor-pointer ${
+                subTab === 'market' ? 'bg-amber-500 text-white' : 'text-slate-600 hover:bg-slate-100'
+              }`}
+            >
+              <Radio className="h-3.5 w-3.5" />
+              实时 Tick & 对外接口
+            </button>
+          </div>
+          {subTab === 'orders' && (
+            <>
+              <select
+                value={days}
+                onChange={(e) => setDays(Number(e.target.value))}
+                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 outline-none"
+              >
+                <option value={1}>最近 1 天</option>
+                <option value={7}>最近 7 天</option>
+                <option value={30}>最近 30 天</option>
+              </select>
+              <button
+                type="button"
+                onClick={handleSync}
+                disabled={syncing}
+                className="inline-flex items-center gap-1.5 rounded-xl bg-amber-500 px-4 py-2 text-xs font-medium text-white hover:bg-amber-600 disabled:opacity-60 cursor-pointer"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${syncing ? 'animate-spin' : ''}`} />
+                {syncing ? '拉取中...' : '立即拉取订单'}
+              </button>
+            </>
+          )}
           <button
             type="button"
             onClick={onNavigateSettings}
@@ -219,6 +443,289 @@ export const CTraderOrdersView: React.FC<CTraderOrdersViewProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Live Quote Strip */}
+      {quoteEntries.length > 0 && (
+        <div className="flex flex-wrap items-center gap-3 rounded-2xl border border-slate-200/80 bg-white px-4 py-2.5 shadow-xs text-xs">
+          <span className="inline-flex items-center gap-1.5 font-semibold text-slate-700">
+            <span
+              className={`h-2 w-2 rounded-full ${
+                marketStatus?.status === 'streaming' ? 'bg-emerald-500 animate-pulse' : 'bg-slate-400'
+              }`}
+            />
+            内存实时报价
+          </span>
+          {quoteEntries.map((q) => (
+            <div
+              key={q.symbol}
+              className="inline-flex items-center gap-2 rounded-xl border border-slate-200/80 bg-slate-50 px-3 py-1 font-mono"
+            >
+              <span className="font-bold text-slate-800">{q.symbol}</span>
+              <span className="text-emerald-700">Bid {q.bid.toFixed(q.bid > 50 ? 2 : 5)}</span>
+              <span className="text-rose-700">Ask {q.ask.toFixed(q.ask > 50 ? 2 : 5)}</span>
+              <span className="text-slate-400">Spread {q.spread.toFixed(q.bid > 50 ? 2 : 5)}</span>
+            </div>
+          ))}
+          {marketStatus && (
+            <span className="ml-auto text-[11px] text-slate-400">
+              {marketStatus.ticks_per_sec} t/s · WS {marketStatus.active_ws_clients} 连接
+            </span>
+          )}
+        </div>
+      )}
+
+      {subTab === 'market' ? (
+        <div className="space-y-5">
+          {/* Stream Control Panel */}
+          <div className="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-xs space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-semibold text-slate-900">实时 Tick 订阅节点</h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  复用 cTrader OpenAPI 凭据直连实时 Spot 行情，自动断线重连并缓存在内存中供外部调用。
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <span className="rounded-lg bg-slate-100 px-2.5 py-1 font-mono text-slate-700">
+                  模式: {marketStatus?.mode || 'STOPPED'}
+                </span>
+                <span className="rounded-lg bg-slate-100 px-2.5 py-1 font-mono text-slate-700">
+                  速率: {marketStatus?.ticks_per_sec ?? 0} t/s
+                </span>
+                <span className="rounded-lg bg-slate-100 px-2.5 py-1 font-mono text-slate-700">
+                  累计: {(marketStatus?.total_ticks ?? 0).toLocaleString()} ticks
+                </span>
+                <span className="rounded-lg bg-slate-100 px-2.5 py-1 font-mono text-slate-700">
+                  WS 客户端: {marketStatus?.active_ws_clients ?? 0}
+                </span>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-end gap-3">
+              <div className="flex-1 min-w-[220px]">
+                <label className="mb-1 block text-[11px] font-medium text-slate-500">
+                  订阅品种（逗号分隔，例如 XAUUSD,EURUSD）
+                </label>
+                <input
+                  type="text"
+                  value={symbolsInput}
+                  onChange={(e) => {
+                    setSymbolsDirty(true);
+                    setSymbolsInput(e.target.value);
+                  }}
+                  placeholder="XAUUSD,EURUSD"
+                  className="w-full rounded-xl border border-slate-200 px-3 py-2 text-xs text-slate-800 outline-none focus:border-amber-500"
+                />
+              </div>
+              <button
+                type="button"
+                onClick={handleMarketStart}
+                disabled={marketBusy}
+                className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-600 px-4 py-2 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-60 cursor-pointer"
+              >
+                <Play className="h-3.5 w-3.5" />
+                {marketStatus?.running ? '更新品种并重连' : '启动采集'}
+              </button>
+              {marketStatus?.running && (
+                <>
+                  <button
+                    type="button"
+                    onClick={handleMarketRestart}
+                    disabled={marketBusy}
+                    className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-60 cursor-pointer"
+                  >
+                    <RefreshCw className="h-3.5 w-3.5" />
+                    重连
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleMarketStop}
+                    disabled={marketBusy}
+                    className="inline-flex items-center gap-1.5 rounded-xl border border-rose-200 bg-rose-50 px-3.5 py-2 text-xs font-medium text-rose-700 hover:bg-rose-100 disabled:opacity-60 cursor-pointer"
+                  >
+                    <Square className="h-3.5 w-3.5" />
+                    停止
+                  </button>
+                </>
+              )}
+            </div>
+
+            {marketStatus?.last_error && (
+              <div className="rounded-xl border border-rose-200 bg-rose-50 px-3.5 py-2.5 text-xs text-rose-700">
+                {marketStatus.last_error}
+              </div>
+            )}
+          </div>
+
+          {/* Live Symbol Cards */}
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            {quoteEntries.length === 0 ? (
+              <div className="sm:col-span-2 lg:col-span-4 rounded-2xl border border-dashed border-slate-200 bg-white p-8 text-center text-xs text-slate-500">
+                暂无内存报价数据。请确认已在「系统设置」配置 cTrader OpenAPI 凭据并点击「启动采集」。
+              </div>
+            ) : (
+              quoteEntries.map((q) => {
+                const digits = q.bid > 50 ? 2 : 5;
+                return (
+                  <div
+                    key={q.symbol}
+                    className="rounded-2xl border border-slate-200/80 bg-white p-4 shadow-xs space-y-2"
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm font-bold text-slate-900">{q.symbol}</span>
+                      <span className="rounded-md bg-slate-100 px-2 py-0.5 text-[10px] font-mono text-slate-600">
+                        {(marketStatus?.tick_counts?.[q.symbol] || 0).toLocaleString()} ticks
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2 font-mono">
+                      <div>
+                        <div className="text-[11px] text-slate-400">Bid 卖出价</div>
+                        <div className="text-lg font-bold text-emerald-600">{q.bid.toFixed(digits)}</div>
+                      </div>
+                      <div>
+                        <div className="text-[11px] text-slate-400">Ask 买入价</div>
+                        <div className="text-lg font-bold text-rose-600">{q.ask.toFixed(digits)}</div>
+                      </div>
+                    </div>
+                    <div className="flex items-center justify-between border-t border-slate-100 pt-2 text-[11px] text-slate-500 font-mono">
+                      <span>点差 {q.spread.toFixed(digits)}</span>
+                      <span>{q.datetime_utc} UTC</span>
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+
+          {/* External API Endpoints & Quick Test */}
+          <div className="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-xs space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-semibold text-slate-900">对外提供实时行情接口（兼容原 gold.36xt.com）</h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  {marketStatus?.has_api_token
+                    ? '当前已启用接口 Token 保护，外部调用请携带 Header `Authorization: Bearer <Token>`、`X-API-Key: <Token>` 或参数 `?token=<Token>`。'
+                    : '当前为直接开放模式（未设置接口 Token），外部脚本与策略可直接访问以下 REST 与 WebSocket 接口；如需鉴权可在「系统设置」填写对外行情接口访问 Token。'}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={handleTestQuotesApi}
+                className="rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-1.5 text-xs font-medium text-amber-700 hover:bg-amber-100 cursor-pointer"
+              >
+                在线测试 GET /quotes
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 gap-2.5 md:grid-cols-2">
+              {[
+                { key: 'status', method: 'GET', url: `${httpOrigin}/status`, desc: '节点运行模式、订阅品种、Tick 计数与 WS 连接数' },
+                { key: 'quotes', method: 'GET', url: `${httpOrigin}/quotes`, desc: '获取所有已订阅品种的最新内存 Bid / Ask / Spread' },
+                { key: 'quote_sym', method: 'GET', url: `${httpOrigin}/quote/XAUUSD`, desc: '获取指定品种最新报价（支持前缀匹配）' },
+                { key: 'ws_all', method: 'WS', url: `${wsOrigin}/ws`, desc: '全量实时 Tick 毫秒级广播推流' },
+                { key: 'ws_sym', method: 'WS', url: `${wsOrigin}/ws/XAUUSD`, desc: '指定品种实时 Tick 推流' },
+              ].map((ep) => (
+                <div
+                  key={ep.key}
+                  className="flex items-center justify-between gap-3 rounded-xl border border-slate-200/80 bg-slate-50/70 px-3.5 py-2.5"
+                >
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span
+                        className={`rounded px-1.5 py-0.5 text-[10px] font-bold ${
+                          ep.method === 'WS' ? 'bg-indigo-100 text-indigo-700' : 'bg-emerald-100 text-emerald-700'
+                        }`}
+                      >
+                        {ep.method}
+                      </span>
+                      <code className="truncate text-xs font-mono text-slate-800">{ep.url}</code>
+                    </div>
+                    <p className="mt-1 text-[11px] text-slate-500">{ep.desc}</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => copyEndpoint(ep.key, ep.url)}
+                    className="shrink-0 rounded-lg border border-slate-200 bg-white p-1.5 text-slate-500 hover:text-slate-800 cursor-pointer"
+                    title="复制接口地址"
+                  >
+                    {copiedKey === ep.key ? <Check className="h-3.5 w-3.5 text-emerald-600" /> : <Copy className="h-3.5 w-3.5" />}
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            {apiTestOutput && (
+              <pre className="max-h-60 overflow-auto rounded-xl bg-slate-900 p-3.5 text-[11px] font-mono text-emerald-300">
+                {apiTestOutput}
+              </pre>
+            )}
+          </div>
+
+          {/* Live Tick Stream Table */}
+          <div className="rounded-2xl border border-slate-200/80 bg-white shadow-xs overflow-hidden">
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200/80 px-5 py-3.5">
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-semibold text-slate-900">实时 Tick 明细流（最近 80 条）</span>
+                <span
+                  className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${
+                    wsConnected ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-500'
+                  }`}
+                >
+                  {wsConnected ? 'WS 实时推流中' : '轮询同步'}
+                </span>
+              </div>
+              <select
+                value={tickSymbolFilter}
+                onChange={(e) => setTickSymbolFilter(e.target.value)}
+                className="rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-700 outline-none"
+              >
+                <option value="ALL">全部品种</option>
+                {(marketStatus?.symbols || ['XAUUSD', 'EURUSD']).map((s) => (
+                  <option key={s} value={s}>
+                    {s}
+                  </option>
+                ))}
+              </select>
+            </div>
+            {recentTicks.length === 0 ? (
+              <div className="p-8 text-center text-xs text-slate-500">
+                暂无实时 Tick 采样，等待行情推流到达...
+              </div>
+            ) : (
+              <div className="overflow-x-auto max-h-[420px]">
+                <table className="w-full text-left text-xs font-mono">
+                  <thead className="sticky top-0 bg-slate-50 text-slate-500 border-b border-slate-200/80">
+                    <tr>
+                      <th className="px-4 py-2.5 font-medium">UTC 时间</th>
+                      <th className="px-4 py-2.5 font-medium">品种</th>
+                      <th className="px-4 py-2.5 font-medium">买入价 (Bid)</th>
+                      <th className="px-4 py-2.5 font-medium">卖出价 (Ask)</th>
+                      <th className="px-4 py-2.5 font-medium">点差 (Spread)</th>
+                      <th className="px-4 py-2.5 font-medium">来源</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {recentTicks.map((t, idx) => {
+                      const digits = t.bid > 50 ? 2 : 5;
+                      return (
+                        <tr key={`${t.symbol}-${t.timestamp}-${idx}`} className="hover:bg-slate-50/70">
+                          <td className="px-4 py-2 text-slate-600 whitespace-nowrap">{t.datetime_utc}</td>
+                          <td className="px-4 py-2 font-bold text-slate-900">{t.symbol}</td>
+                          <td className="px-4 py-2 text-emerald-600 font-semibold">{t.bid.toFixed(digits)}</td>
+                          <td className="px-4 py-2 text-rose-600 font-semibold">{t.ask.toFixed(digits)}</td>
+                          <td className="px-4 py-2 text-slate-700">{t.spread.toFixed(digits)}</td>
+                          <td className="px-4 py-2 text-slate-400">{t.source}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </div>
+      ) : (
+        <>
 
       {/* Filters */}
       <div className="rounded-2xl border border-slate-200/80 bg-white p-4 shadow-xs space-y-3">
@@ -531,6 +1038,8 @@ export const CTraderOrdersView: React.FC<CTraderOrdersViewProps> = ({
           </div>
         )}
       </div>
+        </>
+      )}
     </div>
   );
 };

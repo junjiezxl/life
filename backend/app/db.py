@@ -70,6 +70,9 @@ DEFAULT_SETTINGS: Dict[str, str] = {
     "ctrader_auto_sync_enabled": "0",
     "ctrader_sync_interval_sec": "60",
     "ctrader_bark_push_enabled": "1",
+    "ctrader_market_enabled": "1",
+    "ctrader_market_symbols": "XAUUSD,EURUSD",
+    "ctrader_market_api_token": "",
 }
 
 

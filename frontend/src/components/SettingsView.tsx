@@ -660,6 +660,14 @@ export const SettingsView: React.FC<Props> = ({
             />
             <span>新成交订单通过 Bark 实时推送</span>
           </label>
+          <label className="inline-flex items-center gap-2 font-medium cursor-pointer">
+            <input
+              type="checkbox"
+              checked={settings.ctrader_market_enabled !== '0'}
+              onChange={(e) => updateField('ctrader_market_enabled', e.target.checked ? '1' : '0')}
+            />
+            <span>开启实时 Tick 行情订阅与对外接口</span>
+          </label>
         </div>
 
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
@@ -725,6 +733,30 @@ export const SettingsView: React.FC<Props> = ({
                 className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-amber-500"
               />
             </div>
+          </div>
+          <div>
+            <label className="mb-1 block text-xs font-medium text-slate-600">
+              实时 Tick 订阅品种（逗号分隔）
+            </label>
+            <input
+              type="text"
+              value={settings.ctrader_market_symbols ?? 'XAUUSD,EURUSD'}
+              onChange={(e) => updateField('ctrader_market_symbols', e.target.value)}
+              placeholder="XAUUSD,EURUSD"
+              className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-amber-500"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs font-medium text-slate-600">
+              对外行情接口访问 Token（可选，留空则直接开放 /quotes 与 /ws）
+            </label>
+            <input
+              type="password"
+              value={settings.ctrader_market_api_token || ''}
+              onChange={(e) => updateField('ctrader_market_api_token', e.target.value)}
+              placeholder="留空不校验；填写后支持 Bearer / X-API-Key / ?token="
+              className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-amber-500"
+            />
           </div>
         </div>
 

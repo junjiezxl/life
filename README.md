@@ -18,7 +18,10 @@
    - **资产与负债账户**：银行卡、现金/余额宝、理财基金、信用卡、贷款，实时计算净资产。
    - **收支流水 & 周期固定账单**：支持房租/水电/订阅到期前自动生成提醒，扣款后自动推进下期到期日。
    - **一键结账**：汇总本期未结账收入、支出、分类占比与时点净资产快照，归档历史结账账单并生成 AI 财务总结。
-5. **系统设置 (`Settings`)**
+5. **cTrader 实时 Tick 行情 & 订单同步 (`cTrader`)**
+   - 订阅 cTrader OpenAPI 实时 Spot Tick 行情到内存并支持 WebSocket 实时推流、历史成交拉取与 Bark 推送。
+   - 兼容原 `gold.36xt.com` 对外行情接口：`GET /status`、`GET /quotes`、`GET /quote/{symbol}`、`WS /ws`、`WS /ws/{symbol}`（支持可选访问 Token）。
+6. **系统设置 (`Settings`)**
    - 支持配置 **Google Gemini API**、**OpenAI 兼容接口（OpenAI / DeepSeek / 本地 Ollama）** 或 **本地规则解析**。
    - 支持测试 AI 连接、测试思源 MCP 连接并查看发现的 MCP 工具列表，以及清空示例数据/恢复演示数据。
 

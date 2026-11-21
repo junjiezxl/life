@@ -370,6 +370,25 @@ export const api = {
     request<{ ok: boolean; account_id: string; environment: string; message: string }>('/api/ctrader/test', {
       method: 'POST',
     }),
+  getCTraderMarketStatus: () =>
+    request<import('./types').CTraderMarketStatus>('/api/ctrader/market/status'),
+  getCTraderRecentTicks: (symbol = '', limit = 50) =>
+    request<import('./types').CTraderRecentTicksResponse>(
+      `/api/ctrader/market/ticks?symbol=${encodeURIComponent(symbol)}&limit=${limit}`,
+    ),
+  startCTraderMarket: (symbols?: string) =>
+    request<{ ok: boolean; status: import('./types').CTraderMarketStatus }>('/api/ctrader/market/start', {
+      method: 'POST',
+      body: JSON.stringify(symbols !== undefined ? { symbols } : {}),
+    }),
+  stopCTraderMarket: () =>
+    request<{ ok: boolean; status: import('./types').CTraderMarketStatus }>('/api/ctrader/market/stop', {
+      method: 'POST',
+    }),
+  restartCTraderMarket: () =>
+    request<{ ok: boolean; status: import('./types').CTraderMarketStatus }>('/api/ctrader/market/restart', {
+      method: 'POST',
+    }),
   resetData: (reseed = false) =>
     request<{ ok: boolean; reseeded: boolean }>(`/api/settings/reset-data?reseed=${reseed}`, { method: 'POST' }),
 };

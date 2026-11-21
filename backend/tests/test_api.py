@@ -636,6 +636,103 @@ class TestLifeHubAPI(unittest.TestCase):
         self.assertEqual(sync_rem.status_code, 200)
         self.assertGreaterEqual(sync_rem.json()["created_count"], 2)
 
+    def test_14_ctrader_live_market_ticks_and_external_apis(self):
+        from app.services.ctrader_market_service import _CTraderSpotClient, market_service
+        from ctrader_open_api.messages import OpenApiMessages_pb2 as msg_pb
+
+        # Reset in-memory market state for deterministic assertions
+        market_service.market_cache.clear()
+        market_service.tick_counts.clear()
+        market_service.recent_ticks.clear()
+        self.client.put("/api/settings", json={"ctrader_market_api_token": ""})
+
+        # 1. Decode ProtoOASpotEvent with partial bid/ask updates
+        received = []
+        spot_client = _CTraderSpotClient("id", "sec", "tok", "123", "demo", on_tick=received.append)
+        spot_client._id_to_symbol[1] = "XAUUSD.PRO"
+        spot_client._handle_spot_event(msg_pb.ProtoOASpotEvent(symbolId=1, bid=265055000))
+        self.assertEqual(len(received), 0)  # Ask not known yet
+        spot_client._handle_spot_event(msg_pb.ProtoOASpotEvent(symbolId=1, bid=265055000, ask=265085000, timestamp=1740000000123))
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0]["symbol"], "XAUUSD.PRO")
+        self.assertEqual(received[0]["bid"], 2650.55)
+        self.assertEqual(received[0]["ask"], 2650.85)
+        self.assertEqual(received[0]["spread"], 0.3)
+
+        # Feed ticks into market_service
+        market_service.on_tick_received(received[0])
+        market_service.on_tick_received(
+            {
+                "source": "ctrader",
+                "symbol": "EURUSD",
+                "bid": 1.0851,
+                "ask": 1.0853,
+                "spread": 0.0002,
+                "timestamp": 1740000000500,
+                "datetime_utc": "2026-11-21 12:00:00.500",
+            }
+        )
+
+        # 2. External public endpoints (/status, /quotes, /quote/{symbol}) work without login
+        anon = TestClient(app)
+        st = anon.get("/status")
+        self.assertEqual(st.status_code, 200)
+        self.assertEqual(st.json()["tick_counts"]["XAUUSD.PRO"], 1)
+
+        quotes = anon.get("/quotes")
+        self.assertEqual(quotes.status_code, 200)
+        self.assertEqual(quotes.json()["count"], 2)
+        self.assertEqual(quotes.json()["data"]["XAUUSD.PRO"]["bid"], 2650.55)
+
+        # Prefix match XAUUSD -> XAUUSD.PRO
+        single = anon.get("/quote/XAUUSD")
+        self.assertEqual(single.status_code, 200)
+        self.assertEqual(single.json()["data"]["symbol"], "XAUUSD.PRO")
+        self.assertEqual(anon.get("/quote/UNKNOWN").status_code, 404)
+
+        # 3. Authenticated LifeHub UI endpoints
+        mkt_st = self.client.get("/api/ctrader/market/status")
+        self.assertEqual(mkt_st.status_code, 200)
+        self.assertEqual(mkt_st.json()["total_ticks"], 2)
+
+        recent = self.client.get("/api/ctrader/market/ticks?symbol=XAUUSD&limit=10")
+        self.assertEqual(recent.status_code, 200)
+        self.assertEqual(len(recent.json()["ticks"]), 1)
+        self.assertEqual(recent.json()["ticks"][0]["symbol"], "XAUUSD.PRO")
+
+        # 4. Token protection when ctrader_market_api_token is configured
+        self.client.put("/api/settings", json={"ctrader_market_api_token": "secret-mkt-token"})
+        self.assertEqual(anon.get("/quotes").status_code, 401)
+        self.assertEqual(anon.get("/status").status_code, 401)
+        self.assertEqual(anon.get("/quote/XAUUSD").status_code, 401)
+        self.assertEqual(
+            anon.get("/quotes", headers={"Authorization": "Bearer secret-mkt-token"}).status_code,
+            200,
+        )
+        self.assertEqual(anon.get("/quote/XAUUSD?token=secret-mkt-token").status_code, 200)
+        # Authenticated LifeHub session user still allowed
+        self.assertEqual(self.client.get("/quotes").status_code, 200)
+
+        # 5. WebSocket /ws/{symbol} receives live ticks
+        with anon.websocket_connect("/ws/XAUUSD?token=secret-mkt-token") as ws:
+            market_service.on_tick_received(
+                {
+                    "source": "ctrader",
+                    "symbol": "XAUUSD.PRO",
+                    "bid": 2651.1,
+                    "ask": 2651.4,
+                    "spread": 0.3,
+                    "timestamp": 1740000001000,
+                    "datetime_utc": "2026-11-21 12:00:01.000",
+                }
+            )
+            msg = ws.receive_json()
+            self.assertEqual(msg["symbol"], "XAUUSD.PRO")
+            self.assertEqual(msg["bid"], 2651.1)
+
+        # Clear token setting cleanly
+        self.client.put("/api/settings", json={"ctrader_market_api_token": ""})
+
 
 if __name__ == "__main__":
     unittest.main()
