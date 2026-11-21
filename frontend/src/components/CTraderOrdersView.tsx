@@ -33,7 +33,7 @@ export const CTraderOrdersView: React.FC<CTraderOrdersViewProps> = ({
 
   const loadDeals = useCallback(async () => {
     try {
-      const res = await api.getCTraderDeals(500);
+      const res = await api.getCTraderDeals(2000);
       setDeals(res.deals);
     } catch (err) {
       onNotify(err instanceof Error ? err.message : '加载 cTrader 订单失败');

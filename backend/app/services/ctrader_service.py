@@ -171,7 +171,7 @@ class _CTraderAsyncClient:
     async def fetch_order_labels(self, order_ids: List[int]) -> Dict[str, Tuple[str, str]]:
         assert self.ctid_trader_account_id is not None
         result: Dict[str, Tuple[str, str]] = {}
-        for oid in order_ids[:150]:
+        for oid in order_ids:
             try:
                 req = self.oa_msgs.ProtoOAOrderDetailsReq()
                 req.ctidTraderAccountId = self.ctid_trader_account_id
@@ -188,26 +188,38 @@ class _CTraderAsyncClient:
                 continue
         return result
 
+    async def _fetch_deals_range(self, from_ms: int, to_ms: int) -> List[Any]:
+        assert self.ctid_trader_account_id is not None
+        req = self.oa_msgs.ProtoOADealListReq()
+        req.ctidTraderAccountId = self.ctid_trader_account_id
+        req.fromTimestamp = from_ms
+        req.toTimestamp = to_ms
+        req.maxRows = 500
+        proto = await self._send_req(req, timeout=20.0)
+        res = self.oa_msgs.ProtoOADealListRes()
+        res.ParseFromString(proto.payload)
+        raw_deals = list(res.deal)
+        if getattr(res, "hasMore", False) and (to_ms - from_ms) > 60_000:
+            mid_ms = (from_ms + to_ms) // 2
+            left = await self._fetch_deals_range(from_ms, mid_ms)
+            right = await self._fetch_deals_range(mid_ms + 1, to_ms)
+            by_id = {str(d.dealId): d for d in left + right}
+            return list(by_id.values())
+        return raw_deals
+
     async def fetch_deals(self, days: int = 7) -> List[Dict[str, Any]]:
         assert self.ctid_trader_account_id is not None
         symbol_map = await self.fetch_symbols()
         now_ms = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
         from_ms = now_ms - (max(1, days) * 86400 * 1000)
 
-        req = self.oa_msgs.ProtoOADealListReq()
-        req.ctidTraderAccountId = self.ctid_trader_account_id
-        req.fromTimestamp = from_ms
-        req.toTimestamp = now_ms
-        req.maxRows = 500
-        proto = await self._send_req(req, timeout=20.0)
-        res = self.oa_msgs.ProtoOADealListRes()
-        res.ParseFromString(proto.payload)
+        raw_deals = await self._fetch_deals_range(from_ms, now_ms)
 
-        unique_order_ids = list({int(d.orderId) for d in res.deal if getattr(d, "orderId", 0)})
+        unique_order_ids = list({int(d.orderId) for d in raw_deals if getattr(d, "orderId", 0)})
         order_meta = await self.fetch_order_labels(unique_order_ids) if unique_order_ids else {}
 
         deals: List[Dict[str, Any]] = []
-        for d in res.deal:
+        for d in raw_deals:
             money_digits = int(getattr(d, "moneyDigits", 2) or 2)
             scale = 10 ** money_digits
             close_detail = getattr(d, "closePositionDetail", None)
@@ -416,11 +428,11 @@ async def sync_ctrader_deals(days: int = 7, push_new: bool = True) -> Dict[str, 
     }
 
 
-def list_ctrader_deals(limit: int = 200) -> Dict[str, Any]:
+def list_ctrader_deals(limit: int = 2000) -> Dict[str, Any]:
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT * FROM ctrader_deals ORDER BY executed_at DESC LIMIT ?",
-            (max(1, min(limit, 1000)),),
+            (max(1, min(limit, 5000)),),
         ).fetchall()
         deals = [dict(r) for r in rows]
         agg = conn.execute(
