@@ -886,7 +886,6 @@ export const PhoneNumbersView: React.FC<Props> = ({ onRefreshDashboard, onNotify
                   const renderRow = (item: PhoneNumber, isNestedSub = false) => {
                     const st = STATUS_META[item.status] || STATUS_META.active;
                     const daysLeft = item.keep_alive_days_left;
-                    const currSymbol = CURRENCY_SYMBOLS[item.currency] || `${item.currency} `;
 
                     return (
                       <tr
@@ -930,7 +929,10 @@ export const PhoneNumbersView: React.FC<Props> = ({ onRefreshDashboard, onNotify
                             </span>
                             <button
                               type="button"
-                              onClick={() => handleCopy(item.phone_number, item.label)}
+                              onClick={() => {
+                                navigator.clipboard?.writeText(item.phone_number);
+                                onNotify(`已复制号码：${item.phone_number}`);
+                              }}
                               title="复制号码"
                               className="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700 cursor-pointer"
                             >
@@ -945,12 +947,10 @@ export const PhoneNumbersView: React.FC<Props> = ({ onRefreshDashboard, onNotify
                         </td>
                         <td className="px-4 py-3 whitespace-nowrap">
                           <div className="font-semibold text-slate-900">
-                            {currSymbol}
-                            {Number(item.monthly_fee || 0).toFixed(2)}/月
+                            {item.currency} {Number(item.monthly_fee || 0).toFixed(2)}/月
                           </div>
                           <div className="text-[11px] text-slate-500">
-                            余额 {currSymbol}
-                            {Number(item.balance || 0).toFixed(2)}
+                            余额 {item.currency} {Number(item.balance || 0).toFixed(2)}
                           </div>
                         </td>
                         <td className="px-4 py-3 whitespace-nowrap">
@@ -982,7 +982,7 @@ export const PhoneNumbersView: React.FC<Props> = ({ onRefreshDashboard, onNotify
                             )}
                             <button
                               type="button"
-                              onClick={() => handleCheckIn(item)}
+                              onClick={() => handleKeepAlive(item)}
                               title="保号打卡"
                               className="rounded-lg border border-emerald-200 bg-emerald-50 px-2 py-1 text-[11px] font-medium text-emerald-700 hover:bg-emerald-100 cursor-pointer"
                             >
@@ -990,7 +990,7 @@ export const PhoneNumbersView: React.FC<Props> = ({ onRefreshDashboard, onNotify
                             </button>
                             <button
                               type="button"
-                              onClick={() => openCostForm(item)}
+                              onClick={() => setCostTarget(item)}
                               title="记通信费 / 充值"
                               className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-50 cursor-pointer"
                             >
