@@ -423,6 +423,8 @@ class _CTraderAsyncClient:
             gross = 0.0
             swap = 0.0
             fee = 0.0
+            is_closing = 1 if close_detail is not None else 0
+            entry_price = 0.0
             commission = float(getattr(d, "commission", 0) or 0) / scale
             if close_detail is not None:
                 close_digits = int(getattr(close_detail, "moneyDigits", 0) or money_digits)
@@ -431,6 +433,7 @@ class _CTraderAsyncClient:
                 swap = float(getattr(close_detail, "swap", 0) or 0) / close_scale
                 commission = float(getattr(close_detail, "commission", 0) or 0) / close_scale
                 fee = abs(float(getattr(close_detail, "pnlConversionFee", 0) or 0)) / close_scale
+                entry_price = float(getattr(close_detail, "entryPrice", 0) or 0)
 
             net_profit = gross + swap + commission - fee
             exec_ms = int(getattr(d, "executionTimestamp", 0) or 0)
@@ -469,6 +472,8 @@ class _CTraderAsyncClient:
                     "comment": comment_val,
                     "executed_at": exec_iso,
                     "execution_ms": exec_ms,
+                    "is_closing": is_closing,
+                    "entry_price": round(entry_price, 6) if entry_price else 0.0,
                     "raw_json": json.dumps(
                         {
                             "dealId": str(d.dealId),
@@ -593,6 +598,8 @@ def _upsert_deals(deals: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], in
                 "SELECT deal_id FROM ctrader_deals WHERE deal_id = ?", (d["deal_id"],)
             ).fetchone()
             exec_ms = int(d.get("execution_ms") or _iso_to_ms(d.get("executed_at", "")))
+            is_closing = int(d.get("is_closing") or 0)
+            entry_price = float(d.get("entry_price") or 0.0)
             if existing:
                 conn.execute(
                     """
@@ -604,6 +611,8 @@ def _upsert_deals(deals: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], in
                         comment = CASE WHEN ? != '' THEN ? ELSE comment END,
                         executed_at = ?,
                         execution_ms = CASE WHEN ? > 0 THEN ? ELSE execution_ms END,
+                        is_closing = ?,
+                        entry_price = CASE WHEN ? > 0 THEN ? ELSE entry_price END,
                         raw_json = ?
                     WHERE deal_id = ?
                     """,
@@ -624,6 +633,9 @@ def _upsert_deals(deals: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], in
                         d["executed_at"],
                         exec_ms,
                         exec_ms,
+                        is_closing,
+                        entry_price,
+                        entry_price,
                         d["raw_json"],
                         d["deal_id"],
                     ),
@@ -635,8 +647,9 @@ def _upsert_deals(deals: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], in
                     INSERT INTO ctrader_deals (
                         deal_id, order_id, position_id, account_id, symbol_id, symbol_name,
                         side, volume, price, commission, swap, gross_profit, net_profit,
-                        status, label, comment, executed_at, execution_ms, pushed_at, raw_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
+                        status, label, comment, executed_at, execution_ms, is_closing, entry_price,
+                        pushed_at, raw_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
                     """,
                     (
                         d["deal_id"],
@@ -657,6 +670,8 @@ def _upsert_deals(deals: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], in
                         d["comment"],
                         d["executed_at"],
                         exec_ms,
+                        is_closing,
+                        entry_price,
                         d["raw_json"],
                         now_str,
                     ),
@@ -936,34 +951,182 @@ def start_background_ctrader_sync(
     return {"started": True, "already_running": False, "status": get_ctrader_sync_status()}
 
 
+def _trade_group_key(deal: Dict[str, Any]) -> str:
+    for field, prefix in (("position_id", "pos"), ("order_id", "ord"), ("deal_id", "deal")):
+        val = str(deal.get(field) or "").strip()
+        if val and val != "0":
+            return f"{prefix}:{val}"
+    return f"deal:{deal.get('deal_id', '')}"
+
+
+def _weighted_price(rows: List[Dict[str, Any]]) -> Optional[float]:
+    total_vol = sum(float(r.get("volume") or 0) for r in rows)
+    if total_vol <= 0:
+        return None
+    weighted = sum(float(r.get("price") or 0) * float(r.get("volume") or 0) for r in rows)
+    return round(weighted / total_vol, 5) if weighted > 0 else None
+
+
+def group_deals_into_trades(deals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Merge opening and closing execution deals belonging to the same position into one trade."""
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for d in deals:
+        grouped.setdefault(_trade_group_key(d), []).append(d)
+
+    trades: List[Dict[str, Any]] = []
+    for key, raw_rows in grouped.items():
+        rows = sorted(
+            raw_rows,
+            key=lambda r: (int(r.get("execution_ms") or 0), str(r.get("executed_at") or ""), str(r.get("deal_id") or "")),
+        )
+        explicit_flags = any(
+            int(r.get("is_closing") or 0) == 1
+            or float(r.get("entry_price") or 0) > 0
+            or float(r.get("gross_profit") or 0) != 0
+            or float(r.get("swap") or 0) != 0
+            for r in rows
+        )
+        opens: List[Dict[str, Any]] = []
+        closes: List[Dict[str, Any]] = []
+        if explicit_flags:
+            for r in rows:
+                is_close = (
+                    int(r.get("is_closing") or 0) == 1
+                    or float(r.get("entry_price") or 0) > 0
+                    or float(r.get("gross_profit") or 0) != 0
+                    or float(r.get("swap") or 0) != 0
+                )
+                (closes if is_close else opens).append(r)
+        elif len(rows) >= 2:
+            first_side = str(rows[0].get("side") or "").upper()
+            has_opposite = any(str(r.get("side") or "").upper() != first_side for r in rows[1:])
+            if has_opposite:
+                for r in rows:
+                    (opens if str(r.get("side") or "").upper() == first_side else closes).append(r)
+            else:
+                opens = list(rows)
+        else:
+            opens = list(rows)
+
+        open_vol = round(sum(float(r.get("volume") or 0) for r in opens), 4)
+        close_vol = round(sum(float(r.get("volume") or 0) for r in closes), 4)
+        volume = open_vol if opens else close_vol
+
+        open_price = _weighted_price(opens)
+        if open_price is None and closes:
+            ep = next((float(r.get("entry_price") or 0) for r in closes if float(r.get("entry_price") or 0) > 0), 0.0)
+            open_price = round(ep, 5) if ep > 0 else None
+        close_price = _weighted_price(closes) if closes else None
+
+        if not closes:
+            status = "open"
+        elif opens and (close_vol + 1e-6) < open_vol:
+            status = "partial"
+        else:
+            status = "closed"
+
+        if closes:
+            gross_profit = round(sum(float(r.get("gross_profit") or 0) for r in closes), 2)
+            swap = round(sum(float(r.get("swap") or 0) for r in closes), 2)
+            commission = round(sum(float(r.get("commission") or 0) for r in closes), 2)
+            net_profit = round(sum(float(r.get("net_profit") or 0) for r in closes), 2)
+        else:
+            gross_profit = 0.0
+            swap = 0.0
+            commission = round(sum(float(r.get("commission") or 0) for r in opens), 2)
+            net_profit = 0.0
+
+        first_open_side = str(opens[0].get("side") or "").upper() if opens else ""
+        if first_open_side:
+            side = first_open_side
+        else:
+            close_side = str(closes[0].get("side") or "").upper() if closes else ""
+            side = "BUY" if close_side == "SELL" else ("SELL" if close_side == "BUY" else close_side)
+
+        label = next(((r.get("label") or "").strip() for r in opens + rows if (r.get("label") or "").strip()), "")
+        comment = next(((r.get("comment") or "").strip() for r in opens + rows if (r.get("comment") or "").strip()), "")
+        opened_at = str(opens[0].get("executed_at") or "") if opens else ""
+        closed_at = str(closes[-1].get("executed_at") or "") if closes else ""
+        executed_at = closed_at or opened_at or str(rows[-1].get("executed_at") or "")
+        exec_ms = max(int(r.get("execution_ms") or 0) for r in rows)
+        pushed_at = next((str(r.get("pushed_at") or "") for r in reversed(rows) if (r.get("pushed_at") or "").strip()), "")
+
+        trades.append(
+            {
+                "trade_key": key,
+                "position_id": str(rows[0].get("position_id") or ""),
+                "order_ids": list(dict.fromkeys(str(r.get("order_id") or "") for r in rows if r.get("order_id"))),
+                "deal_ids": [str(r.get("deal_id") or "") for r in rows],
+                "account_id": str(rows[0].get("account_id") or ""),
+                "symbol_name": str(rows[0].get("symbol_name") or ""),
+                "side": side,
+                "status": status,
+                "volume": volume,
+                "open_volume": open_vol,
+                "close_volume": close_vol,
+                "open_price": open_price,
+                "close_price": close_price,
+                "gross_profit": gross_profit,
+                "swap": swap,
+                "commission": commission,
+                "net_profit": net_profit,
+                "label": label,
+                "comment": comment,
+                "opened_at": opened_at,
+                "closed_at": closed_at,
+                "executed_at": executed_at,
+                "execution_ms": exec_ms,
+                "pushed_at": pushed_at,
+                "deal_count": len(rows),
+                "deals": rows,
+            }
+        )
+
+    return sorted(
+        trades,
+        key=lambda t: (str(t.get("executed_at") or ""), int(t.get("execution_ms") or 0), str(t.get("trade_key") or "")),
+        reverse=True,
+    )
+
+
 def list_ctrader_deals(limit: int = 5000) -> Dict[str, Any]:
+    safe_limit = max(1, min(limit, 10000))
+    raw_limit = min(safe_limit * 3, 20000)
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT * FROM ctrader_deals ORDER BY executed_at DESC, execution_ms DESC LIMIT ?",
-            (max(1, min(limit, 10000)),),
+            (raw_limit,),
         ).fetchall()
         deals = [dict(r) for r in rows]
         agg = conn.execute(
             """
             SELECT
                 COUNT(*) AS total_deals,
-                COALESCE(SUM(net_profit), 0) AS total_net_profit,
-                COALESCE(SUM(volume), 0) AS total_volume,
-                COALESCE(SUM(CASE WHEN net_profit > 0 THEN 1 ELSE 0 END), 0) AS win_count,
                 MAX(executed_at) AS latest_executed_at,
                 MIN(executed_at) AS earliest_executed_at
             FROM ctrader_deals
             """
         ).fetchone()
-    total = int(agg["total_deals"] or 0)
-    win_count = int(agg["win_count"] or 0)
+
+    all_trades = group_deals_into_trades(deals)
+    trades = all_trades[:safe_limit]
+    closed_trades = [t for t in all_trades if t["status"] != "open"]
+    win_count = sum(1 for t in closed_trades if float(t["net_profit"]) > 0)
+    total_net_profit = round(sum(float(t["net_profit"]) for t in closed_trades), 2)
+    total_volume = round(sum(float(t["volume"] or 0) for t in all_trades), 4)
+    closed_total = len(closed_trades)
+
     return {
-        "deals": deals,
+        "trades": trades,
+        "deals": deals[:safe_limit],
         "stats": {
-            "total_deals": total,
-            "total_net_profit": round(float(agg["total_net_profit"] or 0), 2),
-            "total_volume": round(float(agg["total_volume"] or 0), 4),
-            "win_rate": round((win_count / total) * 100, 1) if total > 0 else 0.0,
+            "total_deals": int(agg["total_deals"] or 0),
+            "total_trades": len(all_trades),
+            "closed_trades": closed_total,
+            "open_trades": len(all_trades) - closed_total,
+            "total_net_profit": total_net_profit,
+            "total_volume": total_volume,
+            "win_rate": round((win_count / closed_total) * 100, 1) if closed_total > 0 else 0.0,
             "latest_executed_at": str(agg["latest_executed_at"] or ""),
             "earliest_executed_at": str(agg["earliest_executed_at"] or ""),
         },

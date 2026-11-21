@@ -18,11 +18,46 @@ export interface CTraderDeal {
   label?: string;
   comment?: string;
   executed_at: string;
+  execution_ms?: number;
+  is_closing?: number;
+  entry_price?: number;
   pushed_at: string;
+}
+
+export interface CTraderTrade {
+  trade_key: string;
+  position_id: string;
+  order_ids: string[];
+  deal_ids: string[];
+  account_id: string;
+  symbol_name: string;
+  side: string;
+  status: 'closed' | 'partial' | 'open';
+  volume: number;
+  open_volume: number;
+  close_volume: number;
+  open_price: number | null;
+  close_price: number | null;
+  gross_profit: number;
+  swap: number;
+  commission: number;
+  net_profit: number;
+  label?: string;
+  comment?: string;
+  opened_at: string;
+  closed_at: string;
+  executed_at: string;
+  execution_ms: number;
+  pushed_at: string;
+  deal_count: number;
+  deals: CTraderDeal[];
 }
 
 export interface CTraderStats {
   total_deals: number;
+  total_trades?: number;
+  closed_trades?: number;
+  open_trades?: number;
   total_net_profit: number;
   total_volume: number;
   win_rate: number;
@@ -31,6 +66,7 @@ export interface CTraderStats {
 }
 
 export interface CTraderDealsResponse {
+  trades?: CTraderTrade[];
   deals: CTraderDeal[];
   stats: CTraderStats;
 }

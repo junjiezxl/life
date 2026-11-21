@@ -867,8 +867,17 @@ class TestLifeHubAPI(unittest.TestCase):
             self.assertEqual(body1["pushed"], 0)  # silent backfill by default
 
             # Verify breakeven close deal kept swap+commission (-0.58) & inherited position label
-            deals1 = self.client.get("/api/ctrader/deals").json()["deals"]
+            resp1 = self.client.get("/api/ctrader/deals").json()
+            deals1 = resp1["deals"]
+            trades1 = resp1["trades"]
             self.assertEqual(len(deals1), 2)
+            self.assertEqual(len(trades1), 1)
+            self.assertEqual(trades1[0]["status"], "closed")
+            self.assertEqual(trades1[0]["side"], "BUY")
+            self.assertEqual(trades1[0]["open_price"], 3500.0)
+            self.assertEqual(trades1[0]["close_price"], 3500.0)
+            self.assertEqual(trades1[0]["net_profit"], -0.58)  # not double-charging opening commission
+            self.assertEqual(trades1[0]["deal_count"], 2)
             close_deal = next(d for d in deals1 if d["deal_id"] == "102")
             self.assertEqual(close_deal["net_profit"], -0.58)
             self.assertEqual(close_deal["label"], "GS2.1117.abc")
@@ -888,6 +897,10 @@ class TestLifeHubAPI(unittest.TestCase):
 
             deals2 = self.client.get("/api/ctrader/deals").json()
             self.assertEqual(deals2["stats"]["total_deals"], 3)
+            self.assertEqual(deals2["stats"]["total_trades"], 2)
+            self.assertEqual(deals2["stats"]["closed_trades"], 1)
+            self.assertEqual(deals2["stats"]["open_trades"], 1)
+            self.assertEqual(deals2["stats"]["total_net_profit"], -0.58)
 
         st_resp = self.client.get("/api/ctrader/sync/status")
         self.assertEqual(st_resp.status_code, 200)

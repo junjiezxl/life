@@ -15,15 +15,21 @@ import {
   TrendingUp,
 } from 'lucide-react';
 import { api } from '../api';
-import { CTraderDeal, CTraderMarketStatus, CTraderQuote, CTraderStats, CTraderSyncStatus } from '../types';
+import {
+  CTraderMarketStatus,
+  CTraderQuote,
+  CTraderStats,
+  CTraderSyncStatus,
+  CTraderTrade,
+} from '../types';
 
 interface CTraderOrdersViewProps {
   onNotify: (msg: string) => void;
   onNavigateSettings: () => void;
 }
 
-const getAlgoKey = (deal: CTraderDeal) => {
-  const lbl = (deal.label || '').trim();
+const getAlgoKey = (trade: { label?: string }) => {
+  const lbl = (trade.label || '').trim();
   return lbl || '手动订单';
 };
 
@@ -32,7 +38,8 @@ export const CTraderOrdersView: React.FC<CTraderOrdersViewProps> = ({
   onNavigateSettings,
 }) => {
   const [subTab, setSubTab] = useState<'orders' | 'market'>('orders');
-  const [deals, setDeals] = useState<CTraderDeal[]>([]);
+  const [trades, setTrades] = useState<CTraderTrade[]>([]);
+  const [expandedKeys, setExpandedKeys] = useState<Record<string, boolean>>({});
   const [dealStats, setDealStats] = useState<CTraderStats | null>(null);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
@@ -66,7 +73,40 @@ export const CTraderOrdersView: React.FC<CTraderOrdersViewProps> = ({
   const loadDeals = useCallback(async () => {
     try {
       const res = await api.getCTraderDeals(5000);
-      setDeals(res.deals);
+      if (res.trades) {
+        setTrades(res.trades);
+      } else {
+        setTrades(
+          res.deals.map((d) => ({
+            trade_key: d.position_id ? `pos:${d.position_id}` : `deal:${d.deal_id}`,
+            position_id: d.position_id,
+            order_ids: d.order_id ? [d.order_id] : [],
+            deal_ids: [d.deal_id],
+            account_id: d.account_id,
+            symbol_name: d.symbol_name,
+            side: d.side,
+            status: 'closed',
+            volume: d.volume,
+            open_volume: d.volume,
+            close_volume: d.volume,
+            open_price: d.price,
+            close_price: null,
+            gross_profit: d.gross_profit,
+            swap: d.swap,
+            commission: d.commission,
+            net_profit: d.net_profit,
+            label: d.label,
+            comment: d.comment,
+            opened_at: d.executed_at,
+            closed_at: '',
+            executed_at: d.executed_at,
+            execution_ms: d.execution_ms || 0,
+            pushed_at: d.pushed_at,
+            deal_count: 1,
+            deals: [d],
+          })),
+        );
+      }
       setDealStats(res.stats);
     } catch (err) {
       onNotify(err instanceof Error ? err.message : '加载 cTrader 订单失败');
@@ -332,42 +372,42 @@ export const CTraderOrdersView: React.FC<CTraderOrdersViewProps> = ({
 
   const algoOptions = useMemo(() => {
     const set = new Set<string>();
-    deals.forEach((d) => set.add(getAlgoKey(d)));
+    trades.forEach((t) => set.add(getAlgoKey(t)));
     return Array.from(set).sort((a, b) => {
       if (a === '手动订单') return 1;
       if (b === '手动订单') return -1;
       return a.localeCompare(b);
     });
-  }, [deals]);
+  }, [trades]);
 
   const symbolOptions = useMemo(() => {
     const set = new Set<string>();
-    deals.forEach((d) => {
-      if (d.symbol_name) set.add(d.symbol_name);
+    trades.forEach((t) => {
+      if (t.symbol_name) set.add(t.symbol_name);
     });
     return Array.from(set).sort();
-  }, [deals]);
+  }, [trades]);
 
-  const filteredDeals = useMemo(() => {
+  const filteredTrades = useMemo(() => {
     const q = searchText.trim().toLowerCase();
-    return deals.filter((d) => {
-      if (algoFilter !== 'ALL' && getAlgoKey(d) !== algoFilter) return false;
-      if (symbolFilter !== 'ALL' && d.symbol_name !== symbolFilter) return false;
-      if (sideFilter !== 'ALL' && d.side !== sideFilter) return false;
-      if (pnlFilter === 'WIN' && d.net_profit <= 0) return false;
-      if (pnlFilter === 'LOSS' && d.net_profit >= 0) return false;
+    return trades.filter((t) => {
+      if (algoFilter !== 'ALL' && getAlgoKey(t) !== algoFilter) return false;
+      if (symbolFilter !== 'ALL' && t.symbol_name !== symbolFilter) return false;
+      if (sideFilter !== 'ALL' && t.side !== sideFilter) return false;
+      if (pnlFilter === 'WIN' && (t.status === 'open' || t.net_profit <= 0)) return false;
+      if (pnlFilter === 'LOSS' && (t.status === 'open' || t.net_profit >= 0)) return false;
 
-      const dateStr = (d.executed_at || '').slice(0, 10);
+      const dateStr = (t.closed_at || t.opened_at || t.executed_at || '').slice(0, 10);
       if (startDate && dateStr < startDate) return false;
       if (endDate && dateStr > endDate) return false;
 
       if (q) {
-        const hay = `${d.deal_id} ${d.order_id} ${d.position_id} ${d.symbol_name} ${d.label || ''} ${d.comment || ''}`.toLowerCase();
+        const hay = `${t.position_id} ${t.order_ids.join(' ')} ${t.deal_ids.join(' ')} ${t.symbol_name} ${t.label || ''} ${t.comment || ''}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
     });
-  }, [deals, algoFilter, symbolFilter, sideFilter, pnlFilter, startDate, endDate, searchText]);
+  }, [trades, algoFilter, symbolFilter, sideFilter, pnlFilter, startDate, endDate, searchText]);
 
   const summary = useMemo(() => {
     let netProfit = 0;
@@ -375,33 +415,41 @@ export const CTraderOrdersView: React.FC<CTraderOrdersViewProps> = ({
     let grossLoss = 0;
     let winCount = 0;
     let lossCount = 0;
+    let closedTotal = 0;
 
     const algoMap = new Map<
       string,
-      { key: string; net: number; count: number; wins: number; losses: number }
+      { key: string; net: number; count: number; closedCount: number; wins: number; losses: number }
     >();
 
-    for (const d of filteredDeals) {
-      netProfit += d.net_profit;
-      if (d.net_profit > 0) {
-        grossWin += d.net_profit;
-        winCount += 1;
-      } else if (d.net_profit < 0) {
-        grossLoss += Math.abs(d.net_profit);
-        lossCount += 1;
+    for (const t of filteredTrades) {
+      const isClosed = t.status !== 'open';
+      if (isClosed) {
+        closedTotal += 1;
+        netProfit += t.net_profit;
+        if (t.net_profit > 0) {
+          grossWin += t.net_profit;
+          winCount += 1;
+        } else if (t.net_profit < 0) {
+          grossLoss += Math.abs(t.net_profit);
+          lossCount += 1;
+        }
       }
 
-      const ak = getAlgoKey(d);
-      const cur = algoMap.get(ak) || { key: ak, net: 0, count: 0, wins: 0, losses: 0 };
-      cur.net += d.net_profit;
+      const ak = getAlgoKey(t);
+      const cur = algoMap.get(ak) || { key: ak, net: 0, count: 0, closedCount: 0, wins: 0, losses: 0 };
       cur.count += 1;
-      if (d.net_profit > 0) cur.wins += 1;
-      else if (d.net_profit < 0) cur.losses += 1;
+      if (isClosed) {
+        cur.closedCount += 1;
+        cur.net += t.net_profit;
+        if (t.net_profit > 0) cur.wins += 1;
+        else if (t.net_profit < 0) cur.losses += 1;
+      }
       algoMap.set(ak, cur);
     }
 
-    const total = filteredDeals.length;
-    const winRate = total > 0 ? (winCount / total) * 100 : 0;
+    const total = filteredTrades.length;
+    const winRate = closedTotal > 0 ? (winCount / closedTotal) * 100 : 0;
     const avgWin = winCount > 0 ? grossWin / winCount : 0;
     const avgLoss = lossCount > 0 ? grossLoss / lossCount : 0;
     const profitFactor = grossLoss > 0 ? grossWin / grossLoss : grossWin > 0 ? 99.99 : 0;
@@ -416,6 +464,7 @@ export const CTraderOrdersView: React.FC<CTraderOrdersViewProps> = ({
 
     return {
       total,
+      closedTotal,
       netProfit,
       grossWin,
       grossLoss,
@@ -429,7 +478,7 @@ export const CTraderOrdersView: React.FC<CTraderOrdersViewProps> = ({
       winModels,
       lossModels,
     };
-  }, [filteredDeals]);
+  }, [filteredTrades]);
 
   const clearFilters = () => {
     setAlgoFilter('ALL');
@@ -486,7 +535,7 @@ export const CTraderOrdersView: React.FC<CTraderOrdersViewProps> = ({
                 subTab === 'orders' ? 'bg-amber-500 text-white' : 'text-slate-600 hover:bg-slate-100'
               }`}
             >
-              交易订单 ({filteredDeals.length})
+              交易订单 ({filteredTrades.length})
             </button>
             <button
               type="button"
@@ -832,7 +881,7 @@ export const CTraderOrdersView: React.FC<CTraderOrdersViewProps> = ({
                 默认「增量拉取最新」从库内最后一笔提前 3 秒开始，避免同一毫秒并发遗漏；如需补齐更早记录，可在此拉取完整区间。
                 {dealStats && dealStats.total_deals > 0 && (
                   <span className="ml-1 text-slate-700 font-medium">
-                    当前库内共 {dealStats.total_deals} 笔（
+                    当前库内共 {dealStats.total_trades ?? trades.length} 笔订单（{dealStats.total_deals} 条开平仓原始成交，
                     {(dealStats.earliest_executed_at || '').replace('T', ' ').slice(0, 16) || '—'} ~{' '}
                     {(dealStats.latest_executed_at || '').replace('T', ' ').slice(0, 16) || '—'}）
                   </span>
@@ -1141,7 +1190,7 @@ export const CTraderOrdersView: React.FC<CTraderOrdersViewProps> = ({
             {summary.algoList.map((a) => {
               const isWin = a.net >= 0;
               const isSelected = algoFilter === a.key;
-              const rate = a.count > 0 ? ((a.wins / a.count) * 100).toFixed(1) : '0.0';
+              const rate = a.closedCount > 0 ? ((a.wins / a.closedCount) * 100).toFixed(1) : '0.0';
               return (
                 <button
                   key={a.key}
@@ -1175,7 +1224,7 @@ export const CTraderOrdersView: React.FC<CTraderOrdersViewProps> = ({
                     {isWin ? '+' : ''}${a.net.toFixed(2)}
                   </div>
                   <div className="mt-1 text-[11px] text-slate-500">
-                    成交 {a.count} 笔（胜率 {rate}%）
+                    {a.count} 笔（胜率 {rate}%）
                   </div>
                 </button>
               );
@@ -1188,11 +1237,11 @@ export const CTraderOrdersView: React.FC<CTraderOrdersViewProps> = ({
       <div className="rounded-2xl border border-slate-200/80 bg-white shadow-xs overflow-hidden">
         {loading ? (
           <div className="p-8 text-center text-xs text-slate-500">加载中...</div>
-        ) : filteredDeals.length === 0 ? (
+        ) : filteredTrades.length === 0 ? (
           <div className="p-10 text-center space-y-2">
-            <p className="text-sm font-medium text-slate-700">暂无匹配的 cTrader 成交订单</p>
+            <p className="text-sm font-medium text-slate-700">暂无匹配的 cTrader 交易订单</p>
             <p className="text-xs text-slate-500">
-              可尝试调整筛选条件，或点击右上角「立即拉取订单」同步最新成交。
+              可尝试调整筛选条件，或点击右上角「增量拉取最新」/「拉取历史数据」同步订单。
             </p>
           </div>
         ) : (
@@ -1200,68 +1249,130 @@ export const CTraderOrdersView: React.FC<CTraderOrdersViewProps> = ({
             <table className="w-full text-left text-xs">
               <thead className="bg-slate-50 text-slate-500 border-b border-slate-200/80">
                 <tr>
-                  <th className="px-4 py-3 font-medium">成交时间</th>
+                  <th className="px-4 py-3 font-medium">开仓 / 平仓时间</th>
                   <th className="px-4 py-3 font-medium">标签 / 算法</th>
-                  <th className="px-4 py-3 font-medium">品种</th>
+                  <th className="px-4 py-3 font-medium">品种 / 状态</th>
                   <th className="px-4 py-3 font-medium">方向</th>
                   <th className="px-4 py-3 font-medium">手数</th>
-                  <th className="px-4 py-3 font-medium">成交价</th>
+                  <th className="px-4 py-3 font-medium">开仓价 → 平仓价</th>
                   <th className="px-4 py-3 font-medium">净盈亏</th>
-                  <th className="px-4 py-3 font-medium">推送状态</th>
+                  <th className="px-4 py-3 font-medium">明细 / 推送</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {filteredDeals.map((d) => {
-                  const isBuy = d.side === 'BUY';
-                  const isWin = d.net_profit >= 0;
-                  const algo = getAlgoKey(d);
+                {filteredTrades.map((t) => {
+                  const isBuy = t.side === 'BUY';
+                  const isOpen = t.status === 'open';
+                  const isWin = t.net_profit >= 0;
+                  const algo = getAlgoKey(t);
+                  const expanded = !!expandedKeys[t.trade_key];
                   return (
-                    <tr key={d.deal_id} className="hover:bg-slate-50/70">
-                      <td className="px-4 py-3 text-slate-600 whitespace-nowrap">
-                        {d.executed_at.replace('T', ' ')}
-                      </td>
-                      <td className="px-4 py-3">
-                        <span
-                          className={`inline-block rounded-md px-2 py-0.5 text-[11px] font-medium ${
-                            algo === '手动订单'
-                              ? 'bg-slate-100 text-slate-600'
-                              : 'bg-indigo-50 text-indigo-700'
-                          }`}
-                        >
-                          {algo}
-                        </span>
-                      </td>
-                      <td className="px-4 py-3 font-semibold text-slate-900">{d.symbol_name}</td>
-                      <td className="px-4 py-3">
-                        <span
-                          className={`inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[11px] font-medium ${
-                            isBuy ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-700'
-                          }`}
-                        >
-                          {isBuy ? <TrendingUp className="h-3 w-3" /> : <TrendingDown className="h-3 w-3" />}
-                          {d.side}
-                        </span>
-                      </td>
-                      <td className="px-4 py-3 text-slate-700">{d.volume}</td>
-                      <td className="px-4 py-3 text-slate-700">{d.price}</td>
-                      <td
-                        className={`px-4 py-3 font-semibold ${
-                          isWin ? 'text-emerald-600' : 'text-rose-600'
-                        }`}
-                      >
-                        {isWin ? '+' : ''}
-                        {d.net_profit.toFixed(2)}
-                      </td>
-                      <td className="px-4 py-3">
-                        {d.pushed_at ? (
-                          <span className="rounded-md bg-blue-50 px-2 py-0.5 text-[11px] text-blue-700">
-                            已推送
+                    <React.Fragment key={t.trade_key}>
+                      <tr className="hover:bg-slate-50/70">
+                        <td className="px-4 py-3 text-slate-600 whitespace-nowrap">
+                          <div className="font-medium text-slate-800">
+                            {t.closed_at ? t.closed_at.replace('T', ' ') : '持仓中'}
+                          </div>
+                          {t.opened_at && (
+                            <div className="text-[11px] text-slate-400">
+                              开: {t.opened_at.replace('T', ' ')}
+                            </div>
+                          )}
+                        </td>
+                        <td className="px-4 py-3">
+                          <span
+                            className={`inline-block rounded-md px-2 py-0.5 text-[11px] font-medium ${
+                              algo === '手动订单'
+                                ? 'bg-slate-100 text-slate-600'
+                                : 'bg-indigo-50 text-indigo-700'
+                            }`}
+                          >
+                            {algo}
                           </span>
-                        ) : (
-                          <span className="text-slate-400">未推送</span>
-                        )}
-                      </td>
-                    </tr>
+                        </td>
+                        <td className="px-4 py-3">
+                          <div className="font-semibold text-slate-900">{t.symbol_name}</div>
+                          <span
+                            className={`inline-block mt-0.5 rounded px-1.5 py-0.5 text-[10px] font-medium ${
+                              t.status === 'closed'
+                                ? 'bg-slate-100 text-slate-600'
+                                : t.status === 'partial'
+                                  ? 'bg-amber-100 text-amber-700'
+                                  : 'bg-blue-50 text-blue-700'
+                            }`}
+                          >
+                            {t.status === 'closed' ? '已平仓' : t.status === 'partial' ? '部分平仓' : '持仓中'}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3">
+                          <span
+                            className={`inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[11px] font-medium ${
+                              isBuy ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-700'
+                            }`}
+                          >
+                            {isBuy ? <TrendingUp className="h-3 w-3" /> : <TrendingDown className="h-3 w-3" />}
+                            {t.side}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3 text-slate-700">{t.volume}</td>
+                        <td className="px-4 py-3 text-slate-700 font-mono whitespace-nowrap">
+                          <span>{t.open_price != null ? t.open_price : '—'}</span>
+                          <span className="mx-1 text-slate-400">→</span>
+                          <span>{t.close_price != null ? t.close_price : '—'}</span>
+                        </td>
+                        <td
+                          className={`px-4 py-3 font-semibold ${
+                            isOpen ? 'text-slate-400' : isWin ? 'text-emerald-600' : 'text-rose-600'
+                          }`}
+                        >
+                          {isOpen ? '—' : `${isWin ? '+' : ''}${t.net_profit.toFixed(2)}`}
+                        </td>
+                        <td className="px-4 py-3 whitespace-nowrap">
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setExpandedKeys((prev) => ({ ...prev, [t.trade_key]: !prev[t.trade_key] }))
+                              }
+                              className="rounded-md border border-slate-200 bg-slate-50 px-2 py-0.5 text-[11px] text-slate-600 hover:bg-slate-100 cursor-pointer"
+                            >
+                              {t.deal_count} 笔成交 {expanded ? '▲' : '▼'}
+                            </button>
+                            {t.pushed_at ? (
+                              <span className="rounded-md bg-blue-50 px-2 py-0.5 text-[11px] text-blue-700">
+                                已推送
+                              </span>
+                            ) : (
+                              <span className="text-slate-400 text-[11px]">未推送</span>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                      {expanded && (
+                        <tr className="bg-slate-50/70">
+                          <td colSpan={8} className="px-6 py-2.5">
+                            <div className="space-y-1 text-[11px] text-slate-600 font-mono">
+                              {t.deals.map((d) => (
+                                <div
+                                  key={d.deal_id}
+                                  className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-200/70 bg-white px-3 py-1.5"
+                                >
+                                  <span>
+                                    #{d.deal_id} · {d.is_closing ? '平仓' : '开仓'} · {d.side} {d.volume}手 @{' '}
+                                    {d.price}
+                                  </span>
+                                  <span>
+                                    毛利 {d.gross_profit.toFixed(2)} · 佣金 {d.commission.toFixed(2)} · 隔夜{' '}
+                                    {d.swap.toFixed(2)} · 净利 {d.net_profit.toFixed(2)}
+                                  </span>
+                                  <span className="text-slate-400">{d.executed_at.replace('T', ' ')}</span>
+                                </div>
+                              ))}
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
                   );
                 })}
               </tbody>
