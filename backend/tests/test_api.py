@@ -968,6 +968,64 @@ class TestLifeHubAPI(unittest.TestCase):
             self.assertEqual(health.json()["build"]["version"], "v1.0.0")
             self.assertEqual(health.json()["build"]["sha"], "a1b2c3d")
 
+    def test_17_legacy_zero_volume_trade_prices_and_child_flags(self):
+        from app.services.ctrader_service import group_deals_into_trades
+
+        legacy_deals = [
+            {
+                "deal_id": "349451814",
+                "order_id": "1",
+                "position_id": "9001",
+                "account_id": "100",
+                "symbol_name": "XAUUSD",
+                "side": "SELL",
+                "volume": 0.0,
+                "price": 3591.6,
+                "commission": -0.07,
+                "swap": 0.0,
+                "gross_profit": 0.0,
+                "net_profit": -0.07,
+                "label": "",
+                "comment": "",
+                "executed_at": "2026-11-20T19:01:52+08:00",
+                "execution_ms": 1795172512000,
+                "is_closing": 0,
+                "entry_price": 0.0,
+                "pushed_at": "",
+            },
+            {
+                "deal_id": "349465138",
+                "order_id": "2",
+                "position_id": "9001",
+                "account_id": "100",
+                "symbol_name": "XAUUSD",
+                "side": "BUY",
+                "volume": 0.0,
+                "price": 3577.44,
+                "commission": -0.14,
+                "swap": 0.0,
+                "gross_profit": 28.32,
+                "net_profit": 28.18,
+                "label": "",
+                "comment": "",
+                "executed_at": "2026-11-20T20:20:39+08:00",
+                "execution_ms": 1795177239000,
+                "is_closing": 0,
+                "entry_price": 0.0,
+                "pushed_at": "",
+            },
+        ]
+        trades = group_deals_into_trades(legacy_deals)
+        self.assertEqual(len(trades), 1)
+        t = trades[0]
+        self.assertEqual(t["status"], "closed")
+        self.assertEqual(t["side"], "SELL")
+        self.assertEqual(t["open_price"], 3591.6)
+        self.assertEqual(t["close_price"], 3577.44)
+        self.assertEqual(t["net_profit"], 28.18)
+        self.assertEqual(t["deals"][0]["is_closing"], 0)
+        self.assertEqual(t["deals"][1]["is_closing"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -999,11 +999,14 @@ def _trade_group_key(deal: Dict[str, Any]) -> str:
 
 
 def _weighted_price(rows: List[Dict[str, Any]]) -> Optional[float]:
-    total_vol = sum(float(r.get("volume") or 0) for r in rows)
-    if total_vol <= 0:
+    valid_rows = [r for r in rows if float(r.get("price") or 0) > 0]
+    if not valid_rows:
         return None
-    weighted = sum(float(r.get("price") or 0) * float(r.get("volume") or 0) for r in rows)
-    return round(weighted / total_vol, 5) if weighted > 0 else None
+    total_vol = sum(float(r.get("volume") or 0) for r in valid_rows)
+    if total_vol > 0:
+        weighted = sum(float(r.get("price") or 0) * float(r.get("volume") or 0) for r in valid_rows)
+        return round(weighted / total_vol, 5) if weighted > 0 else None
+    return round(sum(float(r.get("price") or 0) for r in valid_rows) / len(valid_rows), 5)
 
 
 def group_deals_into_trades(deals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1090,6 +1093,11 @@ def group_deals_into_trades(deals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         exec_ms = max(int(r.get("execution_ms") or 0) for r in rows)
         pushed_at = next((str(r.get("pushed_at") or "") for r in reversed(rows) if (r.get("pushed_at") or "").strip()), "")
 
+        normalized_deals = [{**r, "is_closing": 0} for r in opens] + [{**r, "is_closing": 1} for r in closes]
+        normalized_deals.sort(
+            key=lambda r: (int(r.get("execution_ms") or 0), str(r.get("executed_at") or ""), str(r.get("deal_id") or "")),
+        )
+
         trades.append(
             {
                 "trade_key": key,
@@ -1116,8 +1124,8 @@ def group_deals_into_trades(deals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 "executed_at": executed_at,
                 "execution_ms": exec_ms,
                 "pushed_at": pushed_at,
-                "deal_count": len(rows),
-                "deals": rows,
+                "deal_count": len(normalized_deals),
+                "deals": normalized_deals,
             }
         )
 
@@ -1126,6 +1134,50 @@ def group_deals_into_trades(deals: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         key=lambda t: (str(t.get("executed_at") or ""), int(t.get("execution_ms") or 0), str(t.get("trade_key") or "")),
         reverse=True,
     )
+
+
+async def repair_legacy_deals_if_needed() -> Dict[str, Any]:
+    """One-time background repair for legacy deals stored with wrong lotSize or missing is_closing."""
+    from ..db import update_settings
+
+    cfg = get_all_settings()
+    if cfg.get("ctrader_deals_repaired_v2") == "1":
+        return {"repaired": False, "reason": "already_done"}
+
+    client_id = (cfg.get("ctrader_client_id") or "").strip()
+    client_secret = (cfg.get("ctrader_client_secret") or "").strip()
+    access_token = (cfg.get("ctrader_access_token") or "").strip()
+    if not client_id or not client_secret or not access_token:
+        return {"repaired": False, "reason": "unconfigured"}
+
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS bad_cnt, MIN(executed_at) AS min_exec
+            FROM ctrader_deals
+            WHERE volume <= 0 OR (gross_profit != 0 AND is_closing = 0)
+            """
+        ).fetchone()
+        bad_cnt = int(row["bad_cnt"] or 0) if row else 0
+        if bad_cnt == 0:
+            total_cnt = conn.execute("SELECT COUNT(*) FROM ctrader_deals").fetchone()[0]
+            if total_cnt > 0:
+                update_settings({"ctrader_deals_repaired_v2": "1"})
+            return {"repaired": False, "reason": "no_bad_rows"}
+        min_row = conn.execute("SELECT MIN(executed_at) AS min_exec FROM ctrader_deals").fetchone()
+        min_exec = str((min_row["min_exec"] if min_row else "") or "")
+
+    start_date = min_exec[:10] if len(min_exec) >= 10 else None
+    today_str = datetime.datetime.now().astimezone().strftime("%Y-%m-%d")
+    res = await sync_ctrader_deals(
+        days=90,
+        push_new=False,
+        mode="range",
+        start_date=start_date,
+        end_date=today_str,
+    )
+    update_settings({"ctrader_deals_repaired_v2": "1"})
+    return {"repaired": True, "result": res}
 
 
 def list_ctrader_deals(limit: int = 5000) -> Dict[str, Any]:

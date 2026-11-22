@@ -71,6 +71,7 @@ from .services.bark_service import format_reminder_bark_message, send_bark_push
 from .services.ctrader_service import (
     get_ctrader_sync_status,
     list_ctrader_deals,
+    repair_legacy_deals_if_needed,
     start_background_ctrader_sync,
     sync_ctrader_deals,
     test_ctrader_connection,
@@ -384,6 +385,14 @@ async def _startup_update_notify_task() -> None:
         pass
 
 
+async def _startup_legacy_deals_repair_task() -> None:
+    await asyncio.sleep(5.0)
+    try:
+        await repair_legacy_deals_if_needed()
+    except Exception:
+        pass
+
+
 @app.on_event("startup")
 async def on_startup() -> None:
     init_db(seed_demo=True)
@@ -391,6 +400,7 @@ async def on_startup() -> None:
     asyncio.create_task(_bark_due_reminder_loop())
     asyncio.create_task(_ctrader_auto_sync_loop())
     asyncio.create_task(_startup_update_notify_task())
+    asyncio.create_task(_startup_legacy_deals_repair_task())
     await market_service.ensure_started_from_settings()
 
 
