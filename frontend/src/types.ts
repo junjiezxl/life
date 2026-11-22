@@ -290,6 +290,7 @@ export interface DashboardData {
     ai_provider: string;
     siyuan_mode: string;
     build?: {
+      version?: string;
       sha: string;
       build_time: string;
       commit_msg: string;

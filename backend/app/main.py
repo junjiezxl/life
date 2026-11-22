@@ -303,29 +303,57 @@ async def _ctrader_auto_sync_loop() -> None:
             pass
 
 
+def _format_update_message(raw_msg: str) -> str:
+    msg = (raw_msg or "").strip()
+    if not msg:
+        return ""
+    prefix_map = {
+        "feat:": "新功能：",
+        "fix:": "修复：",
+        "style:": "界面优化：",
+        "refactor:": "优化重构：",
+        "chore:": "维护：",
+        "docs:": "文档：",
+        "perf:": "性能优化：",
+        "ci:": "构建部署：",
+    }
+    lower = msg.lower()
+    for eng, chn in prefix_map.items():
+        if lower.startswith(eng):
+            rest = msg[len(eng) :].strip()
+            return f"{chn}{rest}" if rest else chn.rstrip("：")
+    return msg
+
+
 def get_build_info() -> Dict[str, str]:
+    version = (os.environ.get("LIFEHUB_VERSION") or "v1.0.0-dev").strip() or "v1.0.0-dev"
+    sha = (os.environ.get("LIFEHUB_BUILD_SHA") or "dev").strip() or "dev"
+    raw_msg = (os.environ.get("LIFEHUB_BUILD_MSG") or "").strip()
     return {
-        "sha": (os.environ.get("LIFEHUB_BUILD_SHA") or "dev").strip() or "dev",
+        "version": version,
+        "sha": sha,
         "build_time": (os.environ.get("LIFEHUB_BUILD_TIME") or "").strip(),
-        "commit_msg": (os.environ.get("LIFEHUB_BUILD_MSG") or "").strip(),
+        "commit_msg": _format_update_message(raw_msg),
     }
 
 
 async def check_and_notify_version_update() -> Dict[str, Any]:
     build = get_build_info()
+    build_version = build["version"]
     build_sha = build["sha"]
     if not build_sha or build_sha == "dev":
         return {"notified": False, "reason": "dev_build"}
 
+    notify_key = f"{build_version}:{build_sha}"
     settings = get_all_settings()
     if settings.get("bark_push_on_update", "1") != "1":
         return {"notified": False, "reason": "disabled"}
     if settings.get("bark_enabled") != "1" or not (settings.get("bark_device_key") or "").strip():
         return {"notified": False, "reason": "bark_unconfigured"}
-    if settings.get("last_notified_build_id", "") == build_sha:
+    if settings.get("last_notified_build_id", "") == notify_key:
         return {"notified": False, "reason": "already_notified"}
 
-    lines = ["新版本镜像已拉取并启动完成。"]
+    lines = [f"新版本 {build_version} 已部署并启动完成。"]
     if build["commit_msg"]:
         lines.append(f"更新内容：{build['commit_msg']}")
     if build["build_time"]:
@@ -333,15 +361,15 @@ async def check_and_notify_version_update() -> Dict[str, Any]:
     lines.append(f"上线时间：{datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S')}")
 
     res = await send_bark_push(
-        title=f"🚀 LifeHub 已更新上线 ({build_sha})",
+        title=f"🚀 LifeHub 已更新上线 ({build_version})",
         body="\n".join(lines),
         settings=settings,
         priority="high",
         group="LifeHub",
     )
     if res.get("ok"):
-        update_settings({"last_notified_build_id": build_sha})
-        return {"notified": True, "sha": build_sha}
+        update_settings({"last_notified_build_id": notify_key})
+        return {"notified": True, "version": build_version, "sha": build_sha}
     return {"notified": False, "reason": res.get("message") or "push_failed"}
 
 

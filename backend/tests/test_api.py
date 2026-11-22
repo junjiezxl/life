@@ -942,9 +942,10 @@ class TestLifeHubAPI(unittest.TestCase):
             patch.dict(
                 os.environ,
                 {
+                    "LIFEHUB_VERSION": "v1.0.0",
                     "LIFEHUB_BUILD_SHA": "a1b2c3d",
                     "LIFEHUB_BUILD_TIME": "2026-11-22 10:40:00",
-                    "LIFEHUB_BUILD_MSG": "fix: resolve XAUUSD lotSize",
+                    "LIFEHUB_BUILD_MSG": "fix: 修复黄金手数换算问题",
                 },
             ),
             patch("app.services.bark_service.httpx.AsyncClient.post", new=AsyncMock(return_value=FakeResp())) as mock_post,
@@ -953,8 +954,8 @@ class TestLifeHubAPI(unittest.TestCase):
             self.assertTrue(res1["notified"])
             self.assertEqual(mock_post.call_count, 1)
             payload = mock_post.call_args.kwargs["json"]
-            self.assertIn("a1b2c3d", payload["title"])
-            self.assertIn("fix: resolve XAUUSD lotSize", payload["body"])
+            self.assertIn("v1.0.0", payload["title"])
+            self.assertIn("修复：修复黄金手数换算问题", payload["body"])
 
             # Same version restart must not duplicate notification
             res2 = asyncio.run(main_mod.check_and_notify_version_update())
@@ -964,6 +965,7 @@ class TestLifeHubAPI(unittest.TestCase):
 
             health = self.client.get("/api/health")
             self.assertEqual(health.status_code, 200)
+            self.assertEqual(health.json()["build"]["version"], "v1.0.0")
             self.assertEqual(health.json()["build"]["sha"], "a1b2c3d")
 
 

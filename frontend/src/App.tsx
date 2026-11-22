@@ -278,11 +278,11 @@ export function App() {
               {dashboard.config_status.build && (
                 <div
                   className="flex items-center justify-between"
-                  title={`${dashboard.config_status.build.commit_msg || ''}\n${dashboard.config_status.build.build_time || ''}`}
+                  title={`${dashboard.config_status.build.commit_msg || ''}\n构建: ${dashboard.config_status.build.build_time || '-'} (${dashboard.config_status.build.sha})`}
                 >
                   <span>运行版本</span>
                   <span className="rounded-md bg-slate-100 px-2 py-0.5 font-mono font-medium text-slate-700">
-                    {dashboard.config_status.build.sha}
+                    {dashboard.config_status.build.version || dashboard.config_status.build.sha}
                   </span>
                 </div>
               )}

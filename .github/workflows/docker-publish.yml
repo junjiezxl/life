@@ -19,6 +19,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -59,6 +61,11 @@ jobs:
       - name: Extract build metadata
         id: build_meta
         run: |
+          count=$(git rev-list --count HEAD)
+          base=31
+          patch=$((count - base))
+          if [ "$patch" -lt 0 ]; then patch=0; fi
+          echo "version=v1.0.${patch}" >> "$GITHUB_OUTPUT"
           echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
           echo "time=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')" >> "$GITHUB_OUTPUT"
           msg=$(git log -1 --pretty=%s | tr '\n\r"' '   ' | cut -c1-120)
@@ -82,6 +89,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
+            LIFEHUB_VERSION=${{ steps.build_meta.outputs.version }}
             LIFEHUB_BUILD_SHA=${{ steps.build_meta.outputs.sha }}
             LIFEHUB_BUILD_TIME=${{ steps.build_meta.outputs.time }}
             LIFEHUB_BUILD_MSG=${{ steps.build_meta.outputs.msg }}
