@@ -775,6 +775,9 @@ class TestLifeHubAPI(unittest.TestCase):
             async def fetch_symbols(self):
                 return {1: "XAUUSD"}
 
+            async def fetch_symbol_lot_sizes(self, symbol_ids):
+                return {1: 10000}
+
             async def fetch_raw_deals_chunked(self, start_ms, end_ms, progress_cb=None):
                 requested_windows.append((start_ms, end_ms))
                 # Verify 7-day chunk splitting would produce >= 8 chunks for Oct 1 -> Nov 21
@@ -784,7 +787,7 @@ class TestLifeHubAPI(unittest.TestCase):
                     positionId=301,
                     symbolId=1,
                     tradeSide=model_pb.BUY,
-                    filledVolume=1000,
+                    filledVolume=100,  # 1 oz = 0.01 lots for XAUUSD (lotSize=10000)
                     executionPrice=3500.0,
                     executionTimestamp=1760000000000,
                     dealStatus=model_pb.FILLED,
@@ -798,7 +801,7 @@ class TestLifeHubAPI(unittest.TestCase):
                     positionId=301,
                     symbolId=1,
                     tradeSide=model_pb.SELL,
-                    filledVolume=1000,
+                    filledVolume=100,
                     executionPrice=3500.0,
                     executionTimestamp=1760000050000,
                     dealStatus=model_pb.FILLED,
@@ -845,8 +848,8 @@ class TestLifeHubAPI(unittest.TestCase):
                     progress_cb(len(order_ids), len(order_ids))
                 return res
 
-            def decode_raw_deals(self, raw_deals, symbol_map, order_meta):
-                return orig_client_cls.decode_raw_deals(self, raw_deals, symbol_map, order_meta)
+            def decode_raw_deals(self, raw_deals, symbol_map, order_meta, lot_sizes=None):
+                return orig_client_cls.decode_raw_deals(self, raw_deals, symbol_map, order_meta, lot_sizes=lot_sizes)
 
         with patch.object(ctrader_service, "_CTraderAsyncClient", FakeAsyncClient):
             # 1. Range historical backfill from 2026-10-01 to 2026-11-21
@@ -874,6 +877,7 @@ class TestLifeHubAPI(unittest.TestCase):
             self.assertEqual(len(trades1), 1)
             self.assertEqual(trades1[0]["status"], "closed")
             self.assertEqual(trades1[0]["side"], "BUY")
+            self.assertEqual(trades1[0]["volume"], 0.01)
             self.assertEqual(trades1[0]["open_price"], 3500.0)
             self.assertEqual(trades1[0]["close_price"], 3500.0)
             self.assertEqual(trades1[0]["net_profit"], -0.58)  # not double-charging opening commission

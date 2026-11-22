@@ -322,6 +322,29 @@ class _CTraderAsyncClient:
         res.ParseFromString(proto.payload)
         return {int(s.symbolId): str(s.symbolName) for s in res.symbol}
 
+    async def fetch_symbol_lot_sizes(self, symbol_ids: List[int]) -> Dict[int, int]:
+        """Fetch contract lotSize (in 0.01-unit cents) via ProtoOASymbolByIdReq."""
+        assert self.ctid_trader_account_id is not None
+        clean_ids = sorted({int(sid) for sid in symbol_ids if sid})
+        if not clean_ids:
+            return {}
+        lot_sizes: Dict[int, int] = {}
+        try:
+            await self._throttle_history()
+            req = self.oa_msgs.ProtoOASymbolByIdReq()
+            req.ctidTraderAccountId = self.ctid_trader_account_id
+            req.symbolId.extend(clean_ids)
+            proto = await self._send_req(req, timeout=15.0)
+            res = self.oa_msgs.ProtoOASymbolByIdRes()
+            res.ParseFromString(proto.payload)
+            for s in res.symbol:
+                lot_val = int(getattr(s, "lotSize", 0) or 0)
+                if lot_val > 0:
+                    lot_sizes[int(s.symbolId)] = lot_val
+        except Exception as exc:
+            logger.warning("Failed to fetch symbol lot sizes, using fallback defaults: %s", exc)
+        return lot_sizes
+
     async def fetch_order_labels(
         self,
         order_ids: List[int],
@@ -402,11 +425,21 @@ class _CTraderAsyncClient:
             key=lambda d: (int(getattr(d, "executionTimestamp", 0) or 0), int(getattr(d, "dealId", 0) or 0)),
         )
 
+    @staticmethod
+    def _fallback_lot_size_cents(symbol_name: str) -> int:
+        sym = (symbol_name or "").upper()
+        if "XAU" in sym or "GOLD" in sym:
+            return 10_000  # 1 lot = 100 oz = 10,000 protocol cents
+        if "XAG" in sym or "SILVER" in sym:
+            return 500_000  # 1 lot = 5,000 oz = 500,000 protocol cents
+        return 10_000_000  # standard Forex 1 lot = 100,000 units = 10,000,000 cents
+
     def decode_raw_deals(
         self,
         raw_deals: List[Any],
         symbol_map: Dict[int, str],
         order_meta: Dict[str, Tuple[str, str]],
+        lot_sizes: Optional[Dict[int, int]] = None,
     ) -> List[Dict[str, Any]]:
         deals: List[Dict[str, Any]] = []
         for d in raw_deals:
@@ -443,7 +476,9 @@ class _CTraderAsyncClient:
             side = "BUY" if side_val == 1 else ("SELL" if side_val == 2 else str(side_val))
             sym_id = int(getattr(d, "symbolId", 0) or 0)
             sym_name = symbol_map.get(sym_id, f"SYM_{sym_id}")
-            vol = float(getattr(d, "filledVolume", 0) or getattr(d, "volume", 0) or 0) / 10000000.0
+            raw_vol = float(getattr(d, "filledVolume", 0) or getattr(d, "volume", 0) or 0)
+            lot_size_cents = (lot_sizes or {}).get(sym_id) or _CTraderAsyncClient._fallback_lot_size_cents(sym_name)
+            vol = raw_vol / float(lot_size_cents)
 
             oid_str = str(getattr(d, "orderId", "") or "")
             direct_label = str(getattr(d, "label", "") or "").strip()
@@ -502,9 +537,11 @@ class _CTraderAsyncClient:
         start_ms = from_ms if from_ms is not None else max(0, end_ms - (max(1, days) * 86400 * 1000))
 
         raw_deals = await self.fetch_raw_deals_chunked(start_ms, end_ms)
+        symbol_ids = [int(getattr(d, "symbolId", 0) or 0) for d in raw_deals]
+        lot_sizes = await self.fetch_symbol_lot_sizes(symbol_ids)
         unique_order_ids = list({int(d.orderId) for d in raw_deals if getattr(d, "orderId", 0)})
         order_meta = await self.fetch_order_labels(unique_order_ids) if unique_order_ids else {}
-        return self.decode_raw_deals(raw_deals, symbol_map, order_meta)
+        return self.decode_raw_deals(raw_deals, symbol_map, order_meta, lot_sizes=lot_sizes)
 
 
 def _get_ctrader_credentials(settings: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -795,8 +832,10 @@ async def sync_ctrader_deals(
                 )
                 _sync_state["deals_fetched"] = len(raw_deals)
 
+                symbol_ids = [int(getattr(d, "symbolId", 0) or 0) for d in raw_deals]
+                lot_sizes = await client.fetch_symbol_lot_sizes(symbol_ids)
                 cached_labels = _get_cached_order_labels()
-                deals = client.decode_raw_deals(raw_deals, symbol_map, cached_labels)
+                deals = client.decode_raw_deals(raw_deals, symbol_map, cached_labels, lot_sizes=lot_sizes)
                 _apply_position_label_inheritance(deals)
 
                 # Save deals immediately so large backfills are visible & durable right away
