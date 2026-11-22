@@ -10,9 +10,16 @@ RUN npm run build
 # Stage 2: Runtime image
 FROM python:3.11-slim
 
+ARG LIFEHUB_BUILD_SHA=dev
+ARG LIFEHUB_BUILD_TIME=
+ARG LIFEHUB_BUILD_MSG=
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    TZ=Asia/Shanghai
+    TZ=Asia/Shanghai \
+    LIFEHUB_BUILD_SHA=${LIFEHUB_BUILD_SHA} \
+    LIFEHUB_BUILD_TIME=${LIFEHUB_BUILD_TIME} \
+    LIFEHUB_BUILD_MSG=${LIFEHUB_BUILD_MSG}
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends tzdata ca-certificates \

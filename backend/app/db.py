@@ -61,6 +61,7 @@ DEFAULT_SETTINGS: Dict[str, str] = {
     "bark_group": "LifeHub",
     "bark_sound": "bell",
     "bark_push_on_create": "1",
+    "bark_push_on_update": "1",
     "bark_due_advance_min": "15",
     "ctrader_client_id": "",
     "ctrader_client_secret": "",

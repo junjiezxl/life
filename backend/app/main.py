@@ -303,12 +303,66 @@ async def _ctrader_auto_sync_loop() -> None:
             pass
 
 
+def get_build_info() -> Dict[str, str]:
+    return {
+        "sha": (os.environ.get("LIFEHUB_BUILD_SHA") or "dev").strip() or "dev",
+        "build_time": (os.environ.get("LIFEHUB_BUILD_TIME") or "").strip(),
+        "commit_msg": (os.environ.get("LIFEHUB_BUILD_MSG") or "").strip(),
+    }
+
+
+async def check_and_notify_version_update() -> Dict[str, Any]:
+    build = get_build_info()
+    build_sha = build["sha"]
+    if not build_sha or build_sha == "dev":
+        return {"notified": False, "reason": "dev_build"}
+
+    settings = get_all_settings()
+    if settings.get("bark_push_on_update", "1") != "1":
+        return {"notified": False, "reason": "disabled"}
+    if settings.get("bark_enabled") != "1" or not (settings.get("bark_device_key") or "").strip():
+        return {"notified": False, "reason": "bark_unconfigured"}
+    if settings.get("last_notified_build_id", "") == build_sha:
+        return {"notified": False, "reason": "already_notified"}
+
+    lines = ["新版本镜像已拉取并启动完成。"]
+    if build["commit_msg"]:
+        lines.append(f"更新内容：{build['commit_msg']}")
+    if build["build_time"]:
+        lines.append(f"构建时间：{build['build_time']}")
+    lines.append(f"上线时间：{datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    res = await send_bark_push(
+        title=f"🚀 LifeHub 已更新上线 ({build_sha})",
+        body="\n".join(lines),
+        settings=settings,
+        priority="high",
+        group="LifeHub",
+    )
+    if res.get("ok"):
+        update_settings({"last_notified_build_id": build_sha})
+        return {"notified": True, "sha": build_sha}
+    return {"notified": False, "reason": res.get("message") or "push_failed"}
+
+
+async def _startup_update_notify_task() -> None:
+    await asyncio.sleep(2.0)
+    try:
+        res = await check_and_notify_version_update()
+        if not res.get("notified") and res.get("reason") not in ("dev_build", "disabled", "bark_unconfigured", "already_notified"):
+            await asyncio.sleep(15.0)
+            await check_and_notify_version_update()
+    except Exception:
+        pass
+
+
 @app.on_event("startup")
 async def on_startup() -> None:
     init_db(seed_demo=True)
     asyncio.create_task(_email_auto_sync_loop())
     asyncio.create_task(_bark_due_reminder_loop())
     asyncio.create_task(_ctrader_auto_sync_loop())
+    asyncio.create_task(_startup_update_notify_task())
     await market_service.ensure_started_from_settings()
 
 
@@ -495,8 +549,8 @@ async def market_ws_symbol(ws: WebSocket, symbol: str) -> None:
 
 
 @app.get("/api/health")
-def health_check() -> Dict[str, bool]:
-    return {"ok": True}
+def health_check() -> Dict[str, Any]:
+    return {"ok": True, "status": "ok", "time": now_iso(), "build": get_build_info()}
 
 
 @app.get("/api/auth/status")
@@ -733,6 +787,7 @@ async def get_dashboard() -> Dict[str, Any]:
         "config_status": {
             "ai_provider": settings.get("ai_provider", "local_fallback"),
             "siyuan_mode": settings.get("siyuan_mode", "mcp_stdio"),
+            "build": get_build_info(),
         },
     }
 

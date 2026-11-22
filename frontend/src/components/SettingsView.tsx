@@ -550,6 +550,14 @@ export const SettingsView: React.FC<Props> = ({
             />
             <span>新增/触发提醒时立即推送一条确认通知</span>
           </label>
+          <label className="inline-flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={settings.bark_push_on_update !== '0'}
+              onChange={(e) => updateField('bark_push_on_update', e.target.checked ? '1' : '0')}
+            />
+            <span>版本更新上线后自动发送 Bark 通知（同一版本只推一次）</span>
+          </label>
         </div>
 
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">

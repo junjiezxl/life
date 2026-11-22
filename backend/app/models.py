@@ -186,6 +186,7 @@ class SettingsUpdateRequest(BaseModel):
     bark_group: Optional[str] = None
     bark_sound: Optional[str] = None
     bark_push_on_create: Optional[str] = None
+    bark_push_on_update: Optional[str] = None
     bark_due_advance_min: Optional[str] = None
     ctrader_client_id: Optional[str] = None
     ctrader_client_secret: Optional[str] = None

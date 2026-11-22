@@ -56,6 +56,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Extract build metadata
+        id: build_meta
+        run: |
+          echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "time=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')" >> "$GITHUB_OUTPUT"
+          msg=$(git log -1 --pretty=%s | tr '\n\r"' '   ' | cut -c1-120)
+          echo "msg=$msg" >> "$GITHUB_OUTPUT"
+
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -73,5 +81,9 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            LIFEHUB_BUILD_SHA=${{ steps.build_meta.outputs.sha }}
+            LIFEHUB_BUILD_TIME=${{ steps.build_meta.outputs.time }}
+            LIFEHUB_BUILD_MSG=${{ steps.build_meta.outputs.msg }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

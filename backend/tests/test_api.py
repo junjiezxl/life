@@ -910,6 +910,62 @@ class TestLifeHubAPI(unittest.TestCase):
         self.assertEqual(st_resp.status_code, 200)
         self.assertEqual(st_resp.json()["phase"], "completed")
 
+    def test_16_startup_version_update_bark_notification(self):
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+        from app import main as main_mod
+
+        self.client.put(
+            "/api/settings",
+            json={
+                "bark_enabled": "1",
+                "bark_server_url": "https://api.day.app",
+                "bark_device_key": "test_bark_key_upd",
+                "bark_group": "LifeHub",
+                "bark_push_on_update": "1",
+            },
+        )
+
+        class FakeResp:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"code": 200, "message": "success"}
+
+        with patch.dict(os.environ, {"LIFEHUB_BUILD_SHA": "dev"}):
+            res_dev = asyncio.run(main_mod.check_and_notify_version_update())
+            self.assertFalse(res_dev["notified"])
+            self.assertEqual(res_dev["reason"], "dev_build")
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "LIFEHUB_BUILD_SHA": "a1b2c3d",
+                    "LIFEHUB_BUILD_TIME": "2026-11-22 10:40:00",
+                    "LIFEHUB_BUILD_MSG": "fix: resolve XAUUSD lotSize",
+                },
+            ),
+            patch("app.services.bark_service.httpx.AsyncClient.post", new=AsyncMock(return_value=FakeResp())) as mock_post,
+        ):
+            res1 = asyncio.run(main_mod.check_and_notify_version_update())
+            self.assertTrue(res1["notified"])
+            self.assertEqual(mock_post.call_count, 1)
+            payload = mock_post.call_args.kwargs["json"]
+            self.assertIn("a1b2c3d", payload["title"])
+            self.assertIn("fix: resolve XAUUSD lotSize", payload["body"])
+
+            # Same version restart must not duplicate notification
+            res2 = asyncio.run(main_mod.check_and_notify_version_update())
+            self.assertFalse(res2["notified"])
+            self.assertEqual(res2["reason"], "already_notified")
+            self.assertEqual(mock_post.call_count, 1)
+
+            health = self.client.get("/api/health")
+            self.assertEqual(health.status_code, 200)
+            self.assertEqual(health.json()["build"]["sha"], "a1b2c3d")
+
 
 if __name__ == "__main__":
     unittest.main()

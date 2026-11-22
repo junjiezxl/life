@@ -275,6 +275,17 @@ export function App() {
                   {dashboard.config_status.siyuan_mode}
                 </span>
               </div>
+              {dashboard.config_status.build && (
+                <div
+                  className="flex items-center justify-between"
+                  title={`${dashboard.config_status.build.commit_msg || ''}\n${dashboard.config_status.build.build_time || ''}`}
+                >
+                  <span>运行版本</span>
+                  <span className="rounded-md bg-slate-100 px-2 py-0.5 font-mono font-medium text-slate-700">
+                    {dashboard.config_status.build.sha}
+                  </span>
+                </div>
+              )}
             </>
           )}
           <div className="pt-2 border-t border-slate-100 flex items-center justify-between">

@@ -289,6 +289,11 @@ export interface DashboardData {
   config_status: {
     ai_provider: string;
     siyuan_mode: string;
+    build?: {
+      sha: string;
+      build_time: string;
+      commit_msg: string;
+    };
   };
 }
 
