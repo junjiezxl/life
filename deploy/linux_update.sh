@@ -5,6 +5,8 @@ APP_DIR="${LIFEHUB_APP_DIR:-/opt/lifehub}"
 BRANCH="${LIFEHUB_GIT_BRANCH:-main}"
 SERVICE_NAME="${LIFEHUB_SERVICE_NAME:-lifehub}"
 FORCE_UPDATE="${1:-}"
+REPO_URL="${LIFEHUB_REPO_URL:-https://github.com/junjiezxl/life.git}"
+MIRROR_URLS="${LIFEHUB_GIT_MIRRORS:-https://gh-proxy.com/${REPO_URL} https://ghfast.top/${REPO_URL} ${REPO_URL}}"
 
 if [ ! -d "$APP_DIR/.git" ]; then
   echo "[lifehub-updater] Git repo not found at $APP_DIR" >&2
@@ -15,8 +17,21 @@ cd "$APP_DIR"
 git config --global --add safe.directory "$APP_DIR" >/dev/null 2>&1 || true
 
 LOCAL_SHA="$(git rev-parse HEAD)"
-git fetch origin "$BRANCH" --quiet
-REMOTE_SHA="$(git rev-parse "origin/$BRANCH")"
+
+FETCHED=0
+for url in $MIRROR_URLS; do
+  if GIT_TERMINAL_PROMPT=0 timeout 25 git fetch --quiet "$url" "$BRANCH"; then
+    FETCHED=1
+    break
+  fi
+done
+
+if [ "$FETCHED" != "1" ]; then
+  echo "[lifehub-updater] Failed to fetch branch $BRANCH from all remotes" >&2
+  exit 1
+fi
+
+REMOTE_SHA="$(git rev-parse FETCH_HEAD)"
 
 NEED_RESTART=0
 REBUILD_FRONTEND=0
@@ -27,7 +42,7 @@ if [ "$LOCAL_SHA" != "$REMOTE_SHA" ] || [ "$FORCE_UPDATE" = "--force" ] || [ ! -
   CHANGED_FILES=""
   if [ "$LOCAL_SHA" != "$REMOTE_SHA" ]; then
     CHANGED_FILES="$(git diff --name-only "$LOCAL_SHA" "$REMOTE_SHA" || true)"
-    git reset --hard "origin/$BRANCH"
+    git reset --hard "$REMOTE_SHA"
     NEED_RESTART=1
   fi
 
@@ -39,8 +54,9 @@ if [ "$LOCAL_SHA" != "$REMOTE_SHA" ] || [ "$FORCE_UPDATE" = "--force" ] || [ ! -
   fi
 
   if [ "$UPDATE_PYTHON" = "1" ]; then
-    "$APP_DIR/backend/.venv/bin/pip" install --upgrade pip -q
-    "$APP_DIR/backend/.venv/bin/pip" install -r "$APP_DIR/backend/requirements.txt" -q
+    PIP_BIN="$APP_DIR/backend/.venv/bin/pip"
+    "$PIP_BIN" install --upgrade pip -i https://pypi.tuna.tsinghua.edu.cn/simple -q || "$PIP_BIN" install --upgrade pip -q
+    "$PIP_BIN" install -r "$APP_DIR/backend/requirements.txt" -i https://pypi.tuna.tsinghua.edu.cn/simple -q || "$PIP_BIN" install -r "$APP_DIR/backend/requirements.txt" -q
     NEED_RESTART=1
   fi
 
@@ -50,6 +66,7 @@ if [ "$LOCAL_SHA" != "$REMOTE_SHA" ] || [ "$FORCE_UPDATE" = "--force" ] || [ ! -
 
   if [ "$REBUILD_FRONTEND" = "1" ]; then
     cd "$APP_DIR/frontend"
+    export npm_config_registry="${NPM_REGISTRY:-https://registry.npmmirror.com}"
     npm ci --no-audit --no-fund --silent || npm install --no-audit --no-fund --silent
     npm run build
     cd "$APP_DIR"
