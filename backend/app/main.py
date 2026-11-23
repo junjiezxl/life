@@ -17,6 +17,7 @@ from .models import (
     CTraderOAuthExchangeRequest,
     CTraderOAuthRefreshRequest,
     CTraderSyncRequest,
+    IBKRSyncRequest,
     AccountCreate,
     AccountUpdate,
     AuthChangePasswordRequest,
@@ -92,6 +93,12 @@ from .services.debt_planner_service import (
     plan_optimal_repayment_paths,
 )
 from .services.email_service import fetch_and_parse_emails, test_imap_connection
+from .services.ibkr_service import (
+    get_ibkr_overview,
+    get_ibkr_sync_status,
+    sync_ibkr_flex,
+    test_ibkr_connection,
+)
 from .services.siyuan_service import fetch_siyuan_notes, test_siyuan_connection
 
 app = FastAPI(title="LifeHub API", version="1.0.0")
@@ -465,6 +472,20 @@ async def _ctrader_token_auto_refresh_loop() -> None:
         await asyncio.sleep(3600.0)
 
 
+async def _ibkr_auto_sync_loop() -> None:
+    await asyncio.sleep(30.0)
+    while True:
+        interval_min = 360
+        try:
+            settings = get_all_settings()
+            interval_min = max(15, int(settings.get("ibkr_sync_interval_min") or "360"))
+            if settings.get("ibkr_auto_sync_enabled") == "1" and (settings.get("ibkr_flex_token") or "").strip():
+                await sync_ibkr_flex()
+        except Exception:
+            pass
+        await asyncio.sleep(interval_min * 60.0)
+
+
 @app.on_event("startup")
 async def on_startup() -> None:
     init_db(seed_demo=True)
@@ -472,6 +493,7 @@ async def on_startup() -> None:
     asyncio.create_task(_bark_due_reminder_loop())
     asyncio.create_task(_ctrader_auto_sync_loop())
     asyncio.create_task(_ctrader_token_auto_refresh_loop())
+    asyncio.create_task(_ibkr_auto_sync_loop())
     asyncio.create_task(_startup_update_notify_task())
     asyncio.create_task(_startup_legacy_deals_repair_task())
     await market_service.ensure_started_from_settings()
@@ -652,6 +674,38 @@ async def api_ctrader_oauth_callback(
 <p><a href="/" style="color:#d97706;">返回 LifeHub</a></p>
 </body></html>""",
         )
+
+
+# ---------------- IBKR Flex Daily Summary ----------------
+
+
+@app.get("/api/ibkr/overview")
+def api_ibkr_overview(account_id: str = "") -> Dict[str, Any]:
+    return get_ibkr_overview(account_id=account_id)
+
+
+@app.get("/api/ibkr/sync/status")
+def api_ibkr_sync_status() -> Dict[str, Any]:
+    return get_ibkr_sync_status()
+
+
+@app.post("/api/ibkr/sync")
+async def api_ibkr_sync(payload: Optional[IBKRSyncRequest] = None) -> Dict[str, Any]:
+    try:
+        return await sync_ibkr_flex(
+            query_id=payload.query_id if payload else None,
+            push_summary=payload.push_summary if payload else None,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc).strip() or repr(exc)) from exc
+
+
+@app.post("/api/ibkr/test")
+async def api_ibkr_test() -> Dict[str, Any]:
+    try:
+        return await test_ibkr_connection()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc).strip() or repr(exc)) from exc
 
 
 @app.get("/api/ctrader/market/status")

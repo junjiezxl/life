@@ -1,4 +1,127 @@
-export type TabKey = 'dashboard' | 'reminders' | 'notes' | 'phones' | 'finance' | 'ctrader' | 'settings';
+export type TabKey = 'dashboard' | 'reminders' | 'notes' | 'phones' | 'finance' | 'ctrader' | 'ibkr' | 'settings';
+
+export interface IbkrEquitySnapshot {
+  report_date: string;
+  currency: string;
+  total_nav: number;
+  total_cash: number;
+  stock_value: number;
+  options_value: number;
+  futures_value: number;
+  other_value: number;
+  accrued_interest: number;
+  dividend_accruals: number;
+  day_change: number;
+  day_change_pct: number;
+}
+
+export interface IbkrDailyTradeSummary {
+  trade_date: string;
+  trade_count: number;
+  buy_count: number;
+  sell_count: number;
+  realized_pnl: number;
+  commission: number;
+  net_pnl: number;
+  turnover: number;
+  symbols: string[];
+}
+
+export interface IbkrPosition {
+  account_id: string;
+  report_date: string;
+  conid: string;
+  symbol: string;
+  asset_category: string;
+  description: string;
+  currency: string;
+  fx_rate_to_base: number;
+  position: number;
+  mark_price: number;
+  position_value: number;
+  position_value_base: number;
+  open_price: number;
+  cost_basis: number;
+  unrealized_pnl: number;
+  unrealized_pnl_base: number;
+  side: string;
+  expiry: string;
+  strike: string;
+  put_call: string;
+  multiplier: number;
+}
+
+export interface IbkrTrade {
+  trade_key: string;
+  account_id: string;
+  trade_id: string;
+  order_id: string;
+  symbol: string;
+  asset_category: string;
+  description: string;
+  currency: string;
+  side: string;
+  open_close: string;
+  quantity: number;
+  trade_price: number;
+  proceeds_base: number;
+  commission_base: number;
+  realized_pnl_base: number;
+  trade_date: string;
+  trade_time: string;
+  executed_at: string;
+}
+
+export interface IbkrCashTransaction {
+  tx_key: string;
+  account_id: string;
+  tx_type: string;
+  symbol: string;
+  description: string;
+  currency: string;
+  amount: number;
+  amount_base: number;
+  report_date: string;
+  date_time: string;
+}
+
+export interface IbkrOverviewResponse {
+  summary: {
+    configured: boolean;
+    base_currency: string;
+    latest_report_date: string;
+    total_nav: number;
+    total_cash: number;
+    stock_value: number;
+    options_value: number;
+    futures_value: number;
+    other_value: number;
+    day_change: number;
+    day_change_pct: number;
+    unrealized_pnl: number;
+    total_realized_pnl: number;
+    total_commission: number;
+    total_net_pnl: number;
+    total_dividends: number;
+    latest_day_trade_count: number;
+    latest_day_net_pnl: number;
+    account_count: number;
+    position_count: number;
+    trade_count: number;
+  };
+  accounts: string[];
+  daily_equity: IbkrEquitySnapshot[];
+  daily_trades: IbkrDailyTradeSummary[];
+  positions: IbkrPosition[];
+  trades: IbkrTrade[];
+  cash_transactions: IbkrCashTransaction[];
+  sync_status: {
+    running: boolean;
+    phase: string;
+    last_sync_at: string;
+    last_error: string | null;
+  };
+}
 
 export interface CTraderDeal {
   deal_id: string;

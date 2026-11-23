@@ -426,6 +426,25 @@ export const api = {
     request<{ ok: boolean; status: import('./types').CTraderMarketStatus }>('/api/ctrader/market/restart', {
       method: 'POST',
     }),
+  getIbkrOverview: (accountId = '') =>
+    request<import('./types').IbkrOverviewResponse>(
+      `/api/ibkr/overview${accountId ? `?account_id=${encodeURIComponent(accountId)}` : ''}`,
+    ),
+  syncIbkrFlex: (options?: { query_id?: string; push_summary?: boolean }) =>
+    request<{
+      ok: boolean;
+      accounts: string[];
+      equity_snapshots: number;
+      positions: number;
+      trades_inserted: number;
+      trades_updated: number;
+      cash_transactions: number;
+      synced_at: string;
+    }>('/api/ibkr/sync', {
+      method: 'POST',
+      body: JSON.stringify(options || {}),
+    }),
+  testIbkr: () => request<{ ok: boolean; accounts: string[]; message: string }>('/api/ibkr/test', { method: 'POST' }),
   resetData: (reseed = false) =>
     request<{ ok: boolean; reseeded: boolean }>(`/api/settings/reset-data?reseed=${reseed}`, { method: 'POST' }),
 };

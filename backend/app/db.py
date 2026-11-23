@@ -79,6 +79,13 @@ DEFAULT_SETTINGS: Dict[str, str] = {
     "ctrader_market_enabled": "1",
     "ctrader_market_symbols": "XAUUSD,EURUSD",
     "ctrader_market_api_token": "",
+    "ibkr_flex_token": "",
+    "ibkr_flex_query_id": "",
+    "ibkr_auto_sync_enabled": "0",
+    "ibkr_sync_interval_min": "360",
+    "ibkr_bark_daily_summary": "0",
+    "ibkr_proxy_url": "",
+    "ibkr_last_notified_date": "",
 }
 
 
@@ -209,6 +216,97 @@ def init_db(seed_demo: bool = True) -> None:
                 account_balance REAL NOT NULL DEFAULT 0,
                 pushed_at TEXT DEFAULT '',
                 raw_json TEXT DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS ibkr_equity_snapshots (
+                account_id TEXT NOT NULL,
+                report_date TEXT NOT NULL,
+                currency TEXT NOT NULL DEFAULT 'USD',
+                total_nav REAL NOT NULL DEFAULT 0,
+                total_cash REAL NOT NULL DEFAULT 0,
+                stock_value REAL NOT NULL DEFAULT 0,
+                options_value REAL NOT NULL DEFAULT 0,
+                futures_value REAL NOT NULL DEFAULT 0,
+                other_value REAL NOT NULL DEFAULT 0,
+                starting_cash REAL NOT NULL DEFAULT 0,
+                accrued_interest REAL NOT NULL DEFAULT 0,
+                dividend_accruals REAL NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (account_id, report_date)
+            );
+
+            CREATE TABLE IF NOT EXISTS ibkr_positions (
+                account_id TEXT NOT NULL,
+                report_date TEXT NOT NULL DEFAULT '',
+                conid TEXT NOT NULL,
+                symbol TEXT NOT NULL DEFAULT '',
+                asset_category TEXT NOT NULL DEFAULT 'STK',
+                description TEXT DEFAULT '',
+                currency TEXT NOT NULL DEFAULT 'USD',
+                fx_rate_to_base REAL NOT NULL DEFAULT 1,
+                position REAL NOT NULL DEFAULT 0,
+                mark_price REAL NOT NULL DEFAULT 0,
+                position_value REAL NOT NULL DEFAULT 0,
+                position_value_base REAL NOT NULL DEFAULT 0,
+                open_price REAL NOT NULL DEFAULT 0,
+                cost_basis REAL NOT NULL DEFAULT 0,
+                unrealized_pnl REAL NOT NULL DEFAULT 0,
+                unrealized_pnl_base REAL NOT NULL DEFAULT 0,
+                side TEXT DEFAULT '',
+                expiry TEXT DEFAULT '',
+                strike TEXT DEFAULT '',
+                put_call TEXT DEFAULT '',
+                multiplier REAL NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (account_id, conid)
+            );
+
+            CREATE TABLE IF NOT EXISTS ibkr_trades (
+                trade_key TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                trade_id TEXT DEFAULT '',
+                order_id TEXT DEFAULT '',
+                conid TEXT DEFAULT '',
+                symbol TEXT NOT NULL DEFAULT '',
+                asset_category TEXT NOT NULL DEFAULT 'STK',
+                description TEXT DEFAULT '',
+                currency TEXT NOT NULL DEFAULT 'USD',
+                fx_rate_to_base REAL NOT NULL DEFAULT 1,
+                side TEXT DEFAULT '',
+                open_close TEXT DEFAULT '',
+                quantity REAL NOT NULL DEFAULT 0,
+                trade_price REAL NOT NULL DEFAULT 0,
+                proceeds REAL NOT NULL DEFAULT 0,
+                proceeds_base REAL NOT NULL DEFAULT 0,
+                commission REAL NOT NULL DEFAULT 0,
+                commission_base REAL NOT NULL DEFAULT 0,
+                realized_pnl REAL NOT NULL DEFAULT 0,
+                realized_pnl_base REAL NOT NULL DEFAULT 0,
+                trade_date TEXT NOT NULL DEFAULT '',
+                trade_time TEXT DEFAULT '',
+                report_date TEXT NOT NULL DEFAULT '',
+                executed_at TEXT NOT NULL DEFAULT '',
+                expiry TEXT DEFAULT '',
+                strike TEXT DEFAULT '',
+                put_call TEXT DEFAULT '',
+                multiplier REAL NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS ibkr_cash_transactions (
+                tx_key TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                transaction_id TEXT DEFAULT '',
+                tx_type TEXT DEFAULT '',
+                symbol TEXT DEFAULT '',
+                description TEXT DEFAULT '',
+                currency TEXT NOT NULL DEFAULT 'USD',
+                fx_rate_to_base REAL NOT NULL DEFAULT 1,
+                amount REAL NOT NULL DEFAULT 0,
+                amount_base REAL NOT NULL DEFAULT 0,
+                report_date TEXT NOT NULL DEFAULT '',
+                date_time TEXT DEFAULT '',
                 created_at TEXT NOT NULL
             );
 

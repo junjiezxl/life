@@ -1401,6 +1401,119 @@ class TestLifeHubAPI(unittest.TestCase):
 
         update_settings({"bark_enabled": "0", "bark_device_key": ""})
 
+    def test_20_ibkr_flex_sync_and_daily_overview(self):
+        from unittest.mock import patch
+        from app.db import get_conn, update_settings
+
+        with get_conn() as conn:
+            conn.execute("DELETE FROM ibkr_equity_snapshots")
+            conn.execute("DELETE FROM ibkr_positions")
+            conn.execute("DELETE FROM ibkr_trades")
+            conn.execute("DELETE FROM ibkr_cash_transactions")
+
+        update_settings(
+            {
+                "ibkr_flex_token": "flex_tok_123",
+                "ibkr_flex_query_id": "998877",
+                "ibkr_bark_daily_summary": "0",
+            }
+        )
+
+        sample_flex_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<FlexQueryResponse queryName="DailyActivity" type="AF">
+  <FlexStatements count="1">
+    <FlexStatement accountId="U1234567" fromDate="20261121" toDate="20261123" whenGenerated="20261123;220000">
+      <EquitySummaryInBase>
+        <EquitySummaryByReportDateInBase accountId="U1234567" currency="USD" reportDate="20261122" totalCash="10000.00" stock="20000.00" options="500.00" />
+        <EquitySummaryByReportDateInBase accountId="U1234567" currency="USD" reportDate="20261123" totalCash="10500.00" stock="20800.00" options="700.00" />
+      </EquitySummaryInBase>
+      <OpenPositions>
+        <OpenPosition accountId="U1234567" levelOfDetail="SUMMARY" symbol="NVDA" conid="4815747" assetCategory="STK" description="NVIDIA CORP" currency="USD" fxRateToBase="1" position="100" markPrice="148.00" positionValue="14800.00" openPrice="140.00" costBasis="14000.00" fifoPnlUnrealized="800.00" side="Long" reportDate="20261123" />
+        <OpenPosition accountId="U1234567" levelOfDetail="LOT" symbol="NVDA" conid="4815747" assetCategory="STK" currency="USD" fxRateToBase="1" position="50" markPrice="148.00" positionValue="7400.00" openPrice="138.00" costBasis="6900.00" fifoPnlUnrealized="500.00" side="Long" reportDate="20261123" />
+      </OpenPositions>
+      <Trades>
+        <Trade accountId="U1234567" levelOfDetail="ORDER" symbol="AAPL" conid="265598" assetCategory="STK" currency="USD" fxRateToBase="1" buySell="SELL" quantity="-10" tradePrice="230.00" proceeds="2300.00" ibCommission="-1.00" fifoPnlRealized="150.00" tradeDate="20261123" tradeTime="100500" orderID="55501" />
+        <Trade accountId="U1234567" levelOfDetail="EXECUTION" symbol="AAPL" conid="265598" assetCategory="STK" currency="USD" fxRateToBase="1" buySell="SELL" openCloseIndicator="C" quantity="-10" tradePrice="230.00" proceeds="2300.00" ibCommission="-1.00" fifoPnlRealized="150.00" tradeDate="20261123" tradeTime="100501" tradeID="88801" ibOrderID="55501" />
+        <Trade accountId="U1234567" levelOfDetail="EXECUTION" symbol="MSFT" conid="272093" assetCategory="STK" currency="USD" fxRateToBase="1" buySell="BUY" openCloseIndicator="O" quantity="5" tradePrice="420.00" proceeds="-2100.00" ibCommission="-1.05" fifoPnlRealized="0" tradeDate="20261122" tradeTime="151000" tradeID="88802" ibOrderID="55502" />
+      </Trades>
+      <CashTransactions>
+        <CashTransaction accountId="U1234567" transactionID="CT901" type="Dividends" symbol="AAPL" description="AAPL CASH DIVIDEND" currency="USD" fxRateToBase="1" amount="25.50" reportDate="20261123" />
+      </CashTransactions>
+    </FlexStatement>
+  </FlexStatements>
+</FlexQueryResponse>"""
+
+        req_urls = []
+        get_stmt_calls = 0
+
+        class _MockFlexResp:
+            def __init__(self, text):
+                self.text = text
+                self.status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+        class _MockFlexClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, url, params=None):
+                nonlocal get_stmt_calls
+                req_urls.append((url, dict(params or {})))
+                if "SendRequest" in url:
+                    return _MockFlexResp(
+                        "<FlexStatementResponse><Status>Success</Status><ReferenceCode>REF777</ReferenceCode>"
+                        "<Url>https://gdcdyn.interactivebrokers.com/Universal/servlet/FlexStatementService.GetStatement</Url>"
+                        "</FlexStatementResponse>"
+                    )
+                get_stmt_calls += 1
+                if get_stmt_calls == 1:
+                    return _MockFlexResp(
+                        "<FlexStatementResponse><Status>Warn</Status><ErrorCode>1019</ErrorCode>"
+                        "<ErrorMessage>Statement generation in progress.</ErrorMessage></FlexStatementResponse>"
+                    )
+                return _MockFlexResp(sample_flex_xml)
+
+        with (
+            patch("app.services.ibkr_service.httpx.AsyncClient", _MockFlexClient),
+            patch("app.services.ibkr_service.asyncio.sleep", return_value=None),
+        ):
+            sync_resp = self.client.post("/api/ibkr/sync", json={})
+
+        self.assertEqual(sync_resp.status_code, 200, sync_resp.text)
+        sr = sync_resp.json()
+        self.assertTrue(sr["ok"])
+        self.assertEqual(sr["accounts"], ["U1234567"])
+        self.assertEqual(sr["equity_snapshots"], 2)
+        self.assertEqual(sr["positions"], 1)  # SUMMARY only, LOT skipped
+        self.assertEqual(sr["trades_inserted"], 2)  # EXECUTION only, ORDER skipped
+        self.assertEqual(sr["cash_transactions"], 1)
+
+        ov = self.client.get("/api/ibkr/overview")
+        self.assertEqual(ov.status_code, 200)
+        body = ov.json()
+        s = body["summary"]
+        self.assertEqual(s["latest_report_date"], "2026-11-23")
+        self.assertEqual(s["total_nav"], 32000.0)
+        self.assertEqual(s["day_change"], 1500.0)
+        self.assertAlmostEqual(s["day_change_pct"], 4.92, places=2)
+        self.assertEqual(s["unrealized_pnl"], 800.0)
+        self.assertEqual(s["total_realized_pnl"], 150.0)
+        self.assertEqual(s["total_commission"], -2.05)
+        self.assertEqual(s["total_net_pnl"], 147.95)
+        self.assertEqual(s["total_dividends"], 25.5)
+        self.assertEqual(len(body["daily_equity"]), 2)
+        self.assertEqual(len(body["daily_trades"]), 2)
+        self.assertEqual(body["daily_trades"][0]["trade_date"], "2026-11-23")
+        self.assertEqual(body["daily_trades"][0]["net_pnl"], 149.0)
+
 
 if __name__ == "__main__":
     unittest.main()

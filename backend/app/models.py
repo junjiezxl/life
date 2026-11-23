@@ -204,6 +204,17 @@ class SettingsUpdateRequest(BaseModel):
     ctrader_market_enabled: Optional[str] = None
     ctrader_market_symbols: Optional[str] = None
     ctrader_market_api_token: Optional[str] = None
+    ibkr_flex_token: Optional[str] = None
+    ibkr_flex_query_id: Optional[str] = None
+    ibkr_auto_sync_enabled: Optional[str] = None
+    ibkr_sync_interval_min: Optional[str] = None
+    ibkr_bark_daily_summary: Optional[str] = None
+    ibkr_proxy_url: Optional[str] = None
+
+
+class IBKRSyncRequest(BaseModel):
+    query_id: Optional[str] = None
+    push_summary: Optional[bool] = None
 
 
 class CTraderSyncRequest(BaseModel):

@@ -27,6 +27,7 @@ export const SettingsView: React.FC<Props> = ({
   const [emailTestResult, setEmailTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [barkTestResult, setBarkTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [ctraderTestResult, setCtraderTestResult] = useState<{ ok: boolean; message: string } | null>(null);
+  const [ibkrTestResult, setIbkrTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [ctraderOAuthScope, setCtraderOAuthScope] = useState<'accounts' | 'trading'>('accounts');
   const [ctraderOAuthCode, setCtraderOAuthCode] = useState('');
   const [ctraderRefreshing, setCtraderRefreshing] = useState(false);
@@ -113,6 +114,20 @@ export const SettingsView: React.FC<Props> = ({
       setCtraderTestResult({
         ok: false,
         message: err instanceof Error ? err.message : 'cTrader 连接失败',
+      });
+    }
+  };
+
+  const handleTestIbkr = async () => {
+    await api.updateSettings(settings);
+    setIbkrTestResult(null);
+    try {
+      const res = await api.testIbkr();
+      setIbkrTestResult({ ok: res.ok, message: res.message });
+    } catch (err) {
+      setIbkrTestResult({
+        ok: false,
+        message: err instanceof Error ? err.message : 'IBKR Flex 连接失败',
       });
     }
   };
@@ -1019,6 +1034,98 @@ export const SettingsView: React.FC<Props> = ({
           >
             {ctraderTestResult.ok ? <CheckCircle2 className="h-4 w-4" /> : <XCircle className="h-4 w-4" />}
             <span>{ctraderTestResult.message}</span>
+          </div>
+        )}
+      </div>
+
+      {/* IBKR Flex Web Service */}
+      <div className="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-xs space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h3 className="text-sm font-semibold text-slate-900">盈透证券 (IBKR) Flex Web Service 配置（每日汇总）</h3>
+            <p className="text-xs text-slate-500">
+              免挂机与二次验证，通过官方 Flex Token + Query ID 定时拉取每日净值、持仓、成交与分红报表。
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={handleTestIbkr}
+            className="rounded-xl border border-blue-200 bg-blue-50 px-3.5 py-1.5 text-xs font-medium text-blue-700 hover:bg-blue-100 cursor-pointer"
+          >
+            测试 Flex 拉取
+          </button>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-6 text-xs text-slate-700">
+          <label className="inline-flex items-center gap-2 font-medium cursor-pointer">
+            <input
+              type="checkbox"
+              checked={settings.ibkr_auto_sync_enabled === '1'}
+              onChange={(e) => updateField('ibkr_auto_sync_enabled', e.target.checked ? '1' : '0')}
+            />
+            <span>开启后台定时自动拉取 Flex 报表</span>
+          </label>
+          <label className="inline-flex items-center gap-2 font-medium cursor-pointer">
+            <input
+              type="checkbox"
+              checked={settings.ibkr_bark_daily_summary === '1'}
+              onChange={(e) => updateField('ibkr_bark_daily_summary', e.target.checked ? '1' : '0')}
+            />
+            <span>出现新报告日时通过 Bark 发送每日净值汇总</span>
+          </label>
+        </div>
+
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+          <div>
+            <label className="mb-1 block text-xs font-medium text-slate-600">Flex Token</label>
+            <input
+              type="password"
+              value={settings.ibkr_flex_token || ''}
+              onChange={(e) => updateField('ibkr_flex_token', e.target.value)}
+              placeholder="IBKR Client Portal 中生成的 Flex Web Service Token"
+              className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-500"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs font-medium text-slate-600">Activity Flex Query ID</label>
+            <input
+              type="text"
+              value={settings.ibkr_flex_query_id || ''}
+              onChange={(e) => updateField('ibkr_flex_query_id', e.target.value)}
+              placeholder="例如 1048293"
+              className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-500"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs font-medium text-slate-600">自动拉取间隔（分钟）</label>
+            <input
+              type="number"
+              min={15}
+              value={settings.ibkr_sync_interval_min || '360'}
+              onChange={(e) => updateField('ibkr_sync_interval_min', e.target.value)}
+              className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-500"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs font-medium text-slate-600">出站代理（可选，留空直连）</label>
+            <input
+              type="text"
+              value={settings.ibkr_proxy_url || ''}
+              onChange={(e) => updateField('ibkr_proxy_url', e.target.value)}
+              placeholder="例如 http://10.0.0.x:7890"
+              className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-500"
+            />
+          </div>
+        </div>
+
+        {ibkrTestResult && (
+          <div
+            className={`flex items-center gap-2 rounded-xl px-4 py-2.5 text-xs ${
+              ibkrTestResult.ok ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-700'
+            }`}
+          >
+            {ibkrTestResult.ok ? <CheckCircle2 className="h-4 w-4" /> : <XCircle className="h-4 w-4" />}
+            <span>{ibkrTestResult.message}</span>
           </div>
         )}
       </div>
