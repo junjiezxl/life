@@ -11,6 +11,7 @@ import asyncio
 import datetime
 import json
 import logging
+import re
 import ssl
 import struct
 import time
@@ -159,6 +160,7 @@ class _CTraderAsyncClient:
         self._heartbeat_task: Optional[asyncio.Task] = None
         self.ctid_trader_account_id: Optional[int] = None
         self._last_history_req_at: float = 0.0
+        self._order_risk_cache: Dict[str, Tuple[float, float]] = {}
 
     async def __aenter__(self) -> "_CTraderAsyncClient":
         ssl_ctx = ssl.create_default_context()
@@ -346,6 +348,33 @@ class _CTraderAsyncClient:
             logger.warning("Failed to fetch symbol lot sizes, using fallback defaults: %s", exc)
         return lot_sizes
 
+    @staticmethod
+    def _extract_order_sl_tp(order_obj: Any, fallback_price: float = 0.0) -> Tuple[float, float]:
+        if order_obj is None:
+            return 0.0, 0.0
+        sl = float(getattr(order_obj, "stopLoss", 0) or 0)
+        tp = float(getattr(order_obj, "takeProfit", 0) or 0)
+        exec_px = float(getattr(order_obj, "executionPrice", 0) or fallback_price or 0)
+        trade_data = getattr(order_obj, "tradeData", None)
+        side_val = int(getattr(trade_data, "tradeSide", 0) or 0) if trade_data else 0
+        if sl <= 0 and exec_px > 0:
+            rel_sl = int(getattr(order_obj, "relativeStopLoss", 0) or 0)
+            if rel_sl > 0:
+                dist = rel_sl / 100000.0
+                if side_val == 1:
+                    sl = round(max(0.0, exec_px - dist), 5)
+                elif side_val == 2:
+                    sl = round(exec_px + dist, 5)
+        if tp <= 0 and exec_px > 0:
+            rel_tp = int(getattr(order_obj, "relativeTakeProfit", 0) or 0)
+            if rel_tp > 0:
+                dist = rel_tp / 100000.0
+                if side_val == 1:
+                    tp = round(exec_px + dist, 5)
+                elif side_val == 2:
+                    tp = round(max(0.0, exec_px - dist), 5)
+        return (round(sl, 5) if sl > 0 else 0.0), (round(tp, 5) if tp > 0 else 0.0)
+
     async def fetch_order_labels(
         self,
         order_ids: List[int],
@@ -368,11 +397,73 @@ class _CTraderAsyncClient:
                 label = str(getattr(trade_data, "label", "") or "").strip()
                 comment = str(getattr(trade_data, "comment", "") or "").strip()
                 result[str(oid)] = (label, comment)
+                sl, tp = self._extract_order_sl_tp(order_obj)
+                if sl > 0 or tp > 0:
+                    self._order_risk_cache[str(oid)] = (sl, tp)
             except Exception as exc:
                 logger.debug("Order details unavailable for order %s: %s", oid, exc)
             if progress_cb:
                 progress_cb(idx, total)
         return result
+
+    async def fetch_reconcile_state(self) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        """Fetch live open positions & pending orders (SL/TP & labels) via ProtoOAReconcileReq."""
+        assert self.ctid_trader_account_id is not None
+        positions: Dict[str, Dict[str, Any]] = {}
+        orders: Dict[str, Dict[str, Any]] = {}
+        try:
+            await self._throttle_history()
+            req = self.oa_msgs.ProtoOAReconcileReq()
+            req.ctidTraderAccountId = self.ctid_trader_account_id
+            proto = await self._send_req(req, timeout=12.0)
+            res = self.oa_msgs.ProtoOAReconcileRes()
+            res.ParseFromString(proto.payload)
+            for p in getattr(res, "position", []):
+                pid = str(getattr(p, "positionId", "") or "")
+                if not pid:
+                    continue
+                td = getattr(p, "tradeData", None)
+                positions[pid] = {
+                    "stop_loss": round(float(getattr(p, "stopLoss", 0) or 0), 5),
+                    "take_profit": round(float(getattr(p, "takeProfit", 0) or 0), 5),
+                    "label": str(getattr(td, "label", "") or "").strip() if td else "",
+                    "comment": str(getattr(td, "comment", "") or "").strip() if td else "",
+                }
+            for o in getattr(res, "order", []):
+                oid = str(getattr(o, "orderId", "") or "")
+                if not oid:
+                    continue
+                td = getattr(o, "tradeData", None)
+                sl, tp = self._extract_order_sl_tp(o)
+                orders[oid] = {
+                    "stop_loss": sl,
+                    "take_profit": tp,
+                    "label": str(getattr(td, "label", "") or "").strip() if td else "",
+                    "comment": str(getattr(td, "comment", "") or "").strip() if td else "",
+                }
+        except Exception as exc:
+            logger.debug("ProtoOAReconcileReq failed: %s", exc)
+        return {"positions": positions, "orders": orders}
+
+    async def fetch_trader_balance(self) -> float:
+        """Fetch current account balance via ProtoOATraderReq."""
+        assert self.ctid_trader_account_id is not None
+        try:
+            await self._throttle_history()
+            req = self.oa_msgs.ProtoOATraderReq()
+            req.ctidTraderAccountId = self.ctid_trader_account_id
+            proto = await self._send_req(req, timeout=10.0)
+            res = self.oa_msgs.ProtoOATraderRes()
+            res.ParseFromString(proto.payload)
+            trader = getattr(res, "trader", None)
+            if trader is None:
+                return 0.0
+            digits = int(getattr(trader, "moneyDigits", 2) or 2)
+            bal_raw = int(getattr(trader, "balance", 0) or 0)
+            return round(bal_raw / float(10 ** digits), 2) if bal_raw > 0 else 0.0
+        except Exception as exc:
+            logger.debug("ProtoOATraderReq failed: %s", exc)
+            return 0.0
 
     async def _fetch_deals_range(self, from_ms: int, to_ms: int) -> List[Any]:
         assert self.ctid_trader_account_id is not None
@@ -459,6 +550,7 @@ class _CTraderAsyncClient:
             fee = 0.0
             is_closing = 1 if close_detail is not None else 0
             entry_price = 0.0
+            account_balance = 0.0
             commission = float(getattr(d, "commission", 0) or 0) / scale
             if close_detail is not None:
                 close_digits = int(getattr(close_detail, "moneyDigits", 0) or money_digits)
@@ -468,6 +560,9 @@ class _CTraderAsyncClient:
                 commission = float(getattr(close_detail, "commission", 0) or 0) / close_scale
                 fee = abs(float(getattr(close_detail, "pnlConversionFee", 0) or 0)) / close_scale
                 entry_price = float(getattr(close_detail, "entryPrice", 0) or 0)
+                bal_raw = int(getattr(close_detail, "balance", 0) or 0)
+                if bal_raw > 0:
+                    account_balance = round(bal_raw / close_scale, 2)
 
             net_profit = gross + swap + commission - fee
             exec_ms = int(getattr(d, "executionTimestamp", 0) or 0)
@@ -510,6 +605,9 @@ class _CTraderAsyncClient:
                     "execution_ms": exec_ms,
                     "is_closing": is_closing,
                     "entry_price": round(entry_price, 6) if entry_price else 0.0,
+                    "stop_loss": 0.0,
+                    "take_profit": 0.0,
+                    "account_balance": account_balance,
                     "raw_json": json.dumps(
                         {
                             "dealId": str(d.dealId),
@@ -638,6 +736,9 @@ def _upsert_deals(deals: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], in
             exec_ms = int(d.get("execution_ms") or _iso_to_ms(d.get("executed_at", "")))
             is_closing = int(d.get("is_closing") or 0)
             entry_price = float(d.get("entry_price") or 0.0)
+            stop_loss = float(d.get("stop_loss") or 0.0)
+            take_profit = float(d.get("take_profit") or 0.0)
+            account_balance = float(d.get("account_balance") or 0.0)
             if existing:
                 conn.execute(
                     """
@@ -651,6 +752,9 @@ def _upsert_deals(deals: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], in
                         execution_ms = CASE WHEN ? > 0 THEN ? ELSE execution_ms END,
                         is_closing = ?,
                         entry_price = CASE WHEN ? > 0 THEN ? ELSE entry_price END,
+                        stop_loss = CASE WHEN ? > 0 THEN ? ELSE stop_loss END,
+                        take_profit = CASE WHEN ? > 0 THEN ? ELSE take_profit END,
+                        account_balance = CASE WHEN ? > 0 THEN ? ELSE account_balance END,
                         raw_json = ?
                     WHERE deal_id = ?
                     """,
@@ -674,6 +778,12 @@ def _upsert_deals(deals: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], in
                         is_closing,
                         entry_price,
                         entry_price,
+                        stop_loss,
+                        stop_loss,
+                        take_profit,
+                        take_profit,
+                        account_balance,
+                        account_balance,
                         d["raw_json"],
                         d["deal_id"],
                     ),
@@ -686,8 +796,8 @@ def _upsert_deals(deals: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], in
                         deal_id, order_id, position_id, account_id, symbol_id, symbol_name,
                         side, volume, price, commission, swap, gross_profit, net_profit,
                         status, label, comment, executed_at, execution_ms, is_closing, entry_price,
-                        pushed_at, raw_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
+                        stop_loss, take_profit, account_balance, pushed_at, raw_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
                     """,
                     (
                         d["deal_id"],
@@ -710,6 +820,9 @@ def _upsert_deals(deals: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], in
                         exec_ms,
                         is_closing,
                         entry_price,
+                        stop_loss,
+                        take_profit,
+                        account_balance,
                         d["raw_json"],
                         now_str,
                     ),
@@ -750,6 +863,169 @@ def _update_order_labels_in_db(order_meta: Dict[str, Tuple[str, str]]) -> None:
                     "UPDATE ctrader_deals SET label = ?, comment = CASE WHEN ? != '' THEN ? ELSE comment END WHERE position_id = ? AND label = ''",
                     (lbl, cmt, cmt, pid),
                 )
+
+
+def _update_deal_risk_and_balance_in_db(deals: List[Dict[str, Any]]) -> None:
+    if not deals:
+        return
+    with get_conn() as conn:
+        for d in deals:
+            sl = float(d.get("stop_loss") or 0.0)
+            tp = float(d.get("take_profit") or 0.0)
+            bal = float(d.get("account_balance") or 0.0)
+            if sl <= 0 and tp <= 0 and bal <= 0:
+                continue
+            conn.execute(
+                """
+                UPDATE ctrader_deals
+                SET stop_loss = CASE WHEN ? > 0 THEN ? ELSE stop_loss END,
+                    take_profit = CASE WHEN ? > 0 THEN ? ELSE take_profit END,
+                    account_balance = CASE WHEN ? > 0 THEN ? ELSE account_balance END
+                WHERE deal_id = ?
+                """,
+                (sl, sl, tp, tp, bal, bal, d["deal_id"]),
+            )
+
+
+_CST_TZ = datetime.timezone(datetime.timedelta(hours=8))
+
+
+def _format_strategy_label(label: str) -> str:
+    raw = (label or "").strip()
+    if not raw:
+        return "手动订单"
+    m_gl = re.match(r"^GL(\d{3,6})(?:\b|\.)", raw, re.IGNORECASE)
+    if m_gl:
+        return f"Gold{m_gl.group(1)}"
+    m_gold_guid = re.match(r"^(Gold\d+)\.[0-9a-fA-F-]+$", raw, re.IGNORECASE)
+    if m_gold_guid:
+        return m_gold_guid.group(1)
+    m_guid = re.match(r"^([A-Za-z0-9_-]+)\.[0-9a-fA-F]{6,}(?:-[0-9a-fA-F-]+)*$", raw)
+    if m_guid:
+        return m_guid.group(1)
+    return raw
+
+
+def _format_beijing_time(executed_at: str, execution_ms: int = 0) -> str:
+    if execution_ms and execution_ms > 0:
+        dt = datetime.datetime.fromtimestamp(execution_ms / 1000.0, tz=datetime.timezone.utc).astimezone(_CST_TZ)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    raw = (executed_at or "").strip()
+    if raw:
+        try:
+            dt = datetime.datetime.fromisoformat(raw)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_CST_TZ)
+            else:
+                dt = dt.astimezone(_CST_TZ)
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return raw.replace("T", " ")[:19]
+    return datetime.datetime.now(_CST_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _format_quote_price(value: float, symbol_name: str) -> str:
+    sym = (symbol_name or "").upper()
+    if any(k in sym for k in ("XAU", "GOLD", "XAG", "SILVER", "BTC", "ETH", "US30", "NAS", "SPX", "US500")) or value >= 200:
+        return f"${value:,.2f}"
+    if "JPY" in sym:
+        return f"{value:,.3f}"
+    if 0 < value < 20:
+        return f"{value:.5f}"
+    return f"${value:,.2f}"
+
+
+def _format_title_pnl(value: float) -> str:
+    if value >= 0:
+        return f"+${value:,.2f}"
+    return f"-${abs(value):,.2f}"
+
+
+def _format_body_usd(value: float, *, show_plus: bool = False) -> str:
+    if value < 0:
+        return f"$-{abs(value):,.2f}"
+    if show_plus:
+        return f"+${value:,.2f}"
+    return f"${value:,.2f}"
+
+
+def _format_lots(volume: float) -> str:
+    if volume <= 0:
+        return "0"
+    txt = f"{volume:.4f}".rstrip("0").rstrip(".")
+    return txt or "0"
+
+
+def format_ctrader_deal_bark_message(deal: Dict[str, Any]) -> Tuple[str, str]:
+    strategy = _format_strategy_label(str(deal.get("label") or ""))
+    sym = str(deal.get("symbol_name") or "").upper() or "XAUUSD"
+    side = str(deal.get("side") or "").upper()
+    price = float(deal.get("price") or 0.0)
+    vol_text = _format_lots(float(deal.get("volume") or 0.0))
+    beijing_time = _format_beijing_time(
+        str(deal.get("executed_at") or ""),
+        int(deal.get("execution_ms") or 0),
+    )
+
+    is_closing = int(deal.get("is_closing") or 0) == 1
+    if is_closing:
+        net = round(float(deal.get("net_profit") or 0.0), 2)
+        gross = round(float(deal.get("gross_profit") or 0.0), 2)
+        fee_total = round(net - gross, 2)
+        is_loss = net < 0
+        title_prefix = "🔻【平仓亏损】" if is_loss else "💰【平仓盈利】"
+        title = f"{title_prefix}{strategy} {_format_title_pnl(net)}"
+
+        bal = float(deal.get("account_balance") or 0.0)
+        bal_text = f"${bal:,.2f}" if bal > 0 else "--"
+        close_action = "平多 (SELL)" if side == "SELL" else ("平空 (BUY)" if side == "BUY" else side)
+        pid = str(deal.get("position_id") or deal.get("order_id") or deal.get("deal_id") or "").strip()
+
+        lines = [
+            f"• 策略模型：{strategy}",
+            f"• 结算净利：{_format_body_usd(net, show_plus=not is_loss)} (毛利：{_format_body_usd(gross)}，费用：{_format_body_usd(fee_total)})",
+            f"• 账户余额：{bal_text}",
+            f"• 平仓动作：{close_action}",
+            f"• 平仓价格：{_format_quote_price(price, sym)}",
+            f"• 成交手数：{vol_text} 手 ({sym})",
+            f"• 持仓编号：#{pid}",
+            f"• 北京时间：{beijing_time}",
+        ]
+        return title, "\n".join(lines)
+
+    side_icon = "🟢" if side == "BUY" else ("🔴" if side == "SELL" else "⚪")
+    side_cn = "做多 (BUY)" if side == "BUY" else ("做空 (SELL)" if side == "SELL" else side)
+    title = f"{side_icon}【开仓提醒】{strategy} {side} {sym}"
+
+    sl = float(deal.get("stop_loss") or 0.0)
+    tp = float(deal.get("take_profit") or 0.0)
+    sl_text = (
+        f"{_format_quote_price(sl, sym)} (距开仓 {_format_quote_price(abs(price - sl), sym)})"
+        if sl > 0 and price > 0
+        else "未设置"
+    )
+    tp_text = (
+        f"{_format_quote_price(tp, sym)} (距开仓 {_format_quote_price(abs(tp - price), sym)})"
+        if tp > 0 and price > 0
+        else "未设置"
+    )
+
+    oid = str(deal.get("order_id") or "").strip()
+    pid = str(deal.get("position_id") or "").strip()
+    id_parts = [f"#{x}" for x in (oid, pid) if x]
+    id_text = " / ".join(id_parts) if id_parts else f"#{deal.get('deal_id', '')}"
+
+    lines = [
+        f"• 策略模型：{strategy}",
+        f"• 交易方向：{side_cn}",
+        f"• 开仓价格：{_format_quote_price(price, sym)}",
+        f"• 止损价格：{sl_text}",
+        f"• 止盈价格：{tp_text}",
+        f"• 成交手数：{vol_text} 手 ({sym})",
+        f"• 订单/持仓：{id_text}",
+        f"• 北京时间：{beijing_time}",
+    ]
+    return title, "\n".join(lines)
 
 
 async def _connect_with_auto_refresh(cfg: Dict[str, str]):
@@ -894,13 +1170,84 @@ async def sync_ctrader_deals(
 
                         batch_meta = await client.fetch_order_labels(batch, progress_cb=on_label_progress)
                         _update_order_labels_in_db(batch_meta)
+                        risk_cache = getattr(client, "_order_risk_cache", {})
                         for d in deals:
                             oid = d.get("order_id") or ""
                             if oid in batch_meta and not (d.get("label") or "").strip():
                                 d["label"], d["comment"] = batch_meta[oid]
+                            if oid in risk_cache:
+                                r_sl, r_tp = risk_cache[oid]
+                                if r_sl > 0 and float(d.get("stop_loss") or 0) <= 0:
+                                    d["stop_loss"] = r_sl
+                                if r_tp > 0 and float(d.get("take_profit") or 0) <= 0:
+                                    d["take_profit"] = r_tp
                         done_count += len(batch)
                         _sync_state["labels_done"] = done_count
                     _apply_position_label_inheritance(deals)
+
+                if should_push and inserted_deals:
+                    # Enrich live SL/TP and fallback balance before Bark notification
+                    if hasattr(client, "fetch_reconcile_state"):
+                        rec_state = await client.fetch_reconcile_state()
+                        rec_positions = rec_state.get("positions", {})
+                        rec_orders = rec_state.get("orders", {})
+                        for d in inserted_deals:
+                            pid = str(d.get("position_id") or "")
+                            oid = str(d.get("order_id") or "")
+                            pos_info = rec_positions.get(pid)
+                            ord_info = rec_orders.get(oid)
+                            for src in (pos_info, ord_info):
+                                if not src:
+                                    continue
+                                if src.get("stop_loss", 0) > 0 and float(d.get("stop_loss") or 0) <= 0:
+                                    d["stop_loss"] = src["stop_loss"]
+                                if src.get("take_profit", 0) > 0 and float(d.get("take_profit") or 0) <= 0:
+                                    d["take_profit"] = src["take_profit"]
+                                if src.get("label") and not (d.get("label") or "").strip():
+                                    d["label"] = src["label"]
+                                if src.get("comment") and not (d.get("comment") or "").strip():
+                                    d["comment"] = src["comment"]
+
+                    queried_oids = {str(x) for x in missing_order_ids}
+                    open_need_risk_oids = sorted(
+                        {
+                            int(d["order_id"])
+                            for d in inserted_deals
+                            if int(d.get("is_closing") or 0) == 0
+                            and d.get("order_id")
+                            and str(d["order_id"]).isdigit()
+                            and str(d["order_id"]) not in queried_oids
+                            and float(d.get("stop_loss") or 0) <= 0
+                            and float(d.get("take_profit") or 0) <= 0
+                        }
+                    )
+                    if open_need_risk_oids:
+                        extra_meta = await client.fetch_order_labels(open_need_risk_oids)
+                        _update_order_labels_in_db(extra_meta)
+                        risk_cache = getattr(client, "_order_risk_cache", {})
+                        for d in inserted_deals:
+                            oid = str(d.get("order_id") or "")
+                            if oid in extra_meta and not (d.get("label") or "").strip():
+                                d["label"], d["comment"] = extra_meta[oid]
+                            if oid in risk_cache:
+                                r_sl, r_tp = risk_cache[oid]
+                                if r_sl > 0 and float(d.get("stop_loss") or 0) <= 0:
+                                    d["stop_loss"] = r_sl
+                                if r_tp > 0 and float(d.get("take_profit") or 0) <= 0:
+                                    d["take_profit"] = r_tp
+
+                    need_bal = any(
+                        int(d.get("is_closing") or 0) == 1 and float(d.get("account_balance") or 0) <= 0
+                        for d in inserted_deals
+                    )
+                    if need_bal and hasattr(client, "fetch_trader_balance"):
+                        trader_bal = await client.fetch_trader_balance()
+                        if trader_bal > 0:
+                            for d in inserted_deals:
+                                if int(d.get("is_closing") or 0) == 1 and float(d.get("account_balance") or 0) <= 0:
+                                    d["account_balance"] = trader_bal
+
+                    _update_deal_risk_and_balance_in_db(inserted_deals)
             finally:
                 await client.__aexit__(None, None, None)
 
@@ -908,17 +1255,12 @@ async def sync_ctrader_deals(
             if (
                 should_push
                 and inserted_deals
-                and cfg.get("ctrader_bark_push_enabled") == "1"
+                and cfg.get("ctrader_bark_push_enabled", "1") != "0"
                 and cfg.get("bark_enabled") == "1"
             ):
                 _sync_state["phase"] = "pushing_bark"
-                for d in inserted_deals[:5]:
-                    pnl_sign = "+" if d["net_profit"] >= 0 else ""
-                    title = f"cTrader 成交: {d['symbol_name']} {d['side']}"
-                    body = (
-                        f"手数: {d['volume']} | 价格: {d['price']} | "
-                        f"净盈亏: {pnl_sign}{d['net_profit']:.2f} | 时间: {d['executed_at']}"
-                    )
+                for d in inserted_deals[:10]:
+                    title, body = format_ctrader_deal_bark_message(d)
                     res = await send_bark_push(
                         title=title, body=body, settings=cfg, priority="high", group="cTrader"
                     )

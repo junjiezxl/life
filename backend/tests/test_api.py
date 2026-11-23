@@ -1156,6 +1156,224 @@ class TestLifeHubAPI(unittest.TestCase):
                 self.assertEqual(client.access_token, "AT_ROTATED_3")
                 self.assertEqual(new_cfg["ctrader_refresh_token"], "RT_ROTATED_3")
 
+    def test_19_ctrader_bark_open_and_close_push_format(self):
+        import asyncio
+        import datetime
+        from unittest.mock import patch
+        from ctrader_open_api.messages import OpenApiModelMessages_pb2 as model_pb
+        from app.db import get_conn, update_settings
+        from app.services import ctrader_service
+
+        cst = datetime.timezone(datetime.timedelta(hours=8))
+        open_dt = datetime.datetime(2026, 11, 20, 23, 35, 0, tzinfo=cst)
+        close_dt = datetime.datetime(2026, 11, 21, 1, 20, 0, tzinfo=cst)
+        open_ms = int(open_dt.timestamp() * 1000)
+        close_ms = int(close_dt.timestamp() * 1000)
+
+        # 1. Direct formatter checks (open + close loss + close profit)
+        t_open, b_open = ctrader_service.format_ctrader_deal_bark_message(
+            {
+                "deal_id": "9001",
+                "order_id": "403576173",
+                "position_id": "663450252",
+                "symbol_name": "XAUUSD",
+                "side": "BUY",
+                "volume": 0.02,
+                "price": 3547.20,
+                "stop_loss": 3523.21,
+                "take_profit": 3583.18,
+                "label": "GL1119.237cadc2-deadbeef",
+                "executed_at": open_dt.isoformat(),
+                "execution_ms": open_ms,
+                "is_closing": 0,
+            }
+        )
+        self.assertEqual(t_open, "🟢【开仓提醒】Gold1119 BUY XAUUSD")
+        self.assertEqual(
+            b_open,
+            "\n".join(
+                [
+                    "• 策略模型：Gold1119",
+                    "• 交易方向：做多 (BUY)",
+                    "• 开仓价格：$3,547.20",
+                    "• 止损价格：$3,523.21 (距开仓 $23.99)",
+                    "• 止盈价格：$3,583.18 (距开仓 $35.98)",
+                    "• 成交手数：0.02 手 (XAUUSD)",
+                    "• 订单/持仓：#403576173 / #663450252",
+                    "• 北京时间：2026-11-20 23:35:00",
+                ]
+            ),
+        )
+
+        t_loss, b_loss = ctrader_service.format_ctrader_deal_bark_message(
+            {
+                "deal_id": "9002",
+                "order_id": "403580000",
+                "position_id": "663450252",
+                "symbol_name": "XAUUSD",
+                "side": "SELL",
+                "volume": 0.02,
+                "price": 3531.25,
+                "gross_profit": -31.90,
+                "net_profit": -32.04,
+                "account_balance": 506.23,
+                "label": "Gold1119",
+                "executed_at": close_dt.isoformat(),
+                "execution_ms": close_ms,
+                "is_closing": 1,
+            }
+        )
+        self.assertEqual(t_loss, "🔻【平仓亏损】Gold1119 -$32.04")
+        self.assertEqual(
+            b_loss,
+            "\n".join(
+                [
+                    "• 策略模型：Gold1119",
+                    "• 结算净利：$-32.04 (毛利：$-31.90，费用：$-0.14)",
+                    "• 账户余额：$506.23",
+                    "• 平仓动作：平多 (SELL)",
+                    "• 平仓价格：$3,531.25",
+                    "• 成交手数：0.02 手 (XAUUSD)",
+                    "• 持仓编号：#663450252",
+                    "• 北京时间：2026-11-21 01:20:00",
+                ]
+            ),
+        )
+
+        t_win, b_win = ctrader_service.format_ctrader_deal_bark_message(
+            {
+                "deal_id": "9003",
+                "position_id": "663450999",
+                "symbol_name": "XAUUSD",
+                "side": "BUY",
+                "volume": 0.02,
+                "price": 3520.10,
+                "gross_profit": 2.16,
+                "net_profit": 2.02,
+                "account_balance": 538.27,
+                "label": "Gold1119",
+                "executed_at": close_dt.isoformat(),
+                "execution_ms": close_ms,
+                "is_closing": 1,
+            }
+        )
+        self.assertEqual(t_win, "💰【平仓盈利】Gold1119 +$2.02")
+        self.assertIn("• 结算净利：+$2.02 (毛利：$2.16，费用：$-0.14)", b_win)
+        self.assertIn("• 平仓动作：平空 (BUY)", b_win)
+
+        # 2. End-to-end sync_ctrader_deals enrichment + Bark push
+        with get_conn() as conn:
+            conn.execute("DELETE FROM ctrader_deals")
+        update_settings(
+            {
+                "ctrader_client_id": "cid",
+                "ctrader_client_secret": "csec",
+                "ctrader_access_token": "tok",
+                "ctrader_account_id": "999001",
+                "ctrader_environment": "demo",
+                "ctrader_bark_push_enabled": "1",
+                "bark_enabled": "1",
+                "bark_device_key": "dummy_bark_key",
+            }
+        )
+
+        orig_client_cls = ctrader_service._CTraderAsyncClient
+
+        class _RichFakeClient:
+            def __init__(self, **kwargs):
+                self.ctid_trader_account_id = 999001
+                self.environment = "demo"
+                self._order_risk_cache = {}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def fetch_symbols(self):
+                return {1: "XAUUSD"}
+
+            async def fetch_symbol_lot_sizes(self, symbol_ids):
+                return {1: 10000}
+
+            async def fetch_raw_deals_chunked(self, start_ms, end_ms, progress_cb=None):
+                d_open = model_pb.ProtoOADeal(
+                    dealId=9101,
+                    orderId=403576173,
+                    positionId=663450252,
+                    symbolId=1,
+                    tradeSide=model_pb.BUY,
+                    filledVolume=200,
+                    executionPrice=3547.20,
+                    executionTimestamp=open_ms,
+                    dealStatus=model_pb.FILLED,
+                    moneyDigits=2,
+                )
+                d_close = model_pb.ProtoOADeal(
+                    dealId=9102,
+                    orderId=403580000,
+                    positionId=663450252,
+                    symbolId=1,
+                    tradeSide=model_pb.SELL,
+                    filledVolume=200,
+                    executionPrice=3531.25,
+                    executionTimestamp=close_ms,
+                    dealStatus=model_pb.FILLED,
+                    moneyDigits=2,
+                    closePositionDetail=model_pb.ProtoOAClosePositionDetail(
+                        entryPrice=3547.20,
+                        grossProfit=-3190,
+                        swap=0,
+                        commission=-14,
+                        balance=50623,
+                        moneyDigits=2,
+                    ),
+                )
+                return [d_open, d_close]
+
+            async def fetch_order_labels(self, order_ids, progress_cb=None):
+                out = {}
+                for oid in order_ids:
+                    if oid == 403576173:
+                        out[str(oid)] = ("GL1119.237cadc2-test", "")
+                        self._order_risk_cache[str(oid)] = (3523.21, 3583.18)
+                    else:
+                        out[str(oid)] = ("", "")
+                return out
+
+            async def fetch_reconcile_state(self):
+                return {"positions": {}, "orders": {}}
+
+            async def fetch_trader_balance(self):
+                return 506.23
+
+            def decode_raw_deals(self, raw_deals, symbol_map, order_meta, lot_sizes=None):
+                return orig_client_cls.decode_raw_deals(self, raw_deals, symbol_map, order_meta, lot_sizes=lot_sizes)
+
+        sent_pushes = []
+
+        async def _fake_send_bark(**kwargs):
+            sent_pushes.append(kwargs)
+            return {"ok": True}
+
+        with (
+            patch.object(ctrader_service, "_CTraderAsyncClient", _RichFakeClient),
+            patch.object(ctrader_service, "send_bark_push", side_effect=_fake_send_bark),
+        ):
+            res = asyncio.run(ctrader_service.sync_ctrader_deals(days=7, push_new=True, mode="incremental"))
+
+        self.assertEqual(res["pushed"], 2)
+        self.assertEqual(len(sent_pushes), 2)
+        self.assertEqual(sent_pushes[0]["title"], "🟢【开仓提醒】Gold1119 BUY XAUUSD")
+        self.assertIn("• 止损价格：$3,523.21 (距开仓 $23.99)", sent_pushes[0]["body"])
+        self.assertIn("• 止盈价格：$3,583.18 (距开仓 $35.98)", sent_pushes[0]["body"])
+        self.assertEqual(sent_pushes[1]["title"], "🔻【平仓亏损】Gold1119 -$32.04")
+        self.assertIn("• 账户余额：$506.23", sent_pushes[1]["body"])
+        self.assertIn("• 结算净利：$-32.04 (毛利：$-31.90，费用：$-0.14)", sent_pushes[1]["body"])
+
+        update_settings({"bark_enabled": "0", "bark_device_key": ""})
+
 
 if __name__ == "__main__":
     unittest.main()
