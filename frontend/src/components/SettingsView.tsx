@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { BellRing, Bot, CheckCircle2, Database, ExternalLink, KeyRound, LogOut, Mail, PlugZap, RefreshCw, Save, ShieldCheck, XCircle } from 'lucide-react';
+import { BellRing, Bot, CheckCircle2, Copy, Database, ExternalLink, KeyRound, LogOut, Mail, PlugZap, RefreshCw, Save, ShieldCheck, XCircle } from 'lucide-react';
 import { api } from '../api';
 import type { AppSettings } from '../types';
 
@@ -42,7 +42,18 @@ export const SettingsView: React.FC<Props> = ({
   const [authFeedback, setAuthFeedback] = useState<{ ok: boolean; message: string } | null>(null);
 
   useEffect(() => {
-    api.getSettings().then(setSettings).catch(() => {});
+    api
+      .getSettings()
+      .then((data) => {
+        const defaultUri =
+          typeof window !== 'undefined' ? `${window.location.origin}/api/ctrader/oauth/callback` : '';
+        if (!data.ctrader_oauth_redirect_uri && defaultUri) {
+          setSettings({ ...data, ctrader_oauth_redirect_uri: defaultUri });
+        } else {
+          setSettings(data);
+        }
+      })
+      .catch(() => {});
     api.getAuthStatus().then((st) => setActiveSessions(st.active_sessions || 1)).catch(() => {});
   }, []);
 
@@ -913,7 +924,7 @@ export const SettingsView: React.FC<Props> = ({
                 OAuth 2.0 一键授权（首次获取 Refresh Token，之后永久自动续期）
               </h4>
               <p className="text-[11px] text-slate-500">
-                需先在 cTrader OpenAPI 应用后台将下方 Redirect URI 添加到允许列表，再点击前往授权。
+                cTrader 严格校验 Redirect URI 一致性：请先将下方回调地址添加到 OpenAPI 应用后台（openapi.ctrader.com/apps → Edit → Redirect URIs），或直接填写后台已有的回调地址后粘贴带 ?code= 的跳转链接。
               </p>
             </div>
             <div className="flex items-center gap-2">
@@ -939,15 +950,29 @@ export const SettingsView: React.FC<Props> = ({
           <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
             <div>
               <label className="mb-1 block text-[11px] font-medium text-slate-600">
-                Redirect URI（回调地址）
+                Redirect URI（必须与 cTrader 应用后台配置完全一致）
               </label>
-              <input
-                type="text"
-                value={settings.ctrader_oauth_redirect_uri ?? defaultCTraderRedirectUri}
-                onChange={(e) => updateField('ctrader_oauth_redirect_uri', e.target.value)}
-                placeholder={defaultCTraderRedirectUri}
-                className="w-full rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs outline-none focus:border-amber-500"
-              />
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={settings.ctrader_oauth_redirect_uri ?? defaultCTraderRedirectUri}
+                  onChange={(e) => updateField('ctrader_oauth_redirect_uri', e.target.value)}
+                  placeholder={defaultCTraderRedirectUri}
+                  className="flex-1 rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs outline-none focus:border-amber-500"
+                />
+                <button
+                  type="button"
+                  onClick={() => {
+                    navigator.clipboard?.writeText(effectiveCTraderRedirectUri);
+                    onNotify('已复制 Redirect URI，请粘贴到 cTrader OpenAPI 应用后台');
+                  }}
+                  className="inline-flex items-center gap-1 rounded-xl border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100 cursor-pointer"
+                  title="复制回调地址"
+                >
+                  <Copy className="h-3.5 w-3.5" />
+                  <span>复制</span>
+                </button>
+              </div>
             </div>
             <div>
               <label className="mb-1 block text-[11px] font-medium text-slate-600">
