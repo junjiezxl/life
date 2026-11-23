@@ -73,6 +73,15 @@ if [ "$LOCAL_SHA" != "$REMOTE_SHA" ] || [ "$FORCE_UPDATE" = "--force" ] || [ ! -
     NEED_RESTART=1
   fi
 
+  if echo "$CHANGED_FILES" | grep -q "^deploy/nginx-lifehub.conf.template"; then
+    if [ -f "/etc/nginx/sites-available/lifehub.conf" ]; then
+      cp "$APP_DIR/deploy/nginx-lifehub.conf.template" /etc/nginx/sites-available/lifehub.conf
+      if nginx -t >/dev/null 2>&1; then
+        systemctl reload nginx || true
+      fi
+    fi
+  fi
+
   COUNT="$(git rev-list --count HEAD)"
   PATCH=$((COUNT - 31))
   if [ "$PATCH" -lt 0 ]; then PATCH=0; fi
