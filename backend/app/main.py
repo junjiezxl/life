@@ -8,12 +8,14 @@ from typing import Any, Dict, List, Optional, Set
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .db import get_all_settings, get_conn, init_db, now_iso, reset_all_data, update_settings
 from .models import (
     CTraderMarketActionRequest,
+    CTraderOAuthExchangeRequest,
+    CTraderOAuthRefreshRequest,
     CTraderSyncRequest,
     AccountCreate,
     AccountUpdate,
@@ -75,6 +77,12 @@ from .services.ctrader_service import (
     start_background_ctrader_sync,
     sync_ctrader_deals,
     test_ctrader_connection,
+)
+from .services.ctrader_oauth_service import (
+    build_authorize_url,
+    ensure_fresh_ctrader_token,
+    exchange_authorization_code,
+    refresh_ctrader_token,
 )
 from .services.ctrader_market_service import market_service
 from .services.bill_parser import parse_bill_file
@@ -393,12 +401,25 @@ async def _startup_legacy_deals_repair_task() -> None:
         pass
 
 
+async def _ctrader_token_auto_refresh_loop() -> None:
+    await asyncio.sleep(15.0)
+    while True:
+        try:
+            res = await ensure_fresh_ctrader_token()
+            if res.get("refreshed"):
+                await market_service.on_settings_updated()
+        except Exception:
+            pass
+        await asyncio.sleep(3600.0)
+
+
 @app.on_event("startup")
 async def on_startup() -> None:
     init_db(seed_demo=True)
     asyncio.create_task(_email_auto_sync_loop())
     asyncio.create_task(_bark_due_reminder_loop())
     asyncio.create_task(_ctrader_auto_sync_loop())
+    asyncio.create_task(_ctrader_token_auto_refresh_loop())
     asyncio.create_task(_startup_update_notify_task())
     asyncio.create_task(_startup_legacy_deals_repair_task())
     await market_service.ensure_started_from_settings()
@@ -483,6 +504,102 @@ async def api_ctrader_test() -> Dict[str, Any]:
         return await test_ctrader_connection()
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/ctrader/oauth/authorize-url")
+def api_ctrader_oauth_authorize_url(
+    redirect_uri: str = Query(...),
+    scope: str = Query("accounts"),
+) -> Dict[str, Any]:
+    try:
+        cfg = get_all_settings()
+        url = build_authorize_url(
+            client_id=cfg.get("ctrader_client_id", ""),
+            redirect_uri=redirect_uri,
+            scope=scope,
+        )
+        return {"ok": True, "url": url}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/ctrader/oauth/exchange")
+async def api_ctrader_oauth_exchange(payload: CTraderOAuthExchangeRequest) -> Dict[str, Any]:
+    try:
+        res = await exchange_authorization_code(
+            code_or_url=payload.code_or_url,
+            redirect_uri=payload.redirect_uri or "",
+        )
+        await market_service.on_settings_updated()
+        return res
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/ctrader/oauth/refresh")
+async def api_ctrader_oauth_refresh(
+    payload: Optional[CTraderOAuthRefreshRequest] = None,
+) -> Dict[str, Any]:
+    try:
+        res = await refresh_ctrader_token(
+            refresh_token_override=payload.refresh_token if payload else None,
+            notify_bark=False,
+        )
+        await market_service.on_settings_updated()
+        return res
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/ctrader/oauth/callback", response_class=HTMLResponse)
+async def api_ctrader_oauth_callback(
+    request: Request,
+    code: str = Query(""),
+    error: str = Query(""),
+    error_description: str = Query(""),
+) -> HTMLResponse:
+    import html as _html
+
+    if error or not code:
+        err_msg = _html.escape(error_description or error or "未收到 cTrader 返回的授权 code")
+        return HTMLResponse(
+            status_code=400,
+            content=f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>cTrader 授权失败</title></head>
+<body style="font-family:system-ui,sans-serif;max-width:560px;margin:60px auto;padding:24px;line-height:1.6;">
+<h2 style="color:#dc2626;">cTrader OAuth 授权失败</h2>
+<p>{err_msg}</p>
+<p style="color:#64748b;font-size:14px;">请检查 cTrader 应用后台的 Redirect URI 是否与当前地址完全一致，或返回 LifeHub 设置页重试。</p>
+<p><a href="/" style="color:#d97706;">返回 LifeHub</a></p>
+</body></html>""",
+        )
+
+    try:
+        callback_url = str(request.url.replace(query=""))
+        saved_redirect = (get_all_settings().get("ctrader_oauth_redirect_uri") or "").strip() or callback_url
+        res = await exchange_authorization_code(code_or_url=code, redirect_uri=saved_redirect)
+        await market_service.on_settings_updated()
+        exp_at = _html.escape(str(res.get("expires_at") or ""))
+        return HTMLResponse(
+            content=f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>cTrader 授权成功</title></head>
+<body style="font-family:system-ui,sans-serif;max-width:560px;margin:60px auto;padding:24px;line-height:1.6;">
+<h2 style="color:#059669;">cTrader OAuth 授权成功</h2>
+<p>已成功保存 Access Token 与 Refresh Token，到期前系统将自动为您续期。</p>
+<p>当前有效期至：<strong>{exp_at}</strong></p>
+<p style="color:#64748b;font-size:14px;">您可以关闭此页面并回到 LifeHub 设置页刷新查看。</p>
+<p><a href="/" style="color:#d97706;">返回 LifeHub</a></p>
+</body></html>""",
+        )
+    except Exception as exc:
+        err_msg = _html.escape(str(exc))
+        return HTMLResponse(
+            status_code=400,
+            content=f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>cTrader Token 换取失败</title></head>
+<body style="font-family:system-ui,sans-serif;max-width:560px;margin:60px auto;padding:24px;line-height:1.6;">
+<h2 style="color:#dc2626;">Token 换取失败</h2>
+<p>{err_msg}</p>
+<p><a href="/" style="color:#d97706;">返回 LifeHub</a></p>
+</body></html>""",
+        )
 
 
 @app.get("/api/ctrader/market/status")

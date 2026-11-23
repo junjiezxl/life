@@ -191,6 +191,10 @@ class SettingsUpdateRequest(BaseModel):
     ctrader_client_id: Optional[str] = None
     ctrader_client_secret: Optional[str] = None
     ctrader_access_token: Optional[str] = None
+    ctrader_refresh_token: Optional[str] = None
+    ctrader_token_expires_at: Optional[str] = None
+    ctrader_auto_refresh_enabled: Optional[str] = None
+    ctrader_oauth_redirect_uri: Optional[str] = None
     ctrader_account_id: Optional[str] = None
     ctrader_environment: Optional[str] = None
     ctrader_auto_sync_enabled: Optional[str] = None
@@ -213,6 +217,15 @@ class CTraderSyncRequest(BaseModel):
 
 class CTraderMarketActionRequest(BaseModel):
     symbols: Optional[str] = None
+
+
+class CTraderOAuthExchangeRequest(BaseModel):
+    code_or_url: str = Field(..., min_length=1, max_length=2000)
+    redirect_uri: str = ""
+
+
+class CTraderOAuthRefreshRequest(BaseModel):
+    refresh_token: Optional[str] = None
 
 
 class PhoneNumberCreate(BaseModel):

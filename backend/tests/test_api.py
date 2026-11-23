@@ -1026,6 +1026,136 @@ class TestLifeHubAPI(unittest.TestCase):
         self.assertEqual(t["deals"][0]["is_closing"], 0)
         self.assertEqual(t["deals"][1]["is_closing"], 1)
 
+    def test_18_ctrader_oauth_exchange_and_auto_refresh(self):
+        import asyncio
+        import datetime
+        from unittest.mock import patch
+        from app.db import get_all_settings, update_settings
+        from app.services import ctrader_oauth_service, ctrader_service
+
+        self.assertEqual(
+            ctrader_oauth_service.parse_oauth_code("https://life.example.com/api/ctrader/oauth/callback?code=AUTH_CODE_123&state=x"),
+            "AUTH_CODE_123",
+        )
+        self.assertEqual(ctrader_oauth_service.parse_oauth_code("RAW_CODE_999"), "RAW_CODE_999")
+        self.assertTrue(ctrader_oauth_service.is_token_expired_error("CH_ACCESS_TOKEN_INVALID: expired"))
+
+        update_settings(
+            {
+                "ctrader_client_id": "cid_test_1",
+                "ctrader_client_secret": "csec_test_1",
+                "ctrader_account_id": "1396743",
+                "ctrader_environment": "demo",
+                "ctrader_auto_refresh_enabled": "1",
+            }
+        )
+
+        auth_url_resp = self.client.get(
+            "/api/ctrader/oauth/authorize-url",
+            params={"redirect_uri": "https://life.example.com/api/ctrader/oauth/callback", "scope": "accounts"},
+        )
+        self.assertEqual(auth_url_resp.status_code, 200)
+        auth_url = auth_url_resp.json()["url"]
+        self.assertIn("https://openapi.ctrader.com/apps/auth?", auth_url)
+        self.assertIn("client_id=cid_test_1", auth_url)
+
+        calls = []
+
+        class _MockResp:
+            def __init__(self, payload, status_code=200):
+                self._payload = payload
+                self.status_code = status_code
+
+            def json(self):
+                return self._payload
+
+        class _MockAsyncClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, url, params=None):
+                calls.append((url, dict(params or {})))
+                gt = (params or {}).get("grant_type")
+                if gt == "authorization_code":
+                    return _MockResp(
+                        {
+                            "accessToken": "AT_INITIAL_1",
+                            "refreshToken": "RT_INITIAL_1",
+                            "expiresIn": 2628000,
+                            "tokenType": "bearer",
+                        }
+                    )
+                if gt == "refresh_token":
+                    n = len(calls)
+                    return _MockResp(
+                        {
+                            "accessToken": f"AT_ROTATED_{n}",
+                            "refreshToken": f"RT_ROTATED_{n}",
+                            "expiresIn": 2628000,
+                            "tokenType": "bearer",
+                        }
+                    )
+                return _MockResp({"errorCode": "INVALID_GRANT"}, status_code=400)
+
+        with patch("app.services.ctrader_oauth_service.httpx.AsyncClient", _MockAsyncClient):
+            ex_resp = self.client.post(
+                "/api/ctrader/oauth/exchange",
+                json={
+                    "code_or_url": "https://life.example.com/api/ctrader/oauth/callback?code=CODE_ABC",
+                    "redirect_uri": "https://life.example.com/api/ctrader/oauth/callback",
+                },
+            )
+            self.assertEqual(ex_resp.status_code, 200)
+            self.assertTrue(ex_resp.json()["ok"])
+            self.assertTrue(ex_resp.json()["has_refresh_token"])
+
+            cfg1 = get_all_settings()
+            self.assertEqual(cfg1["ctrader_access_token"], "AT_INITIAL_1")
+            self.assertEqual(cfg1["ctrader_refresh_token"], "RT_INITIAL_1")
+            self.assertEqual(cfg1["ctrader_oauth_redirect_uri"], "https://life.example.com/api/ctrader/oauth/callback")
+
+            # Still valid (> 5 days remaining) -> skip proactive refresh
+            check_valid = asyncio.run(ctrader_oauth_service.ensure_fresh_ctrader_token())
+            self.assertFalse(check_valid["refreshed"])
+            self.assertEqual(check_valid["reason"], "still_valid")
+
+            # Expire within 2 days -> proactive auto-refresh rotates token
+            soon_exp = (datetime.datetime.now().astimezone() + datetime.timedelta(days=2)).isoformat(timespec="seconds")
+            update_settings({"ctrader_token_expires_at": soon_exp})
+            check_renew = asyncio.run(ctrader_oauth_service.ensure_fresh_ctrader_token())
+            self.assertTrue(check_renew["refreshed"])
+            cfg2 = get_all_settings()
+            self.assertEqual(cfg2["ctrader_access_token"], "AT_ROTATED_2")
+            self.assertEqual(cfg2["ctrader_refresh_token"], "RT_ROTATED_2")
+
+            # Reactive recovery inside _connect_with_auto_refresh on CH_ACCESS_TOKEN_INVALID
+            seen_tokens = []
+
+            class _FakeCTraderClient:
+                def __init__(self, **creds):
+                    self.access_token = creds["access_token"]
+
+                async def __aenter__(self):
+                    seen_tokens.append(self.access_token)
+                    if len(seen_tokens) == 1:
+                        raise RuntimeError("cTrader error CH_ACCESS_TOKEN_INVALID: Access token expired")
+                    return self
+
+                async def __aexit__(self, exc_type, exc, tb):
+                    return False
+
+            with patch.object(ctrader_service, "_CTraderAsyncClient", _FakeCTraderClient):
+                client, new_cfg = asyncio.run(ctrader_service._connect_with_auto_refresh(get_all_settings()))
+                self.assertEqual(seen_tokens, ["AT_ROTATED_2", "AT_ROTATED_3"])
+                self.assertEqual(client.access_token, "AT_ROTATED_3")
+                self.assertEqual(new_cfg["ctrader_refresh_token"], "RT_ROTATED_3")
+
 
 if __name__ == "__main__":
     unittest.main()

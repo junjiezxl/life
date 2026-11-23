@@ -18,6 +18,7 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Set
 from fastapi import WebSocket
 
 from ..db import get_all_settings
+from .ctrader_oauth_service import is_token_expired_error, refresh_ctrader_token
 
 logger = logging.getLogger("lifehub.ctrader_market")
 
@@ -678,6 +679,16 @@ class CTraderMarketService:
                 self._last_error = str(exc)
                 self._status = "reconnecting"
                 logger.warning("cTrader live tick stream error: %s", exc)
+                if is_token_expired_error(exc):
+                    try:
+                        await refresh_ctrader_token(
+                            previous_access_token=cfg["access_token"],
+                            notify_bark=True,
+                        )
+                        self._last_error = None
+                        backoff = 1.0
+                    except Exception as ref_exc:
+                        self._last_error = f"Access Token 已过期且自动续期失败: {ref_exc}"
             finally:
                 self._connected = False
                 self._authenticated = False

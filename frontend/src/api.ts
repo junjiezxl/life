@@ -387,6 +387,26 @@ export const api = {
     request<{ ok: boolean; account_id: string; environment: string; message: string }>('/api/ctrader/test', {
       method: 'POST',
     }),
+  getCTraderAuthorizeUrl: (redirectUri: string, scope: 'accounts' | 'trading' = 'accounts') =>
+    request<{ ok: boolean; url: string }>(
+      `/api/ctrader/oauth/authorize-url?redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scope)}`,
+    ),
+  exchangeCTraderCode: (codeOrUrl: string, redirectUri?: string) =>
+    request<{ ok: boolean; expires_in: number; expires_at: string; has_refresh_token: boolean; message: string }>(
+      '/api/ctrader/oauth/exchange',
+      {
+        method: 'POST',
+        body: JSON.stringify({ code_or_url: codeOrUrl, redirect_uri: redirectUri || '' }),
+      },
+    ),
+  refreshCTraderToken: (refreshToken?: string) =>
+    request<{ ok: boolean; already_rotated?: boolean; expires_at?: string; message: string }>(
+      '/api/ctrader/oauth/refresh',
+      {
+        method: 'POST',
+        body: JSON.stringify(refreshToken ? { refresh_token: refreshToken } : {}),
+      },
+    ),
   getCTraderMarketStatus: () =>
     request<import('./types').CTraderMarketStatus>('/api/ctrader/market/status'),
   getCTraderRecentTicks: (symbol = '', limit = 50) =>

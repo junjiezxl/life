@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { BellRing, Bot, CheckCircle2, Database, KeyRound, LogOut, Mail, PlugZap, Save, ShieldCheck, XCircle } from 'lucide-react';
+import { BellRing, Bot, CheckCircle2, Database, ExternalLink, KeyRound, LogOut, Mail, PlugZap, RefreshCw, Save, ShieldCheck, XCircle } from 'lucide-react';
 import { api } from '../api';
 import type { AppSettings } from '../types';
 
@@ -27,6 +27,10 @@ export const SettingsView: React.FC<Props> = ({
   const [emailTestResult, setEmailTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [barkTestResult, setBarkTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [ctraderTestResult, setCtraderTestResult] = useState<{ ok: boolean; message: string } | null>(null);
+  const [ctraderOAuthScope, setCtraderOAuthScope] = useState<'accounts' | 'trading'>('accounts');
+  const [ctraderOAuthCode, setCtraderOAuthCode] = useState('');
+  const [ctraderRefreshing, setCtraderRefreshing] = useState(false);
+  const [ctraderExchanging, setCtraderExchanging] = useState(false);
 
   // Account security state
   const [newUsername, setNewUsername] = useState(currentUsername);
@@ -100,6 +104,103 @@ export const SettingsView: React.FC<Props> = ({
         message: err instanceof Error ? err.message : 'cTrader 连接失败',
       });
     }
+  };
+
+  const defaultCTraderRedirectUri =
+    typeof window !== 'undefined' ? `${window.location.origin}/api/ctrader/oauth/callback` : '';
+
+  const effectiveCTraderRedirectUri =
+    (settings.ctrader_oauth_redirect_uri || '').trim() || defaultCTraderRedirectUri;
+
+  const handleOpenCTraderAuthorize = async () => {
+    setCtraderTestResult(null);
+    try {
+      const updated = await api.updateSettings({
+        ...settings,
+        ctrader_oauth_redirect_uri: effectiveCTraderRedirectUri,
+      });
+      setSettings(updated);
+      const res = await api.getCTraderAuthorizeUrl(effectiveCTraderRedirectUri, ctraderOAuthScope);
+      window.open(res.url, '_blank', 'noopener,noreferrer');
+      onNotify('已打开 cTrader OAuth 授权页，授权完成后将自动回填 Token');
+    } catch (err) {
+      setCtraderTestResult({
+        ok: false,
+        message: err instanceof Error ? err.message : '生成 cTrader 授权链接失败',
+      });
+    }
+  };
+
+  const handleExchangeCTraderCode = async () => {
+    if (!ctraderOAuthCode.trim()) {
+      setCtraderTestResult({ ok: false, message: '请先粘贴 cTrader 回调链接或 code 参数' });
+      return;
+    }
+    setCtraderExchanging(true);
+    setCtraderTestResult(null);
+    try {
+      await api.updateSettings({
+        ...settings,
+        ctrader_oauth_redirect_uri: effectiveCTraderRedirectUri,
+      });
+      const res = await api.exchangeCTraderCode(ctraderOAuthCode.trim(), effectiveCTraderRedirectUri);
+      const latest = await api.getSettings();
+      setSettings(latest);
+      setCtraderOAuthCode('');
+      setCtraderTestResult({ ok: true, message: res.message });
+      onNotify('cTrader Token 已换取并保存');
+    } catch (err) {
+      setCtraderTestResult({
+        ok: false,
+        message: err instanceof Error ? err.message : 'cTrader 授权码换取 Token 失败',
+      });
+    } finally {
+      setCtraderExchanging(false);
+    }
+  };
+
+  const handleRefreshCTraderToken = async () => {
+    setCtraderRefreshing(true);
+    setCtraderTestResult(null);
+    try {
+      await api.updateSettings(settings);
+      const res = await api.refreshCTraderToken();
+      const latest = await api.getSettings();
+      setSettings(latest);
+      setCtraderTestResult({ ok: true, message: res.message });
+      onNotify('cTrader Token 续期成功');
+    } catch (err) {
+      setCtraderTestResult({
+        ok: false,
+        message: err instanceof Error ? err.message : 'cTrader Token 续期失败',
+      });
+    } finally {
+      setCtraderRefreshing(false);
+    }
+  };
+
+  const renderCTraderExpiryHint = () => {
+    const raw = (settings.ctrader_token_expires_at || '').trim();
+    if (!raw) {
+      return (
+        <span className="text-slate-400">
+          尚未记录过期时间（通过下方 OAuth 授权或续期后将自动追踪并在到期前 5 天续期）
+        </span>
+      );
+    }
+    const ts = Date.parse(raw);
+    if (Number.isNaN(ts)) {
+      return <span className="text-slate-500">预计过期：{raw}</span>;
+    }
+    const diffDays = Math.round(((ts - Date.now()) / 86400000) * 10) / 10;
+    const formatted = new Date(ts).toLocaleString('zh-CN', { hour12: false });
+    if (diffDays <= 0) {
+      return <span className="font-medium text-rose-600">已过期（{formatted}），请点击「立即续期 Token」或重新授权</span>;
+    }
+    if (diffDays <= 5) {
+      return <span className="font-medium text-amber-600">即将到期（{formatted}，剩余 {diffDays} 天，后台将自动续期）</span>;
+    }
+    return <span className="text-emerald-600">有效至 {formatted}（剩余 {diffDays} 天，到期前 5 天自动续期）</span>;
   };
 
   const handleReset = async (reseed: boolean) => {
@@ -635,20 +736,31 @@ export const SettingsView: React.FC<Props> = ({
 
       {/* cTrader OpenAPI */}
       <div className="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-xs space-y-4">
-        <div className="flex items-center justify-between">
+        <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
             <h3 className="text-sm font-semibold text-slate-900">cTrader OpenAPI 配置（订单拉取与实时推送）</h3>
             <p className="text-xs text-slate-500">
-              替代原有的文件配置，直接在页面管理 cTrader API Key、账户与自动同步推送。
+              替代原有的文件配置，直接在页面管理 cTrader API Key、OAuth 自动续期与自动同步推送。
             </p>
           </div>
-          <button
-            type="button"
-            onClick={handleTestCTrader}
-            className="rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-1.5 text-xs font-medium text-amber-700 hover:bg-amber-100 cursor-pointer"
-          >
-            测试连接
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={handleRefreshCTraderToken}
+              disabled={ctraderRefreshing}
+              className="inline-flex items-center gap-1.5 rounded-xl border border-emerald-200 bg-emerald-50 px-3.5 py-1.5 text-xs font-medium text-emerald-700 hover:bg-emerald-100 disabled:opacity-50 cursor-pointer"
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${ctraderRefreshing ? 'animate-spin' : ''}`} />
+              <span>{ctraderRefreshing ? '续期中...' : '立即续期 Token'}</span>
+            </button>
+            <button
+              type="button"
+              onClick={handleTestCTrader}
+              className="rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-1.5 text-xs font-medium text-amber-700 hover:bg-amber-100 cursor-pointer"
+            >
+              测试连接
+            </button>
+          </div>
         </div>
 
         <div className="flex flex-wrap items-center gap-6 text-xs text-slate-700">
@@ -676,6 +788,14 @@ export const SettingsView: React.FC<Props> = ({
             />
             <span>开启实时 Tick 行情订阅与对外接口</span>
           </label>
+          <label className="inline-flex items-center gap-2 font-medium cursor-pointer">
+            <input
+              type="checkbox"
+              checked={settings.ctrader_auto_refresh_enabled !== '0'}
+              onChange={(e) => updateField('ctrader_auto_refresh_enabled', e.target.checked ? '1' : '0')}
+            />
+            <span>Access Token 到期前自动续期</span>
+          </label>
         </div>
 
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
@@ -699,8 +819,10 @@ export const SettingsView: React.FC<Props> = ({
               className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-amber-500"
             />
           </div>
-          <div className="md:col-span-2">
-            <label className="mb-1 block text-xs font-medium text-slate-600">Access Token</label>
+          <div>
+            <div className="mb-1 flex items-center justify-between gap-2">
+              <label className="text-xs font-medium text-slate-600">Access Token（约 30 天有效）</label>
+            </div>
             <input
               type="password"
               value={settings.ctrader_access_token || ''}
@@ -708,6 +830,22 @@ export const SettingsView: React.FC<Props> = ({
               placeholder="cTrader OpenAPI Access Token"
               className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-amber-500"
             />
+            <p className="mt-1 text-[11px]">{renderCTraderExpiryHint()}</p>
+          </div>
+          <div>
+            <label className="mb-1 block text-xs font-medium text-slate-600">
+              Refresh Token（官方支持无限次轮换自动续期）
+            </label>
+            <input
+              type="password"
+              value={settings.ctrader_refresh_token || ''}
+              onChange={(e) => updateField('ctrader_refresh_token', e.target.value)}
+              placeholder="通过下方 OAuth 一键授权自动获取，也可手动填入"
+              className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-amber-500"
+            />
+            <p className="mt-1 text-[11px] text-slate-400">
+              每次续期都会自动保存新 Access Token 与新 Refresh Token，遇失效错误也会自动无缝重试。
+            </p>
           </div>
           <div>
             <label className="mb-1 block text-xs font-medium text-slate-600">Account ID（账户号 / ctidTraderAccountId）</label>
@@ -765,6 +903,74 @@ export const SettingsView: React.FC<Props> = ({
               placeholder="留空不校验；填写后支持 Bearer / X-API-Key / ?token="
               className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-amber-500"
             />
+          </div>
+        </div>
+
+        <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3.5 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h4 className="text-xs font-semibold text-slate-800">
+                OAuth 2.0 一键授权（首次获取 Refresh Token，之后永久自动续期）
+              </h4>
+              <p className="text-[11px] text-slate-500">
+                需先在 cTrader OpenAPI 应用后台将下方 Redirect URI 添加到允许列表，再点击前往授权。
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <select
+                value={ctraderOAuthScope}
+                onChange={(e) => setCtraderOAuthScope(e.target.value as 'accounts' | 'trading')}
+                className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs outline-none focus:border-amber-500"
+              >
+                <option value="accounts">权限：accounts（行情与订单同步）</option>
+                <option value="trading">权限：trading（含交易指令）</option>
+              </select>
+              <button
+                type="button"
+                onClick={handleOpenCTraderAuthorize}
+                className="inline-flex items-center gap-1 rounded-xl bg-amber-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-600 cursor-pointer"
+              >
+                <ExternalLink className="h-3.5 w-3.5" />
+                <span>前往 cTrader 授权</span>
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+            <div>
+              <label className="mb-1 block text-[11px] font-medium text-slate-600">
+                Redirect URI（回调地址）
+              </label>
+              <input
+                type="text"
+                value={settings.ctrader_oauth_redirect_uri ?? defaultCTraderRedirectUri}
+                onChange={(e) => updateField('ctrader_oauth_redirect_uri', e.target.value)}
+                placeholder={defaultCTraderRedirectUri}
+                className="w-full rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs outline-none focus:border-amber-500"
+              />
+            </div>
+            <div>
+              <label className="mb-1 block text-[11px] font-medium text-slate-600">
+                手动粘贴回调 URL 或 code（若授权后未自动回填可使用）
+              </label>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={ctraderOAuthCode}
+                  onChange={(e) => setCtraderOAuthCode(e.target.value)}
+                  placeholder="粘贴 ?code=... 完整链接或 code 值"
+                  className="flex-1 rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs outline-none focus:border-amber-500"
+                />
+                <button
+                  type="button"
+                  onClick={handleExchangeCTraderCode}
+                  disabled={ctraderExchanging}
+                  className="rounded-xl border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50 cursor-pointer"
+                >
+                  {ctraderExchanging ? '换取中...' : '换取 Token'}
+                </button>
+              </div>
+            </div>
           </div>
         </div>
 

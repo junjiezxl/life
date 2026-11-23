@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..db import get_all_settings, get_conn, now_iso
 from .bark_service import send_bark_push
+from .ctrader_oauth_service import is_token_expired_error, refresh_ctrader_token
 
 logger = logging.getLogger("lifehub.ctrader_sync")
 
@@ -751,15 +752,39 @@ def _update_order_labels_in_db(order_meta: Dict[str, Tuple[str, str]]) -> None:
                 )
 
 
+async def _connect_with_auto_refresh(cfg: Dict[str, str]):
+    creds = _get_ctrader_credentials(cfg)
+    try:
+        client = _CTraderAsyncClient(**creds)
+        await client.__aenter__()
+        return client, cfg
+    except Exception as exc:
+        if is_token_expired_error(exc) and (cfg.get("ctrader_refresh_token") or "").strip():
+            logger.info("cTrader access token expired during connect, attempting auto-refresh...")
+            await refresh_ctrader_token(
+                previous_access_token=creds["access_token"],
+                notify_bark=True,
+            )
+            new_cfg = get_all_settings()
+            new_creds = _get_ctrader_credentials(new_cfg)
+            client = _CTraderAsyncClient(**new_creds)
+            await client.__aenter__()
+            return client, new_cfg
+        raise
+
+
 async def test_ctrader_connection() -> Dict[str, Any]:
-    creds = _get_ctrader_credentials()
-    async with _CTraderAsyncClient(**creds) as client:
+    cfg = get_all_settings()
+    client, _ = await _connect_with_auto_refresh(cfg)
+    try:
         return {
             "ok": True,
             "account_id": str(client.ctid_trader_account_id),
             "environment": client.environment,
             "message": f"cTrader OpenAPI 连接成功（账户 {client.ctid_trader_account_id}，环境 {client.environment}）",
         }
+    finally:
+        await client.__aexit__(None, None, None)
 
 
 async def sync_ctrader_deals(
@@ -799,7 +824,9 @@ async def sync_ctrader_deals(
         )
 
         try:
-            async with _CTraderAsyncClient(**creds) as client:
+            client, cfg = await _connect_with_auto_refresh(cfg)
+            creds = _get_ctrader_credentials(cfg)
+            try:
                 account_id_str = str(client.ctid_trader_account_id)
                 now_ms = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
 
@@ -874,6 +901,8 @@ async def sync_ctrader_deals(
                         done_count += len(batch)
                         _sync_state["labels_done"] = done_count
                     _apply_position_label_inheritance(deals)
+            finally:
+                await client.__aexit__(None, None, None)
 
             pushed_count = 0
             if (
