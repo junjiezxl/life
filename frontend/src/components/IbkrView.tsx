@@ -160,17 +160,17 @@ export const IbkrView: React.FC<Props> = ({ onNotify, onNavigateSettings }) => {
           <h3 className="text-sm font-semibold text-blue-900">4 步接入 IBKR Flex 每日汇总（约 2 分钟）</h3>
           <ol className="list-decimal pl-5 space-y-1.5 leading-relaxed">
             <li>
-              登录 IBKR Client Portal 网页端 → <strong>业绩与报告 → Flex 查询 → 活动 Flex 查询（Activity Flex Queries）</strong>，点击新建（格式选 <strong>XML</strong>）。
+              登录 IBKR 网页端 → 顶部菜单 <strong>业绩与报告 → 自主查询</strong>（英文界面为 Flex Queries），在 <strong>活动自主查询</strong>（Activity Flex Queries）旁点击 <strong>+</strong> 新建，交付格式务必选 <strong>XML</strong>。
             </li>
             <li>
-              建议勾选以下 4 个部分并全部选择字段（Full）：
-              <code className="mx-1 rounded bg-white px-1.5 py-0.5 text-blue-800">Equity Summary in Base</code>（每日净值）、
-              <code className="mx-1 rounded bg-white px-1.5 py-0.5 text-blue-800">Open Positions</code>（持仓）、
-              <code className="mx-1 rounded bg-white px-1.5 py-0.5 text-blue-800">Trades</code>（成交）、
-              <code className="mx-1 rounded bg-white px-1.5 py-0.5 text-blue-800">Cash Transactions</code>（分红/出入金），日期范围建议选 <strong>Last 30 Calendar Days</strong> 或 <strong>Month to Date</strong>。
+              勾选以下 4 个部分并选择全部字段（Full / 全选）：
+              <code className="mx-1 rounded bg-white px-1.5 py-0.5 text-blue-800">基础货币权益汇总 (Equity Summary in Base)</code>、
+              <code className="mx-1 rounded bg-white px-1.5 py-0.5 text-blue-800">未平仓头寸 (Open Positions)</code>、
+              <code className="mx-1 rounded bg-white px-1.5 py-0.5 text-blue-800">交易 / 成交 (Trades)</code>、
+              <code className="mx-1 rounded bg-white px-1.5 py-0.5 text-blue-800">现金交易 (Cash Transactions)</code>，周期建议选 <strong>最近 30 个日历日 (Last 30 Calendar Days)</strong>。
             </li>
             <li>
-              保存后记录生成的 <strong>Query ID</strong>；在同一页面的「Flex Web Service 配置」中点击生成 <strong>Flex Token</strong>（最长可设 1 年有效期）。
+              保存后点进刚创建的查询或查看列表右侧的 <strong>Query ID（查询编号）</strong>；然后在同页面点开 <strong>Flex Web 服务配置（自主网络服务配置）</strong>，开启服务并点 <strong>生成新口令（Generate New Token）</strong>（有效期最长可设 1 年，IP 限制可留空）。
             </li>
             <li>
               前往 <button type="button" onClick={onNavigateSettings} className="font-semibold text-blue-700 underline cursor-pointer">系统设置 → 盈透证券 (IBKR) Flex 配置</button> 填入 Token 与 Query ID，保存后点「立即同步 Flex 报告」即可。
