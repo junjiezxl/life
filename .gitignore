@@ -20,6 +20,7 @@ backend/data/
 *.sqlite3
 .env
 .env.*
+.build_meta.json
 
 # OS & Editor
 .DS_Store

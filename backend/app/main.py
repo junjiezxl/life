@@ -335,14 +335,66 @@ def _format_update_message(raw_msg: str) -> str:
 
 
 def get_build_info() -> Dict[str, str]:
-    version = (os.environ.get("LIFEHUB_VERSION") or "v1.0.0-dev").strip() or "v1.0.0-dev"
-    sha = (os.environ.get("LIFEHUB_BUILD_SHA") or "dev").strip() or "dev"
-    raw_msg = (os.environ.get("LIFEHUB_BUILD_MSG") or "").strip()
+    env_sha = os.environ.get("LIFEHUB_BUILD_SHA")
+    if env_sha is not None and env_sha.strip():
+        version = (os.environ.get("LIFEHUB_VERSION") or "v1.0.0-dev").strip() or "v1.0.0-dev"
+        sha = env_sha.strip()
+        raw_msg = (os.environ.get("LIFEHUB_BUILD_MSG") or "").strip()
+        return {
+            "version": version,
+            "sha": sha,
+            "build_time": (os.environ.get("LIFEHUB_BUILD_TIME") or "").strip(),
+            "commit_msg": _format_update_message(raw_msg),
+        }
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    meta_path = os.path.join(repo_root, ".build_meta.json")
+    if os.path.isfile(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as fh:
+                meta = json.load(fh)
+            sha = str(meta.get("sha") or "").strip()
+            if sha:
+                return {
+                    "version": str(meta.get("version") or "v1.0.0").strip(),
+                    "sha": sha,
+                    "build_time": str(meta.get("build_time") or "").strip(),
+                    "commit_msg": _format_update_message(str(meta.get("commit_msg") or "")),
+                }
+        except Exception:
+            pass
+
+    if os.path.isdir(os.path.join(repo_root, ".git")):
+        try:
+            import subprocess
+
+            def _git(*args: str) -> str:
+                return subprocess.check_output(
+                    ["git", "-C", repo_root, *args],
+                    stderr=subprocess.DEVNULL,
+                    timeout=3,
+                ).decode("utf-8", errors="ignore").strip()
+
+            sha = _git("rev-parse", "--short=7", "HEAD")
+            if sha:
+                count = int(_git("rev-list", "--count", "HEAD") or "0")
+                patch = max(0, count - 31)
+                msg = _git("log", "-1", "--pretty=%s")
+                btime = _git("log", "-1", "--pretty=%cd", "--date=format:%Y-%m-%d %H:%M:%S")
+                return {
+                    "version": f"v1.0.{patch}",
+                    "sha": sha,
+                    "build_time": btime,
+                    "commit_msg": _format_update_message(msg),
+                }
+        except Exception:
+            pass
+
     return {
-        "version": version,
-        "sha": sha,
+        "version": (os.environ.get("LIFEHUB_VERSION") or "v1.0.0-dev").strip() or "v1.0.0-dev",
+        "sha": "dev",
         "build_time": (os.environ.get("LIFEHUB_BUILD_TIME") or "").strip(),
-        "commit_msg": _format_update_message(raw_msg),
+        "commit_msg": _format_update_message((os.environ.get("LIFEHUB_BUILD_MSG") or "").strip()),
     }
 
 
