@@ -585,7 +585,7 @@ async def api_ctrader_oauth_exchange(payload: CTraderOAuthExchangeRequest) -> Di
         await market_service.on_settings_updated()
         return res
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=str(exc).strip() or repr(exc)) from exc
 
 
 @app.post("/api/ctrader/oauth/refresh")
@@ -600,7 +600,7 @@ async def api_ctrader_oauth_refresh(
         await market_service.on_settings_updated()
         return res
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=str(exc).strip() or repr(exc)) from exc
 
 
 @app.get("/api/ctrader/oauth/callback", response_class=HTMLResponse)
@@ -642,7 +642,7 @@ async def api_ctrader_oauth_callback(
 </body></html>""",
         )
     except Exception as exc:
-        err_msg = _html.escape(str(exc))
+        err_msg = _html.escape(str(exc).strip() or repr(exc))
         return HTMLResponse(
             status_code=400,
             content=f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>cTrader Token 换取失败</title></head>

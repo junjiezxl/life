@@ -996,6 +996,18 @@ export const SettingsView: React.FC<Props> = ({
                 </button>
               </div>
             </div>
+            <div className="md:col-span-2">
+              <label className="mb-1 block text-[11px] font-medium text-slate-600">
+                OAuth 出站代理（仅换取/自动续期 Token 时访问 openapi.ctrader.com；国内服务器建议填局域网代理，如 http://10.0.0.x:7890）
+              </label>
+              <input
+                type="text"
+                value={settings.ctrader_oauth_proxy || ''}
+                onChange={(e) => updateField('ctrader_oauth_proxy', e.target.value)}
+                placeholder="留空则直连；支持 http://IP:端口 或 socks5://（需与服务器同一局域网并开启允许局域网连接）"
+                className="w-full rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs outline-none focus:border-amber-500"
+              />
+            </div>
           </div>
         </div>
 

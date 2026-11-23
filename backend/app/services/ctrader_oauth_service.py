@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
+import os
 import urllib.parse
 from typing import Any, Dict, Optional
 
@@ -99,9 +100,28 @@ def _compute_expires_iso(expires_in: Any) -> tuple[int, str]:
     return sec, exp_dt.isoformat(timespec="seconds")
 
 
-async def _request_ctrader_token(params: Dict[str, str]) -> Dict[str, Any]:
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.get(CTRADER_TOKEN_URL, params=params)
+async def _request_ctrader_token(params: Dict[str, str], *, proxy_url: str = "") -> Dict[str, Any]:
+    effective_proxy = (
+        proxy_url
+        or (get_all_settings().get("ctrader_oauth_proxy") or "")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("HTTP_PROXY")
+        or ""
+    ).strip()
+    client_kwargs: Dict[str, Any] = {"timeout": 20.0}
+    if effective_proxy:
+        client_kwargs["proxy"] = effective_proxy
+
+    try:
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            resp = await client.get(CTRADER_TOKEN_URL, params=params)
+    except httpx.HTTPError as exc:
+        detail = str(exc).strip() or type(exc).__name__
+        raise RuntimeError(
+            f"无法连接 cTrader OAuth 服务器 ({CTRADER_TOKEN_URL}) [{type(exc).__name__}: {detail}]。"
+            "国内网络通常会屏蔽或重置 openapi.ctrader.com，请在设置页「OAuth 出站代理」填入可用的 HTTP 代理（例如 http://10.0.0.x:7890）后重试。"
+        ) from exc
+
     try:
         data = resp.json()
     except Exception as exc:

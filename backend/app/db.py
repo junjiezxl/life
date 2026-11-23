@@ -70,6 +70,7 @@ DEFAULT_SETTINGS: Dict[str, str] = {
     "ctrader_token_expires_at": "",
     "ctrader_auto_refresh_enabled": "1",
     "ctrader_oauth_redirect_uri": "",
+    "ctrader_oauth_proxy": "",
     "ctrader_account_id": "",
     "ctrader_environment": "demo",
     "ctrader_auto_sync_enabled": "0",

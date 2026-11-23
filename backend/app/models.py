@@ -195,6 +195,7 @@ class SettingsUpdateRequest(BaseModel):
     ctrader_token_expires_at: Optional[str] = None
     ctrader_auto_refresh_enabled: Optional[str] = None
     ctrader_oauth_redirect_uri: Optional[str] = None
+    ctrader_oauth_proxy: Optional[str] = None
     ctrader_account_id: Optional[str] = None
     ctrader_environment: Optional[str] = None
     ctrader_auto_sync_enabled: Optional[str] = None

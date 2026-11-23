@@ -1156,6 +1156,33 @@ class TestLifeHubAPI(unittest.TestCase):
                 self.assertEqual(client.access_token, "AT_ROTATED_3")
                 self.assertEqual(new_cfg["ctrader_refresh_token"], "RT_ROTATED_3")
 
+        # Verify proxy parameter forwarding and descriptive network timeout error
+        import httpx as _httpx
+
+        proxy_seen = []
+
+        class _MockTimeoutClient:
+            def __init__(self, *args, **kwargs):
+                proxy_seen.append(kwargs.get("proxy"))
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, url, params=None):
+                raise _httpx.ConnectTimeout("")
+
+        update_settings({"ctrader_oauth_proxy": "http://10.0.0.88:7890"})
+        with patch("app.services.ctrader_oauth_service.httpx.AsyncClient", _MockTimeoutClient):
+            err_resp = self.client.post("/api/ctrader/oauth/refresh")
+            self.assertEqual(err_resp.status_code, 400)
+            self.assertIn("ConnectTimeout", err_resp.json()["detail"])
+            self.assertIn("OAuth 出站代理", err_resp.json()["detail"])
+        self.assertEqual(proxy_seen, ["http://10.0.0.88:7890"])
+        update_settings({"ctrader_oauth_proxy": ""})
+
     def test_19_ctrader_bark_open_and_close_push_format(self):
         import asyncio
         import datetime
