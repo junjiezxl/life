@@ -133,6 +133,31 @@ class EmailFetchRequest(BaseModel):
     zip_password: str = ""
     include_body_ai: bool = True
     unread_only: bool = False
+    account_id: Optional[int] = None
+
+
+class EmailAccountCreate(BaseModel):
+    name: str = ""
+    imap_host: str = Field(..., min_length=1, max_length=200)
+    imap_port: int = Field(993, ge=1, le=65535)
+    username: str = Field(..., min_length=1, max_length=200)
+    password: str = Field(..., min_length=1, max_length=500)
+    use_ssl: bool = True
+    use_proxy: bool = False
+    bill_zip_password: str = ""
+    enabled: bool = True
+
+
+class EmailAccountUpdate(BaseModel):
+    name: Optional[str] = None
+    imap_host: Optional[str] = None
+    imap_port: Optional[int] = Field(default=None, ge=1, le=65535)
+    username: Optional[str] = None
+    password: Optional[str] = None
+    use_ssl: Optional[bool] = None
+    use_proxy: Optional[bool] = None
+    bill_zip_password: Optional[str] = None
+    enabled: Optional[bool] = None
 
 
 class EmailParseTextRequest(BaseModel):

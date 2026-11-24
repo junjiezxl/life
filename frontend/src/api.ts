@@ -251,6 +251,46 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ transactions, account_id: accountId, skip_duplicates: skipDuplicates }),
     }),
+  listEmailAccounts: () => request<import('./types').EmailAccount[]>('/api/email-accounts'),
+  createEmailAccount: (payload: {
+    name?: string;
+    imap_host: string;
+    imap_port: number;
+    username: string;
+    password: string;
+    use_ssl?: boolean;
+    use_proxy?: boolean;
+    bill_zip_password?: string;
+    enabled?: boolean;
+  }) =>
+    request<import('./types').EmailAccount>('/api/email-accounts', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  updateEmailAccount: (
+    id: number,
+    payload: Partial<{
+      name: string;
+      imap_host: string;
+      imap_port: number;
+      username: string;
+      password: string;
+      use_ssl: boolean;
+      use_proxy: boolean;
+      bill_zip_password: string;
+      enabled: boolean;
+    }>,
+  ) =>
+    request<import('./types').EmailAccount>(`/api/email-accounts/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    }),
+  deleteEmailAccount: (id: number) =>
+    request<{ deleted: boolean }>(`/api/email-accounts/${id}`, { method: 'DELETE' }),
+  testEmailAccount: (id: number) =>
+    request<{ ok: boolean; message: string; inbox_count: number }>(`/api/email-accounts/${id}/test`, {
+      method: 'POST',
+    }),
   testEmail: () => request<{ ok: boolean; message: string; inbox_count: number }>('/api/emails/test', { method: 'POST' }),
   fetchParseEmails: (params: {
     days: number;
@@ -259,6 +299,7 @@ export const api = {
     zip_password: string;
     include_body_ai: boolean;
     unread_only: boolean;
+    account_id?: number;
   }) => request<EmailFetchResponse>('/api/emails/fetch-parse', { method: 'POST', body: JSON.stringify(params) }),
   parseEmailText: (params: { subject: string; sender: string; body: string }) =>
     request<{ transactions: ParsedBillTransaction[]; reminders: NoteCandidate[]; engine: string; warning?: string }>(

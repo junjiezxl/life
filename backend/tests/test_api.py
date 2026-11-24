@@ -1671,6 +1671,114 @@ class TestLifeHubAPI(unittest.TestCase):
 
         update_settings({"email_imap_host": "", "email_username": "", "email_password": ""})
 
+    def test_23_multi_email_accounts_crud_and_chat_aggregation(self):
+        from unittest.mock import patch
+        from app.db import get_conn, update_settings
+        from app.services import email_service
+
+        with get_conn() as conn:
+            conn.execute("DELETE FROM email_accounts")
+        update_settings({"ai_provider": "local_fallback", "global_proxy_url": "http://10.0.0.8:7890", "global_proxy_enabled": "1"})
+
+        a1 = self.client.post(
+            "/api/email-accounts",
+            json={
+                "name": "主Gmail",
+                "imap_host": "imap.gmail.com",
+                "imap_port": 993,
+                "username": "june@gmail.com",
+                "password": "gmail_app_pwd",
+                "use_ssl": True,
+                "use_proxy": True,
+                "enabled": True,
+            },
+        )
+        self.assertEqual(a1.status_code, 200, a1.text)
+        id1 = a1.json()["id"]
+        self.assertEqual(a1.json()["password"], "")
+        self.assertTrue(a1.json()["has_password"])
+
+        a2 = self.client.post(
+            "/api/email-accounts",
+            json={
+                "name": "QQ账单",
+                "imap_host": "imap.qq.com",
+                "imap_port": 993,
+                "username": "76870@qq.com",
+                "password": "qq_auth_code",
+                "use_ssl": True,
+                "use_proxy": False,
+                "enabled": True,
+            },
+        )
+        self.assertEqual(a2.status_code, 200, a2.text)
+        id2 = a2.json()["id"]
+
+        # Update name with blank password keeps existing password
+        upd = self.client.put(f"/api/email-accounts/{id2}", json={"name": "QQ主力账单", "password": ""})
+        self.assertEqual(upd.status_code, 200)
+        self.assertEqual(upd.json()["name"], "QQ主力账单")
+        self.assertTrue(upd.json()["has_password"])
+
+        seen_calls = []
+
+        def _fake_fetch_raw(settings, days=14, limit=25, unread_only=False):
+            user = settings["email_username"]
+            seen_calls.append((user, settings.get("email_use_proxy")))
+            if user == "june@gmail.com":
+                return [
+                    {
+                        "uid": "<multi-gmail-001@gmail.com>",
+                        "imap_uid": "10",
+                        "subject": "众安银行消费通知",
+                        "sender": "ZA Bank <no-reply@za.group>",
+                        "received_at": "2026-11-24 10:00",
+                        "body": "你于 2026-11-24 10:00:00 使用 ZA Card (0720) 完成一笔以下消费\n消费金额:\nHKD 100.00\n消费商户: APPLE STORE HK",
+                        "attachments": [],
+                    }
+                ]
+            return [
+                {
+                    "uid": "<multi-qq-001@qq.com>",
+                    "imap_uid": "20",
+                    "subject": "付款成功通知",
+                    "sender": "Alipay <service@alipay.com>",
+                    "received_at": "2026-11-24 11:00",
+                    "body": "您于 2026-11-24 11:00 付款成功，实付金额：¥35.50，商户：瑞幸咖啡",
+                    "attachments": [],
+                }
+            ]
+
+        with patch.object(email_service, "_fetch_raw_emails_sync", side_effect=_fake_fetch_raw):
+            # 1. Fetch all enabled mailboxes
+            f_all = self.client.post("/api/emails/fetch-parse", json={"days": 7, "limit": 20})
+            self.assertEqual(f_all.status_code, 200, f_all.text)
+            body_all = f_all.json()
+            self.assertEqual(len(body_all["emails"]), 2)
+            self.assertEqual(len(body_all["transactions"]), 2)
+            self.assertEqual(seen_calls, [("june@gmail.com", "1"), ("76870@qq.com", "0")])
+
+            # 2. Fetch single specific mailbox
+            seen_calls.clear()
+            f_one = self.client.post("/api/emails/fetch-parse", json={"days": 7, "limit": 20, "account_id": id2})
+            self.assertEqual(f_one.status_code, 200)
+            self.assertEqual(len(f_one.json()["emails"]), 1)
+            self.assertEqual(seen_calls, [("76870@qq.com", "0")])
+
+            # 3. AI Chat aggregates & bookkeeps both mailboxes
+            chat_res = self.client.post("/api/chat", json={"message": "分析邮件中的数据把消费的内容计入个人财务"})
+            self.assertEqual(chat_res.status_code, 200, chat_res.text)
+            cb = chat_res.json()
+            self.assertEqual(len(cb["created_transactions"]), 2)
+            self.assertIn("主Gmail", cb["message"]["content"])
+            self.assertIn("QQ主力账单", cb["message"]["content"])
+
+        # Cleanup
+        self.assertEqual(self.client.delete(f"/api/email-accounts/{id1}").status_code, 200)
+        self.assertEqual(self.client.delete(f"/api/email-accounts/{id2}").status_code, 200)
+        self.assertEqual(len(self.client.get("/api/email-accounts").json()), 0)
+        update_settings({"global_proxy_url": ""})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -359,3 +359,93 @@ async def fetch_and_parse_emails(
         "reminders": all_reminders,
         "warnings": list(dict.fromkeys(warnings)),
     }
+
+
+def build_account_imap_settings(base_settings: Dict[str, str], account: Dict[str, Any]) -> Dict[str, str]:
+    merged = dict(base_settings)
+    merged["email_imap_host"] = str(account.get("imap_host") or "").strip()
+    merged["email_imap_port"] = str(account.get("imap_port") or 993)
+    merged["email_username"] = str(account.get("username") or "").strip()
+    merged["email_password"] = str(account.get("password") or "").strip()
+    merged["email_use_ssl"] = "0" if not account.get("use_ssl", 1) else "1"
+    merged["email_use_proxy"] = "1" if account.get("use_proxy") else "0"
+    if account.get("bill_zip_password"):
+        merged["email_bill_zip_password"] = str(account.get("bill_zip_password") or "")
+    return merged
+
+
+async def fetch_and_parse_multi_emails(
+    base_settings: Dict[str, str],
+    accounts: List[Dict[str, Any]],
+    existing_refs: Set[str],
+    synced_uids: Set[str],
+    days: int = 14,
+    limit: int = 25,
+    keyword: str = "",
+    zip_password: str = "",
+    include_body_ai: bool = True,
+    unread_only: bool = False,
+    skip_already_synced: bool = False,
+) -> Dict[str, Any]:
+    if not accounts:
+        raise ValueError("尚未配置任何可用的邮箱账号，请先在「系统设置 → 邮箱 & Bark」添加至少一个邮箱。")
+
+    all_emails: List[Dict[str, Any]] = []
+    all_txs: List[Dict[str, Any]] = []
+    all_rems: List[Dict[str, Any]] = []
+    all_warnings: List[str] = []
+    scanned_accounts: List[str] = []
+    succeeded = 0
+    last_exc: Optional[Exception] = None
+
+    for acct in accounts:
+        acct_label = (acct.get("name") or acct.get("username") or "邮箱").strip()
+        acct_id = acct.get("id")
+        acct_settings = build_account_imap_settings(base_settings, acct)
+        try:
+            res = await fetch_and_parse_emails(
+                settings=acct_settings,
+                existing_refs=existing_refs,
+                synced_uids=synced_uids,
+                days=days,
+                limit=limit,
+                keyword=keyword,
+                zip_password=zip_password,
+                include_body_ai=include_body_ai,
+                unread_only=unread_only,
+                skip_already_synced=skip_already_synced,
+            )
+            succeeded += 1
+            scanned_accounts.append(acct_label)
+            for em in res.get("emails", []):
+                em["email_account_id"] = acct_id
+                em["email_account_name"] = acct_label
+                all_emails.append(em)
+            for tx in res.get("transactions", []):
+                tx["email_account_id"] = acct_id
+                tx["email_account_name"] = acct_label
+                all_txs.append(tx)
+            for rm in res.get("reminders", []):
+                rm["email_account_id"] = acct_id
+                rm["email_account_name"] = acct_label
+                all_rems.append(rm)
+            for w in res.get("warnings", []):
+                all_warnings.append(f"[{acct_label}] {w}")
+        except Exception as exc:
+            last_exc = exc
+            err_msg = str(exc).strip() or type(exc).__name__
+            all_warnings.append(f"邮箱「{acct_label}」拉取失败: {err_msg}")
+
+    if succeeded == 0 and last_exc is not None:
+        if len(accounts) == 1:
+            raise last_exc
+        raise RuntimeError("；".join(all_warnings))
+
+    all_emails.sort(key=lambda e: str(e.get("received_at") or ""), reverse=True)
+    return {
+        "emails": all_emails,
+        "transactions": all_txs,
+        "reminders": all_rems,
+        "warnings": list(dict.fromkeys(all_warnings)),
+        "scanned_accounts": scanned_accounts,
+    }

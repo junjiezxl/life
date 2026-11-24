@@ -421,6 +421,22 @@ export interface DashboardData {
   };
 }
 
+export interface EmailAccount {
+  id: number;
+  name: string;
+  imap_host: string;
+  imap_port: number;
+  username: string;
+  password?: string;
+  has_password?: boolean;
+  use_ssl: boolean;
+  use_proxy: boolean;
+  bill_zip_password: string;
+  enabled: boolean;
+  created_at?: string;
+  updated_at?: string;
+}
+
 export interface ParsedBillTransaction {
   type: 'expense' | 'income';
   amount: number;
@@ -432,6 +448,7 @@ export interface ParsedBillTransaction {
   already_imported?: boolean;
   email_subject?: string;
   email_uid?: string;
+  email_account_name?: string;
 }
 
 export interface EmailScanSummary {
@@ -443,6 +460,7 @@ export interface EmailScanSummary {
   already_synced: boolean;
   parsed_tx_count: number;
   parsed_rem_count: number;
+  email_account_name?: string;
 }
 
 export interface EmailFetchResponse {

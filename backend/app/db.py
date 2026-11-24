@@ -175,6 +175,21 @@ def init_db(seed_demo: bool = True) -> None:
                 synced_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS email_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL DEFAULT '',
+                imap_host TEXT NOT NULL,
+                imap_port INTEGER NOT NULL DEFAULT 993,
+                username TEXT NOT NULL,
+                password TEXT NOT NULL,
+                use_ssl INTEGER NOT NULL DEFAULT 1,
+                use_proxy INTEGER NOT NULL DEFAULT 0,
+                bill_zip_password TEXT DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS recurring_bills (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
@@ -477,6 +492,43 @@ def init_db(seed_demo: bool = True) -> None:
                         (leg_val, ts),
                     )
                     break
+
+        # Migrate legacy single email_* settings into email_accounts table once
+        ea_count = conn.execute("SELECT COUNT(*) FROM email_accounts").fetchone()[0]
+        if ea_count == 0:
+            s_rows = {
+                r["key"]: r["value"]
+                for r in conn.execute(
+                    "SELECT key, value FROM settings WHERE key LIKE 'email_%'"
+                ).fetchall()
+            }
+            leg_host = (s_rows.get("email_imap_host") or "").strip()
+            leg_user = (s_rows.get("email_username") or "").strip()
+            leg_pwd = (s_rows.get("email_password") or "").strip()
+            if leg_host and leg_user and leg_pwd:
+                try:
+                    leg_port = int(s_rows.get("email_imap_port") or 993)
+                except ValueError:
+                    leg_port = 993
+                conn.execute(
+                    """
+                    INSERT INTO email_accounts
+                    (name, imap_host, imap_port, username, password, use_ssl, use_proxy, bill_zip_password, enabled, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    """,
+                    (
+                        leg_user,
+                        leg_host,
+                        leg_port,
+                        leg_user,
+                        leg_pwd,
+                        0 if s_rows.get("email_use_ssl") == "0" else 1,
+                        1 if s_rows.get("email_use_proxy") == "1" else 0,
+                        (s_rows.get("email_bill_zip_password") or "").strip(),
+                        ts,
+                        ts,
+                    ),
+                )
 
         if seed_demo:
             seeded_flag = conn.execute("SELECT value FROM settings WHERE key = 'demo_seeded'").fetchone()

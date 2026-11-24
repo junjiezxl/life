@@ -30,6 +30,8 @@ from .models import (
     CreditCardUpdate,
     DebtOperationCreate,
     DebtPlanRequest,
+    EmailAccountCreate,
+    EmailAccountUpdate,
     EmailFetchRequest,
     EmailImportRequest,
     EmailParseTextRequest,
@@ -92,7 +94,12 @@ from .services.debt_planner_service import (
     enrich_loan,
     plan_optimal_repayment_paths,
 )
-from .services.email_service import fetch_and_parse_emails, test_imap_connection
+from .services.email_service import (
+    build_account_imap_settings,
+    fetch_and_parse_emails,
+    fetch_and_parse_multi_emails,
+    test_imap_connection,
+)
 from .services.ibkr_service import (
     get_ibkr_overview,
     get_ibkr_sync_status,
@@ -180,45 +187,104 @@ app.add_middleware(
 )
 
 
+def _sanitize_email_account(row: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(row)
+    out["has_password"] = bool((out.get("password") or "").strip())
+    out["password"] = ""
+    out["use_ssl"] = bool(out.get("use_ssl", 1))
+    out["use_proxy"] = bool(out.get("use_proxy", 0))
+    out["enabled"] = bool(out.get("enabled", 1))
+    return out
+
+
+def _get_active_email_accounts(
+    settings: Dict[str, str],
+    account_id: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    with get_conn() as conn:
+        if account_id is not None:
+            rows = conn.execute(
+                "SELECT * FROM email_accounts WHERE id = ?",
+                (account_id,),
+            ).fetchall()
+            return [_row_to_dict(r) for r in rows]
+        rows = conn.execute(
+            "SELECT * FROM email_accounts WHERE enabled = 1 ORDER BY id ASC"
+        ).fetchall()
+        if rows:
+            return [_row_to_dict(r) for r in rows]
+        total_rows = conn.execute("SELECT COUNT(*) FROM email_accounts").fetchone()[0]
+        if total_rows > 0:
+            return []
+
+    # Fallback to legacy single email_* settings if email_accounts table has no entries
+    leg_host = (settings.get("email_imap_host") or "").strip()
+    leg_user = (settings.get("email_username") or "").strip()
+    leg_pwd = (settings.get("email_password") or "").strip()
+    if leg_host and leg_user and leg_pwd:
+        try:
+            leg_port = int(settings.get("email_imap_port") or 993)
+        except ValueError:
+            leg_port = 993
+        return [
+            {
+                "id": 0,
+                "name": leg_user,
+                "imap_host": leg_host,
+                "imap_port": leg_port,
+                "username": leg_user,
+                "password": leg_pwd,
+                "use_ssl": 0 if settings.get("email_use_ssl") == "0" else 1,
+                "use_proxy": 1 if settings.get("email_use_proxy") == "1" else 0,
+                "bill_zip_password": (settings.get("email_bill_zip_password") or "").strip(),
+                "enabled": 1,
+            }
+        ]
+    return []
+
+
 async def _email_auto_sync_loop() -> None:
     while True:
         interval_min = 30
         try:
             settings = get_all_settings()
             interval_min = max(5, int(settings.get("email_sync_interval_min") or 30))
-            if settings.get("email_auto_sync_enabled") == "1" and settings.get("email_username") and settings.get("email_password"):
-                with get_conn() as conn:
-                    existing_refs = _get_existing_external_refs(conn)
-                    synced_uids = _get_synced_email_uids(conn)
-                res = await fetch_and_parse_emails(
-                    settings=settings,
-                    existing_refs=existing_refs,
-                    synced_uids=synced_uids,
-                    days=7,
-                    limit=20,
-                    include_body_ai=True,
-                    skip_already_synced=True,
-                )
-                if res["emails"] or res["transactions"] or res["reminders"]:
+            if settings.get("email_auto_sync_enabled") == "1":
+                accounts = _get_active_email_accounts(settings)
+                if accounts:
                     with get_conn() as conn:
-                        _commit_email_batch(
-                            conn=conn,
-                            txs=[TransactionCreate(**{k: t[k] for k in ("type", "amount", "category", "description", "occurred_at", "source_type", "external_ref") if k in t}) for t in res["transactions"]],
-                            rems=[ReminderCreate(**{k: r[k] for k in ("title", "description", "due_at", "priority", "category", "source_type", "source_ref", "linked_amount", "linked_tx_type") if k in r}) for r in res["reminders"]],
-                            account_id=None,
-                            skip_duplicates=True,
-                            logs=[
-                                {
-                                    "message_uid": e["uid"],
-                                    "subject": e["subject"],
-                                    "sender": e["sender"],
-                                    "received_at": e["received_at"],
-                                    "tx_imported": e["parsed_tx_count"],
-                                    "rem_imported": e["parsed_rem_count"],
-                                }
-                                for e in res["emails"]
-                            ],
-                        )
+                        existing_refs = _get_existing_external_refs(conn)
+                        synced_uids = _get_synced_email_uids(conn)
+                    res = await fetch_and_parse_multi_emails(
+                        base_settings=settings,
+                        accounts=accounts,
+                        existing_refs=existing_refs,
+                        synced_uids=synced_uids,
+                        days=7,
+                        limit=20,
+                        include_body_ai=True,
+                        skip_already_synced=True,
+                    )
+                    if res["emails"] or res["transactions"] or res["reminders"]:
+                        with get_conn() as conn:
+                            _commit_email_batch(
+                                conn=conn,
+                                txs=[TransactionCreate(**{k: t[k] for k in ("type", "amount", "category", "description", "occurred_at", "source_type", "external_ref") if k in t}) for t in res["transactions"]],
+                                rems=[ReminderCreate(**{k: r[k] for k in ("title", "description", "due_at", "priority", "category", "source_type", "source_ref", "linked_amount", "linked_tx_type") if k in r}) for r in res["reminders"]],
+                                account_id=None,
+                                skip_duplicates=True,
+                                logs=[
+                                    {
+                                        "message_uid": e["uid"],
+                                        "subject": e["subject"],
+                                        "sender": e["sender"],
+                                        "received_at": e["received_at"],
+                                        "tx_imported": e["parsed_tx_count"],
+                                        "rem_imported": e["parsed_rem_count"],
+                                    }
+                                    for e in res["emails"]
+                                ],
+                            )
         except Exception:
             pass
         await asyncio.sleep(interval_min * 60)
@@ -1317,20 +1383,29 @@ async def chat_endpoint(payload: ChatRequest) -> Dict[str, Any]:
         created_reminders: List[Dict[str, Any]] = []
         created_transactions: List[Dict[str, Any]] = []
 
-        has_email_cfg = bool(
-            (settings.get("email_imap_host") or "").strip()
-            and (settings.get("email_username") or "").strip()
-            and (settings.get("email_password") or "").strip()
-        )
-        if not has_email_cfg:
-            reply_text = "目前尚未配置邮箱连接，请先前往「系统设置 → 邮箱 & Bark」填好 Gmail/邮箱 IMAP 信息并测试连接成功，然后再让我分析邮件。"
+        active_email_accounts = _get_active_email_accounts(settings)
+        if not active_email_accounts:
+            reply_text = "目前尚未配置可用邮箱，请先前往「系统设置 → 邮箱 & Bark」添加至少一个邮箱并测试连接成功，然后再让我分析邮件。"
         else:
+            # If user explicitly named a specific mailbox (e.g. Gmail / QQ / 163 / alias), narrow down
+            msg_low = user_msg.lower()
+            matched_accounts = [
+                a
+                for a in active_email_accounts
+                if (a.get("name") and str(a["name"]).lower() in msg_low)
+                or (a.get("username") and str(a["username"]).lower() in msg_low)
+                or ("gmail" in msg_low and "gmail" in str(a.get("imap_host", "")).lower())
+                or ("qq" in msg_low and "qq.com" in str(a.get("imap_host", "")).lower())
+                or ("163" in msg_low and "163.com" in str(a.get("imap_host", "")).lower())
+            ]
+            target_mailboxes = matched_accounts if matched_accounts else active_email_accounts
             try:
                 with get_conn() as conn:
                     existing_refs = _get_existing_external_refs(conn)
                     synced_uids = _get_synced_email_uids(conn)
-                res = await fetch_and_parse_emails(
-                    settings=settings,
+                res = await fetch_and_parse_multi_emails(
+                    base_settings=settings,
+                    accounts=target_mailboxes,
                     existing_refs=existing_refs,
                     synced_uids=synced_uids,
                     days=email_intent["days"],
@@ -1341,9 +1416,11 @@ async def chat_endpoint(payload: ChatRequest) -> Dict[str, Any]:
                 emails = res.get("emails") or []
                 txs = res.get("transactions") or []
                 rems = res.get("reminders") or []
+                scanned_names = res.get("scanned_accounts") or []
+                acct_prefix = f"（邮箱：{'、'.join(scanned_names)}）" if scanned_names else ""
 
                 if not emails:
-                    reply_text = f"已连接邮箱扫描最近 {email_intent['days']} 天收件箱，暂时没有找到新邮件。"
+                    reply_text = f"已连接邮箱{acct_prefix}扫描最近 {email_intent['days']} 天收件箱，暂时没有找到新邮件。"
                 elif email_intent["auto_import"]:
                     tx_models = [
                         TransactionCreate(
@@ -1413,7 +1490,7 @@ async def chat_endpoint(payload: ChatRequest) -> Dict[str, Any]:
                             }
                         )
 
-                    lines = [f"已扫描最近 {email_intent['days']} 天共 {len(emails)} 封邮件："]
+                    lines = [f"已扫描最近 {email_intent['days']} 天共 {len(emails)} 封邮件{acct_prefix}："]
                     if created_transactions:
                         total_exp = sum(float(t["amount"]) for t in created_transactions if t["type"] == "expense")
                         total_inc = sum(float(t["amount"]) for t in created_transactions if t["type"] == "income")
@@ -1437,9 +1514,11 @@ async def chat_endpoint(payload: ChatRequest) -> Dict[str, Any]:
                     if not txs and emails:
                         sample_subjs = "、".join(f"《{e['subject'][:26]}》" for e in emails[:5])
                         lines.append(f"• 最近扫描到的邮件主题：{sample_subjs}")
+                    if res.get("warnings"):
+                        lines.append(f"• 部分提示：{'；'.join(res['warnings'][:3])}")
                     reply_text = "\n".join(lines)
                 else:
-                    lines = [f"已扫描最近 {email_intent['days']} 天共 {len(emails)} 封邮件："]
+                    lines = [f"已扫描最近 {email_intent['days']} 天共 {len(emails)} 封邮件{acct_prefix}："]
                     if txs:
                         lines.append(f"• 识别出 {len(txs)} 笔消费/收入明细：")
                         for t in txs[:12]:
@@ -1454,6 +1533,8 @@ async def chat_endpoint(payload: ChatRequest) -> Dict[str, Any]:
                         lines.append(f"• 暂未识别到明确消费/入账流水。最近邮件主题：{sample_subjs}")
                     if rems:
                         lines.append(f"• 另发现 {len(rems)} 条待办/账单提醒线索。")
+                    if res.get("warnings"):
+                        lines.append(f"• 部分提示：{'；'.join(res['warnings'][:3])}")
                     reply_text = "\n".join(lines)
             except Exception as exc:
                 err_txt = str(exc).strip() or type(exc).__name__
@@ -2257,6 +2338,97 @@ def batch_import_transactions(payload: BatchImportTransactionsRequest) -> Dict[s
         )
 
 
+@app.get("/api/email-accounts")
+def list_email_accounts() -> List[Dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM email_accounts ORDER BY id ASC").fetchall()
+        return [_sanitize_email_account(_row_to_dict(r)) for r in rows]
+
+
+@app.post("/api/email-accounts")
+def create_email_account(payload: EmailAccountCreate) -> Dict[str, Any]:
+    ts = now_iso()
+    name = (payload.name or payload.username).strip()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO email_accounts
+            (name, imap_host, imap_port, username, password, use_ssl, use_proxy, bill_zip_password, enabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                name,
+                payload.imap_host.strip(),
+                int(payload.imap_port),
+                payload.username.strip(),
+                payload.password.strip(),
+                1 if payload.use_ssl else 0,
+                1 if payload.use_proxy else 0,
+                (payload.bill_zip_password or "").strip(),
+                1 if payload.enabled else 0,
+                ts,
+                ts,
+            ),
+        )
+        row = conn.execute("SELECT * FROM email_accounts WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return _sanitize_email_account(_row_to_dict(row))
+
+
+@app.put("/api/email-accounts/{account_id}")
+def update_email_account(account_id: int, payload: EmailAccountUpdate) -> Dict[str, Any]:
+    with get_conn() as conn:
+        existing = conn.execute("SELECT * FROM email_accounts WHERE id = ?", (account_id,)).fetchone()
+        if not existing:
+            raise HTTPException(status_code=404, detail="邮箱账号不存在")
+        cur_data = _row_to_dict(existing)
+        updates: Dict[str, Any] = {}
+        data = payload.model_dump(exclude_unset=True)
+        for k, v in data.items():
+            if v is None:
+                continue
+            if k == "password":
+                if str(v).strip():
+                    updates["password"] = str(v).strip()
+                continue
+            if k in ("use_ssl", "use_proxy", "enabled"):
+                updates[k] = 1 if v else 0
+            elif isinstance(v, str):
+                updates[k] = v.strip()
+            else:
+                updates[k] = v
+        if "name" in updates and not updates["name"]:
+            updates["name"] = updates.get("username") or cur_data["username"]
+        updates["updated_at"] = now_iso()
+        set_clause = ", ".join(f"{k} = ?" for k in updates.keys())
+        conn.execute(
+            f"UPDATE email_accounts SET {set_clause} WHERE id = ?",
+            (*updates.values(), account_id),
+        )
+        row = conn.execute("SELECT * FROM email_accounts WHERE id = ?", (account_id,)).fetchone()
+    return _sanitize_email_account(_row_to_dict(row))
+
+
+@app.delete("/api/email-accounts/{account_id}")
+def delete_email_account(account_id: int) -> Dict[str, bool]:
+    with get_conn() as conn:
+        cur = conn.execute("DELETE FROM email_accounts WHERE id = ?", (account_id,))
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="邮箱账号不存在")
+    return {"deleted": True}
+
+
+@app.post("/api/email-accounts/{account_id}/test")
+async def test_email_account_endpoint(account_id: int) -> Dict[str, Any]:
+    settings = get_all_settings()
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM email_accounts WHERE id = ?", (account_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="邮箱账号不存在")
+    acct = _row_to_dict(row)
+    merged = build_account_imap_settings(settings, acct)
+    return await asyncio.to_thread(test_imap_connection, merged)
+
+
 @app.post("/api/emails/test")
 def test_email_endpoint() -> Dict[str, Any]:
     return test_imap_connection(get_all_settings())
@@ -2265,12 +2437,14 @@ def test_email_endpoint() -> Dict[str, Any]:
 @app.post("/api/emails/fetch-parse")
 async def fetch_parse_emails_endpoint(payload: EmailFetchRequest) -> Dict[str, Any]:
     settings = get_all_settings()
+    accounts = _get_active_email_accounts(settings, account_id=payload.account_id)
     with get_conn() as conn:
         existing_refs = _get_existing_external_refs(conn)
         synced_uids = _get_synced_email_uids(conn)
     try:
-        return await fetch_and_parse_emails(
-            settings=settings,
+        return await fetch_and_parse_multi_emails(
+            base_settings=settings,
+            accounts=accounts,
             existing_refs=existing_refs,
             synced_uids=synced_uids,
             days=payload.days,

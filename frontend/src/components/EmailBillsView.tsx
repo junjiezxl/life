@@ -14,6 +14,7 @@ import {
 import { api } from '../api';
 import type {
   Account,
+  EmailAccount,
   EmailScanSummary,
   EmailSyncLog,
   NoteCandidate,
@@ -36,6 +37,8 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
 
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [targetAccountId, setTargetAccountId] = useState<string>('');
+  const [mailboxes, setMailboxes] = useState<EmailAccount[]>([]);
+  const [selectedMailboxId, setSelectedMailboxId] = useState<string>('');
 
   const [emails, setEmails] = useState<EmailScanSummary[]>([]);
   const [txCandidates, setTxCandidates] = useState<ParsedBillTransaction[]>([]);
@@ -55,8 +58,13 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
 
   const loadMeta = async () => {
     try {
-      const [accRes, logRes] = await Promise.all([api.listAccounts(), api.listEmailLogs()]);
+      const [accRes, logRes, mbRes] = await Promise.all([
+        api.listAccounts(),
+        api.listEmailLogs(),
+        api.listEmailAccounts().catch(() => [] as EmailAccount[]),
+      ]);
       setAccounts(accRes.accounts);
+      setMailboxes(mbRes.filter((m) => m.enabled));
       if (!targetAccountId && accRes.accounts.length > 0) {
         setTargetAccountId(String(accRes.accounts[0].id));
       }
@@ -123,6 +131,7 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
         zip_password: zipPassword,
         include_body_ai: includeBodyAi,
         unread_only: unreadOnly,
+        account_id: selectedMailboxId ? Number(selectedMailboxId) : undefined,
       });
       setEmails(res.emails || []);
       setWarnings(res.warnings || []);
@@ -262,6 +271,20 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
           </div>
 
           <div className="flex flex-wrap items-center gap-5 text-xs text-slate-600">
+            {mailboxes.length > 0 && (
+              <select
+                value={selectedMailboxId}
+                onChange={(e) => setSelectedMailboxId(e.target.value)}
+                className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs text-slate-700"
+              >
+                <option value="">全部已启用邮箱 ({mailboxes.length} 个)</option>
+                {mailboxes.map((m) => (
+                  <option key={m.id} value={String(m.id)}>
+                    {m.name || m.username} ({m.username})
+                  </option>
+                ))}
+              </select>
+            )}
             <label className="inline-flex items-center gap-1.5 cursor-pointer">
               <input
                 type="checkbox"

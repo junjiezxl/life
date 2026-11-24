@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
-import { Activity, BellRing, Bot, CheckCircle2, Copy, Database, ExternalLink, Globe, KeyRound, LogOut, Mail, PlugZap, RefreshCw, Save, ShieldCheck, TrendingUp, XCircle } from 'lucide-react';
+import { Activity, BellRing, Bot, CheckCircle2, Copy, Database, ExternalLink, Globe, KeyRound, LogOut, Mail, Pencil, PlugZap, Plus, RefreshCw, Save, ShieldCheck, Trash2, TrendingUp, XCircle } from 'lucide-react';
 import { api } from '../api';
-import type { AppSettings } from '../types';
+import type { AppSettings, EmailAccount } from '../types';
 
 export type SettingsTabKey = 'proxy' | 'ai' | 'mail' | 'ctrader' | 'ibkr' | 'security';
 
@@ -38,7 +38,23 @@ export const SettingsView: React.FC<Props> = ({
     message: string;
     tools: Array<{ name: string; description: string }>;
   } | null>(null);
-  const [emailTestResult, setEmailTestResult] = useState<{ ok: boolean; message: string } | null>(null);
+  const [emailAccounts, setEmailAccounts] = useState<EmailAccount[]>([]);
+  const [emailFormOpen, setEmailFormOpen] = useState(false);
+  const [editingEmailId, setEditingEmailId] = useState<number | null>(null);
+  const [emailSaving, setEmailSaving] = useState(false);
+  const [testingEmailId, setTestingEmailId] = useState<number | null>(null);
+  const [emailAccountTestResults, setEmailAccountTestResults] = useState<Record<number, { ok: boolean; message: string }>>({});
+  const [emailForm, setEmailForm] = useState({
+    name: '',
+    imap_host: 'imap.gmail.com',
+    imap_port: '993',
+    username: '',
+    password: '',
+    use_ssl: true,
+    use_proxy: true,
+    bill_zip_password: '',
+    enabled: true,
+  });
   const [barkTestResult, setBarkTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [proxyTestResult, setProxyTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [proxyTesting, setProxyTesting] = useState(false);
@@ -58,6 +74,18 @@ export const SettingsView: React.FC<Props> = ({
   const [activeSessions, setActiveSessions] = useState<number>(1);
   const [authFeedback, setAuthFeedback] = useState<{ ok: boolean; message: string } | null>(null);
 
+  const loadEmailAccounts = async () => {
+    try {
+      const list = await api.listEmailAccounts();
+      setEmailAccounts(list);
+      if (list.length === 0) {
+        setEmailFormOpen(true);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
   useEffect(() => {
     api
       .getSettings()
@@ -72,6 +100,7 @@ export const SettingsView: React.FC<Props> = ({
       })
       .catch(() => {});
     api.getAuthStatus().then((st) => setActiveSessions(st.active_sessions || 1)).catch(() => {});
+    loadEmailAccounts();
   }, []);
 
   useEffect(() => {
@@ -130,10 +159,122 @@ export const SettingsView: React.FC<Props> = ({
     setMcpTestResult(res);
   };
 
-  const handleTestEmail = async () => {
-    await api.updateSettings(settings);
-    const res = await api.testEmail();
-    setEmailTestResult(res);
+  const handleOpenAddEmail = () => {
+    setEditingEmailId(null);
+    setEmailForm({
+      name: '',
+      imap_host: 'imap.gmail.com',
+      imap_port: '993',
+      username: '',
+      password: '',
+      use_ssl: true,
+      use_proxy: true,
+      bill_zip_password: '',
+      enabled: true,
+    });
+    setEmailFormOpen(true);
+  };
+
+  const handleOpenEditEmail = (acct: EmailAccount) => {
+    setEditingEmailId(acct.id);
+    setEmailForm({
+      name: acct.name || '',
+      imap_host: acct.imap_host,
+      imap_port: String(acct.imap_port || 993),
+      username: acct.username,
+      password: '',
+      use_ssl: acct.use_ssl,
+      use_proxy: acct.use_proxy,
+      bill_zip_password: acct.bill_zip_password || '',
+      enabled: acct.enabled,
+    });
+    setEmailFormOpen(true);
+  };
+
+  const handleSaveEmailAccount = async () => {
+    if (!emailForm.imap_host.trim() || !emailForm.username.trim()) {
+      onNotify('请填写邮箱 IMAP 服务器地址和邮箱账号');
+      return;
+    }
+    if (editingEmailId === null && !emailForm.password.trim()) {
+      onNotify('新增邮箱时请填写 IMAP 授权码 / 应用专用密码');
+      return;
+    }
+    setEmailSaving(true);
+    try {
+      const portNum = Math.max(1, Number(emailForm.imap_port) || 993);
+      if (editingEmailId === null) {
+        await api.createEmailAccount({
+          name: emailForm.name.trim() || emailForm.username.trim(),
+          imap_host: emailForm.imap_host.trim(),
+          imap_port: portNum,
+          username: emailForm.username.trim(),
+          password: emailForm.password.trim(),
+          use_ssl: emailForm.use_ssl,
+          use_proxy: emailForm.use_proxy,
+          bill_zip_password: emailForm.bill_zip_password.trim(),
+          enabled: emailForm.enabled,
+        });
+        onNotify('已添加新邮箱');
+      } else {
+        await api.updateEmailAccount(editingEmailId, {
+          name: emailForm.name.trim() || emailForm.username.trim(),
+          imap_host: emailForm.imap_host.trim(),
+          imap_port: portNum,
+          username: emailForm.username.trim(),
+          ...(emailForm.password.trim() ? { password: emailForm.password.trim() } : {}),
+          use_ssl: emailForm.use_ssl,
+          use_proxy: emailForm.use_proxy,
+          bill_zip_password: emailForm.bill_zip_password.trim(),
+          enabled: emailForm.enabled,
+        });
+        onNotify('邮箱配置已更新');
+      }
+      await loadEmailAccounts();
+      setEmailFormOpen(false);
+      setEditingEmailId(null);
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : '保存邮箱失败');
+    } finally {
+      setEmailSaving(false);
+    }
+  };
+
+  const handleToggleEmailAccount = async (acct: EmailAccount) => {
+    try {
+      await api.updateEmailAccount(acct.id, { enabled: !acct.enabled });
+      await loadEmailAccounts();
+      onNotify(acct.enabled ? `已停用邮箱 ${acct.name || acct.username}` : `已启用邮箱 ${acct.name || acct.username}`);
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : '更新状态失败');
+    }
+  };
+
+  const handleDeleteEmailAccount = async (acct: EmailAccount) => {
+    if (!window.confirm(`确定删除邮箱「${acct.name || acct.username}」吗？`)) return;
+    try {
+      await api.deleteEmailAccount(acct.id);
+      await loadEmailAccounts();
+      onNotify('已删除邮箱配置');
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : '删除失败');
+    }
+  };
+
+  const handleTestEmailAccount = async (acct: EmailAccount) => {
+    setTestingEmailId(acct.id);
+    try {
+      await api.updateSettings(settings);
+      const res = await api.testEmailAccount(acct.id);
+      setEmailAccountTestResults((prev) => ({ ...prev, [acct.id]: res }));
+    } catch (err) {
+      setEmailAccountTestResults((prev) => ({
+        ...prev,
+        [acct.id]: { ok: false, message: err instanceof Error ? err.message : '连接失败' },
+      }));
+    } finally {
+      setTestingEmailId(null);
+    }
   };
 
   const handleTestBark = async () => {
@@ -709,7 +850,7 @@ export const SettingsView: React.FC<Props> = ({
       </>
       )}
 
-      {/* Email IMAP Config */}
+      {/* Multi Email IMAP Config */}
       {activeSection === 'mail' && (
       <>
       <div className="rounded-2xl border border-slate-200/80 bg-white p-6 shadow-xs space-y-4">
@@ -717,150 +858,285 @@ export const SettingsView: React.FC<Props> = ({
           <div className="flex items-center gap-2">
             <Mail className="h-5 w-5 text-sky-600" />
             <div>
-              <h3 className="text-base font-semibold text-slate-900">个人邮箱 IMAP 自动解析配置</h3>
-              <p className="text-xs text-slate-500">支持自动扫描支付宝/微信账单附件及信用卡、缴费、行程邮件（仅连接个人邮箱本地解析）</p>
+              <h3 className="text-base font-semibold text-slate-900">
+                多邮箱 IMAP 自动解析配置（已接入 {emailAccounts.length} 个邮箱）
+              </h3>
+              <p className="text-xs text-slate-500">
+                可同时接入多个 Gmail、QQ、163 或企业邮箱；AI 对话分析与后台自动同步会自动汇总扫描全部已启用邮箱
+              </p>
             </div>
           </div>
           <button
             type="button"
-            onClick={handleTestEmail}
-            className="rounded-xl border border-sky-200 bg-sky-50 px-3.5 py-1.5 text-xs font-medium text-sky-700 hover:bg-sky-100 cursor-pointer"
+            onClick={handleOpenAddEmail}
+            className="inline-flex items-center gap-1 rounded-xl bg-sky-600 px-3.5 py-1.5 text-xs font-medium text-white hover:bg-sky-700 cursor-pointer"
           >
-            测试邮箱连接
+            <Plus className="h-3.5 w-3.5" />
+            <span>添加邮箱</span>
           </button>
         </div>
 
-        <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="text-slate-500 py-1">常用预设：</span>
-            {[
-              { label: 'Gmail (Google 邮箱)', host: 'imap.gmail.com', port: '993', suggestProxy: true },
-              { label: 'QQ 邮箱', host: 'imap.qq.com', port: '993', suggestProxy: false },
-              { label: '163 邮箱', host: 'imap.163.com', port: '993', suggestProxy: false },
-              { label: '腾讯企业邮', host: 'imap.exmail.qq.com', port: '993', suggestProxy: false },
-            ].map((preset) => (
-              <button
-                key={preset.host}
-                type="button"
-                onClick={() => {
-                  updateField('email_imap_host', preset.host);
-                  updateField('email_imap_port', preset.port);
-                  updateField('email_use_ssl', '1');
-                  if (preset.suggestProxy) {
-                    updateField('email_use_proxy', '1');
-                  }
-                }}
-                className={`rounded-lg px-2.5 py-1 cursor-pointer ${
-                  settings.email_imap_host === preset.host
-                    ? 'bg-sky-600 text-white'
-                    : 'bg-slate-100 text-slate-700 hover:bg-sky-50 hover:text-sky-700'
-                }`}
-              >
-                {preset.label}
-              </button>
-            ))}
-          </div>
-          <label className="inline-flex items-center gap-2 font-medium text-slate-700 cursor-pointer">
+        <div className="flex flex-wrap items-center gap-4 rounded-xl border border-slate-200/70 bg-slate-50/70 px-3.5 py-2.5 text-xs text-slate-700">
+          <label className="inline-flex items-center gap-2 font-medium cursor-pointer">
             <input
               type="checkbox"
-              checked={settings.email_use_proxy === '1'}
-              onChange={(e) => updateField('email_use_proxy', e.target.checked ? '1' : '0')}
+              checked={settings.email_auto_sync_enabled === '1'}
+              onChange={(e) => updateField('email_auto_sync_enabled', e.target.checked ? '1' : '0')}
             />
-            <span>通过全局代理连接邮箱（Gmail 必开）</span>
+            <span>开启后台定时自动解析全部已启用邮箱</span>
           </label>
+          <select
+            value={settings.email_sync_interval_min || '30'}
+            onChange={(e) => updateField('email_sync_interval_min', e.target.value)}
+            className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs"
+          >
+            <option value="15">每 15 分钟</option>
+            <option value="30">每 30 分钟</option>
+            <option value="60">每 60 分钟</option>
+          </select>
         </div>
 
-        {(settings.email_imap_host || '').toLowerCase().includes('gmail') && (
-          <div className="rounded-xl border border-sky-200/80 bg-sky-50/70 p-3 text-[11px] text-sky-900 space-y-1">
-            <div className="font-semibold">Gmail 接入 3 步指引：</div>
-            <div>
-              1. 前往 Google 账号安全设置开启「两步验证」，然后打开{' '}
-              <span className="font-mono underline">myaccount.google.com/apppasswords</span> 创建一个「应用专用密码」（16 位字母）。
-            </div>
-            <div>2. 邮箱账号填完整 Gmail 地址（如 xxx@gmail.com），上方密码框填刚才生成的 16 位应用专用密码。</div>
-            <div>3. 若服务器位于国内，请确保顶部「全局网络代理配置」已填可用代理并勾选「通过全局代理连接邮箱」。</div>
+        {/* Configured mailboxes list */}
+        {emailAccounts.length > 0 && (
+          <div className="space-y-2.5">
+            {emailAccounts.map((acct) => {
+              const testRes = emailAccountTestResults[acct.id];
+              return (
+                <div
+                  key={acct.id}
+                  className="rounded-xl border border-slate-200/80 bg-white p-3.5 space-y-2"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="space-y-0.5">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-sm font-semibold text-slate-900">{acct.name || acct.username}</span>
+                        <span
+                          className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${
+                            acct.enabled ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'
+                          }`}
+                        >
+                          {acct.enabled ? '已启用' : '已停用'}
+                        </span>
+                        <span
+                          className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${
+                            acct.use_proxy ? 'bg-cyan-50 text-cyan-700' : 'bg-slate-100 text-slate-500'
+                          }`}
+                        >
+                          {acct.use_proxy ? '走全局代理' : '直连'}
+                        </span>
+                      </div>
+                      <div className="text-xs text-slate-500 font-mono">
+                        {acct.username} · {acct.imap_host}:{acct.imap_port}
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-1.5 text-xs">
+                      <button
+                        type="button"
+                        disabled={testingEmailId === acct.id}
+                        onClick={() => handleTestEmailAccount(acct)}
+                        className="rounded-lg border border-sky-200 bg-sky-50 px-2.5 py-1 font-medium text-sky-700 hover:bg-sky-100 disabled:opacity-50 cursor-pointer"
+                      >
+                        {testingEmailId === acct.id ? '测试中...' : '测试连接'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleToggleEmailAccount(acct)}
+                        className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-slate-600 hover:bg-slate-50 cursor-pointer"
+                      >
+                        {acct.enabled ? '停用' : '启用'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleOpenEditEmail(acct)}
+                        className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-slate-700 hover:bg-slate-50 cursor-pointer"
+                      >
+                        <Pencil className="h-3 w-3" />
+                        <span>编辑</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteEmailAccount(acct)}
+                        className="inline-flex items-center gap-1 rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1 text-rose-600 hover:bg-rose-100 cursor-pointer"
+                      >
+                        <Trash2 className="h-3 w-3" />
+                        <span>删除</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {testRes && (
+                    <div
+                      className={`flex items-center gap-2 rounded-lg px-3 py-2 text-xs ${
+                        testRes.ok ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-700'
+                      }`}
+                    >
+                      {testRes.ok ? <CheckCircle2 className="h-3.5 w-3.5 shrink-0" /> : <XCircle className="h-3.5 w-3.5 shrink-0" />}
+                      <span>{testRes.message}</span>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </div>
         )}
 
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-          <div>
-            <label className="block text-xs font-medium text-slate-700 mb-1">IMAP 服务器地址</label>
-            <input
-              type="text"
-              value={settings.email_imap_host || ''}
-              onChange={(e) => updateField('email_imap_host', e.target.value)}
-              placeholder="imap.qq.com"
-              className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm font-mono"
-            />
-          </div>
-          <div>
-            <label className="block text-xs font-medium text-slate-700 mb-1">端口（SSL 默认 993）</label>
-            <input
-              type="text"
-              value={settings.email_imap_port || '993'}
-              onChange={(e) => updateField('email_imap_port', e.target.value)}
-              className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm font-mono"
-            />
-          </div>
-          <div>
-            <label className="block text-xs font-medium text-slate-700 mb-1">邮箱账号</label>
-            <input
-              type="text"
-              value={settings.email_username || ''}
-              onChange={(e) => updateField('email_username', e.target.value)}
-              placeholder="your_email@qq.com"
-              className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm"
-            />
-          </div>
-          <div>
-            <label className="block text-xs font-medium text-slate-700 mb-1">IMAP 授权码 / 应用专用密码</label>
-            <input
-              type="password"
-              value={settings.email_password || ''}
-              onChange={(e) => updateField('email_password', e.target.value)}
-              placeholder="QQ/163/Gmail 请填 IMAP 授权码"
-              className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm"
-            />
-          </div>
-          <div>
-            <label className="block text-xs font-medium text-slate-700 mb-1">默认账单压缩包密码（可选）</label>
-            <input
-              type="password"
-              value={settings.email_bill_zip_password || ''}
-              onChange={(e) => updateField('email_bill_zip_password', e.target.value)}
-              placeholder="微信/支付宝发送加密 zip 时使用"
-              className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm"
-            />
-          </div>
-          <div className="flex items-end gap-3 pb-1">
-            <label className="inline-flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={settings.email_auto_sync_enabled === '1'}
-                onChange={(e) => updateField('email_auto_sync_enabled', e.target.checked ? '1' : '0')}
-              />
-              <span>开启后台定时自动解析邮箱</span>
-            </label>
-            <select
-              value={settings.email_sync_interval_min || '30'}
-              onChange={(e) => updateField('email_sync_interval_min', e.target.value)}
-              className="rounded-lg border border-slate-200 px-2 py-1 text-xs"
-            >
-              <option value="15">每 15 分钟</option>
-              <option value="30">每 30 分钟</option>
-              <option value="60">每 60 分钟</option>
-            </select>
-          </div>
-        </div>
+        {/* Add / Edit mailbox form */}
+        {emailFormOpen && (
+          <div className="rounded-xl border border-sky-200/80 bg-sky-50/40 p-4 space-y-3.5">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h4 className="text-xs font-semibold text-slate-900">
+                {editingEmailId === null ? '添加新邮箱账号' : '编辑邮箱账号'}
+              </h4>
+              <div className="flex flex-wrap items-center gap-1.5 text-xs">
+                <span className="text-slate-500">预设：</span>
+                {[
+                  { label: 'Gmail (Google)', host: 'imap.gmail.com', port: '993', suggestProxy: true },
+                  { label: 'QQ 邮箱', host: 'imap.qq.com', port: '993', suggestProxy: false },
+                  { label: '163 邮箱', host: 'imap.163.com', port: '993', suggestProxy: false },
+                  { label: '腾讯企业邮', host: 'imap.exmail.qq.com', port: '993', suggestProxy: false },
+                ].map((preset) => (
+                  <button
+                    key={preset.host}
+                    type="button"
+                    onClick={() =>
+                      setEmailForm((prev) => ({
+                        ...prev,
+                        imap_host: preset.host,
+                        imap_port: preset.port,
+                        use_ssl: true,
+                        use_proxy: preset.suggestProxy,
+                      }))
+                    }
+                    className={`rounded-lg px-2 py-1 cursor-pointer ${
+                      emailForm.imap_host === preset.host
+                        ? 'bg-sky-600 text-white'
+                        : 'bg-white border border-slate-200 text-slate-700 hover:bg-sky-50'
+                    }`}
+                  >
+                    {preset.label}
+                  </button>
+                ))}
+              </div>
+            </div>
 
-        {emailTestResult && (
-          <div
-            className={`flex items-center gap-2 rounded-xl px-4 py-2.5 text-xs ${
-              emailTestResult.ok ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-700'
-            }`}
-          >
-            {emailTestResult.ok ? <CheckCircle2 className="h-4 w-4" /> : <XCircle className="h-4 w-4" />}
-            <span>{emailTestResult.message}</span>
+            {emailForm.imap_host.toLowerCase().includes('gmail') && (
+              <div className="rounded-xl border border-sky-200 bg-white/80 p-3 text-[11px] text-sky-900 space-y-1">
+                <div className="font-semibold">Gmail 接入 3 步指引：</div>
+                <div>
+                  1. 开启 Google 两步验证后访问 <span className="font-mono underline">myaccount.google.com/apppasswords</span> 生成 16 位「应用专用密码」。
+                </div>
+                <div>2. 邮箱账号填完整 Gmail 地址，下方授权码框填生成的 16 位应用专用密码。</div>
+                <div>3. 国内服务器请保持勾选「通过全局代理连接该邮箱」，并在顶部「全局代理」填好代理地址。</div>
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">邮箱备注名（如 主Gmail / QQ账单）</label>
+                <input
+                  type="text"
+                  value={emailForm.name}
+                  onChange={(e) => setEmailForm((prev) => ({ ...prev, name: e.target.value }))}
+                  placeholder="留空默认使用邮箱账号"
+                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">邮箱账号 *</label>
+                <input
+                  type="text"
+                  value={emailForm.username}
+                  onChange={(e) => setEmailForm((prev) => ({ ...prev, username: e.target.value }))}
+                  placeholder="your_email@gmail.com"
+                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">IMAP 服务器地址 *</label>
+                <input
+                  type="text"
+                  value={emailForm.imap_host}
+                  onChange={(e) => setEmailForm((prev) => ({ ...prev, imap_host: e.target.value }))}
+                  placeholder="imap.gmail.com"
+                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-mono"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">端口（SSL 默认 993）</label>
+                <input
+                  type="text"
+                  value={emailForm.imap_port}
+                  onChange={(e) => setEmailForm((prev) => ({ ...prev, imap_port: e.target.value }))}
+                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-mono"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">
+                  IMAP 授权码 / 应用专用密码 {editingEmailId === null ? '*' : '（留空不修改）'}
+                </label>
+                <input
+                  type="password"
+                  value={emailForm.password}
+                  onChange={(e) => setEmailForm((prev) => ({ ...prev, password: e.target.value }))}
+                  placeholder={editingEmailId === null ? 'QQ/163/Gmail 专用授权码' : '留空则保持原授权码不变'}
+                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">默认账单压缩包密码（可选）</label>
+                <input
+                  type="password"
+                  value={emailForm.bill_zip_password}
+                  onChange={(e) => setEmailForm((prev) => ({ ...prev, bill_zip_password: e.target.value }))}
+                  placeholder="微信/支付宝加密 zip 解压密码"
+                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
+                />
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+              <div className="flex flex-wrap items-center gap-4 text-xs text-slate-700">
+                <label className="inline-flex items-center gap-2 font-medium cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={emailForm.use_proxy}
+                    onChange={(e) => setEmailForm((prev) => ({ ...prev, use_proxy: e.target.checked }))}
+                  />
+                  <span>通过全局代理连接该邮箱（Gmail 必开）</span>
+                </label>
+                <label className="inline-flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={emailForm.enabled}
+                    onChange={(e) => setEmailForm((prev) => ({ ...prev, enabled: e.target.checked }))}
+                  />
+                  <span>启用该邮箱</span>
+                </label>
+              </div>
+              <div className="flex items-center gap-2">
+                {emailAccounts.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setEmailFormOpen(false);
+                      setEditingEmailId(null);
+                    }}
+                    className="rounded-xl border border-slate-200 bg-white px-3.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50 cursor-pointer"
+                  >
+                    取消
+                  </button>
+                )}
+                <button
+                  type="button"
+                  disabled={emailSaving}
+                  onClick={handleSaveEmailAccount}
+                  className="rounded-xl bg-sky-600 px-4 py-1.5 text-xs font-medium text-white hover:bg-sky-700 disabled:opacity-50 cursor-pointer"
+                >
+                  {emailSaving ? '保存中...' : editingEmailId === null ? '保存并添加到列表' : '保存邮箱修改'}
+                </button>
+              </div>
+            </div>
           </div>
         )}
       </div>
