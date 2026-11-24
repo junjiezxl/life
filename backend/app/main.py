@@ -99,6 +99,7 @@ from .services.ibkr_service import (
     sync_ibkr_flex,
     test_ibkr_connection,
 )
+from .services.proxy_service import test_proxy_connection
 from .services.siyuan_service import fetch_siyuan_notes, test_siyuan_connection
 
 app = FastAPI(title="LifeHub API", version="1.0.0")
@@ -2971,6 +2972,11 @@ async def update_settings_endpoint(payload: SettingsUpdateRequest) -> Dict[str, 
 @app.post("/api/settings/test-ai")
 async def test_ai_endpoint() -> Dict[str, Any]:
     return await test_ai_connection(get_all_settings())
+
+
+@app.post("/api/settings/test-proxy")
+async def test_proxy_endpoint() -> Dict[str, Any]:
+    return await test_proxy_connection(get_all_settings())
 
 
 @app.post("/api/settings/test-bark")

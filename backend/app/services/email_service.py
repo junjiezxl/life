@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .ai_service import extract_from_email_content
 from .bill_parser import parse_bill_file
+from .proxy_service import create_proxied_socket, resolve_proxy_url
 
 
 def _decode_mime_str(raw: Optional[str]) -> str:
@@ -105,20 +106,48 @@ def _extract_body_and_attachments(msg: Message) -> Tuple[str, List[Tuple[str, by
     return body, attachments
 
 
+class _ProxiedIMAP4(imaplib.IMAP4):
+    def __init__(self, host: str, port: int, proxy_url: str, timeout: float = 15.0):
+        self._proxy_url = proxy_url
+        super().__init__(host, port, timeout=timeout)
+
+    def _create_socket(self, timeout):
+        return create_proxied_socket(self.host, self.port, self._proxy_url, timeout or 15.0)
+
+
+class _ProxiedIMAP4_SSL(imaplib.IMAP4_SSL):
+    def __init__(self, host: str, port: int, proxy_url: str, timeout: float = 15.0):
+        self._proxy_url = proxy_url
+        super().__init__(host, port, timeout=timeout)
+
+    def _create_socket(self, timeout):
+        import ssl
+
+        sock = create_proxied_socket(self.host, self.port, self._proxy_url, timeout or 15.0)
+        return self.ssl_context.wrap_socket(sock, server_hostname=self.host)
+
+
 def _connect_imap(settings: Dict[str, str]) -> imaplib.IMAP4:
     host = (settings.get("email_imap_host") or "").strip()
     port = int(settings.get("email_imap_port") or 993)
     username = (settings.get("email_username") or "").strip()
     password = (settings.get("email_password") or "").strip()
     use_ssl = settings.get("email_use_ssl", "1") != "0"
+    proxy_url = resolve_proxy_url("email_use_proxy", settings)
 
     if not host or not username or not password:
         raise ValueError("请先在「系统设置」填写邮箱 IMAP 服务器、邮箱账号和授权码。")
 
-    if use_ssl:
-        client: imaplib.IMAP4 = imaplib.IMAP4_SSL(host, port, timeout=15)
+    if proxy_url:
+        if use_ssl:
+            client: imaplib.IMAP4 = _ProxiedIMAP4_SSL(host, port, proxy_url, timeout=15)
+        else:
+            client = _ProxiedIMAP4(host, port, proxy_url, timeout=15)
     else:
-        client = imaplib.IMAP4(host, port, timeout=15)
+        if use_ssl:
+            client = imaplib.IMAP4_SSL(host, port, timeout=15)
+        else:
+            client = imaplib.IMAP4(host, port, timeout=15)
     client.login(username, password)
     return client
 
@@ -140,10 +169,17 @@ def test_imap_connection(settings: Dict[str, str]) -> Dict[str, Any]:
             except Exception:
                 pass
     except Exception as exc:
-        err = str(exc)
+        err = str(exc).strip() or type(exc).__name__
+        host = (settings.get("email_imap_host") or "").lower()
         hint = ""
-        if "login" in err.lower() or "auth" in err.lower() or "password" in err.lower():
-            hint = "（提示：QQ邮箱/163邮箱/Gmail 请使用「IMAP 专用授权码 / App Password」，而不是登录密码。）"
+        if "login" in err.lower() or "auth" in err.lower() or "password" in err.lower() or "invalid credentials" in err.lower():
+            if "gmail" in host:
+                hint = "（Gmail 需开启「两步验证」后在安全设置生成 16 位「应用专用密码 (App Password)」填入授权码框，不能用登录密码。）"
+            else:
+                hint = "（提示：QQ邮箱/163邮箱/Gmail 请使用「IMAP 专用授权码 / App Password」，而不是登录密码。）"
+        elif "timeout" in err.lower() or "timed out" in err.lower() or "refused" in err.lower():
+            if "gmail" in host:
+                hint = "（提示：国内服务器直连 imap.gmail.com:993 通常会被屏蔽，请在全局网络代理配置代理并开启「邮箱走全局代理」开关。）"
         return {"ok": False, "message": f"邮箱连接失败: {err} {hint}".strip(), "inbox_count": 0}
 
 

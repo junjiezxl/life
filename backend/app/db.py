@@ -63,6 +63,13 @@ DEFAULT_SETTINGS: Dict[str, str] = {
     "bark_push_on_create": "1",
     "bark_push_on_update": "1",
     "bark_due_advance_min": "15",
+    "global_proxy_url": "",
+    "global_proxy_enabled": "1",
+    "ai_use_proxy": "0",
+    "email_use_proxy": "0",
+    "ctrader_oauth_use_proxy": "1",
+    "ibkr_use_proxy": "0",
+    "bark_use_proxy": "0",
     "ctrader_client_id": "",
     "ctrader_client_secret": "",
     "ctrader_access_token": "",
@@ -457,6 +464,19 @@ def init_db(seed_demo: bool = True) -> None:
                 "INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
                 (k, v, ts),
             )
+
+        # Migrate legacy per-module proxy URLs into global_proxy_url if not yet populated
+        gp_row = conn.execute("SELECT value FROM settings WHERE key = 'global_proxy_url'").fetchone()
+        if gp_row and not (gp_row["value"] or "").strip():
+            for legacy_k in ("ctrader_oauth_proxy", "ibkr_proxy_url"):
+                leg_row = conn.execute("SELECT value FROM settings WHERE key = ?", (legacy_k,)).fetchone()
+                leg_val = (leg_row["value"] or "").strip() if leg_row else ""
+                if leg_val:
+                    conn.execute(
+                        "UPDATE settings SET value = ?, updated_at = ? WHERE key = 'global_proxy_url'",
+                        (leg_val, ts),
+                    )
+                    break
 
         if seed_demo:
             seeded_flag = conn.execute("SELECT value FROM settings WHERE key = 'demo_seeded'").fetchone()

@@ -1179,7 +1179,7 @@ class TestLifeHubAPI(unittest.TestCase):
             err_resp = self.client.post("/api/ctrader/oauth/refresh")
             self.assertEqual(err_resp.status_code, 400)
             self.assertIn("ConnectTimeout", err_resp.json()["detail"])
-            self.assertIn("OAuth 出站代理", err_resp.json()["detail"])
+            self.assertIn("全局网络代理配置", err_resp.json()["detail"])
         self.assertEqual(proxy_seen, ["http://10.0.0.88:7890"])
         update_settings({"ctrader_oauth_proxy": ""})
 
@@ -1513,6 +1513,102 @@ class TestLifeHubAPI(unittest.TestCase):
         self.assertEqual(len(body["daily_trades"]), 2)
         self.assertEqual(body["daily_trades"][0]["trade_date"], "2026-11-23")
         self.assertEqual(body["daily_trades"][0]["net_pnl"], 149.0)
+
+    def test_21_global_proxy_switches_and_proxied_imap_gmail(self):
+        import socket
+        import threading
+        from unittest.mock import patch
+        from app.db import update_settings
+        from app.services import email_service, proxy_service
+
+        update_settings(
+            {
+                "global_proxy_url": "http://10.0.0.99:7890",
+                "global_proxy_enabled": "1",
+                "email_use_proxy": "1",
+                "ai_use_proxy": "0",
+                "ibkr_use_proxy": "1",
+                "bark_use_proxy": "0",
+                "ctrader_oauth_use_proxy": "1",
+            }
+        )
+        self.assertEqual(proxy_service.resolve_proxy_url("email_use_proxy"), "http://10.0.0.99:7890")
+        self.assertEqual(proxy_service.resolve_proxy_url("ai_use_proxy"), "")
+        self.assertEqual(proxy_service.resolve_proxy_url("ibkr_use_proxy"), "http://10.0.0.99:7890")
+        self.assertEqual(proxy_service.resolve_proxy_url("bark_use_proxy"), "")
+        self.assertEqual(proxy_service.resolve_proxy_url("ctrader_oauth_use_proxy"), "http://10.0.0.99:7890")
+
+        # Master switch off overrides all module switches
+        update_settings({"global_proxy_enabled": "0"})
+        self.assertEqual(proxy_service.resolve_proxy_url("email_use_proxy"), "")
+        self.assertEqual(proxy_service.resolve_proxy_url("ctrader_oauth_use_proxy"), "")
+
+        # Verify pure-stdlib HTTP CONNECT tunnel handshake with loopback server
+        captured_req = []
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+
+        def _serve_connect():
+            conn, _ = srv.accept()
+            data = conn.recv(4096).decode("ascii", errors="ignore")
+            captured_req.append(data)
+            conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            conn.close()
+
+        t = threading.Thread(target=_serve_connect, daemon=True)
+        t.start()
+        try:
+            sock = proxy_service.create_proxied_socket(
+                "imap.gmail.com",
+                993,
+                f"http://user1:pass1@127.0.0.1:{port}",
+                timeout=5.0,
+            )
+            sock.close()
+        finally:
+            t.join(timeout=2)
+            srv.close()
+
+        self.assertEqual(len(captured_req), 1)
+        self.assertIn("CONNECT imap.gmail.com:993 HTTP/1.1", captured_req[0])
+        self.assertIn("Proxy-Authorization: Basic ", captured_req[0])
+
+        # Verify Gmail-specific auth hint & test-proxy endpoint
+        with patch.object(email_service, "_connect_imap", side_effect=Exception("[AUTHENTICATIONFAILED] Invalid credentials")):
+            res = email_service.test_imap_connection(
+                {"email_imap_host": "imap.gmail.com", "email_username": "u@gmail.com", "email_password": "bad"}
+            )
+            self.assertFalse(res["ok"])
+            self.assertIn("应用专用密码", res["message"])
+
+        update_settings({"global_proxy_url": "http://127.0.0.1:7890", "global_proxy_enabled": "1"})
+
+        class _ProxyMockResp:
+            def __init__(self, code):
+                self.status_code = code
+
+        class _ProxyMockClient:
+            def __init__(self, *args, **kwargs):
+                self.proxy = kwargs.get("proxy")
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, url):
+                return _ProxyMockResp(204 if "google" in url else 200)
+
+        with patch("app.services.proxy_service.httpx.AsyncClient", _ProxyMockClient):
+            tp = self.client.post("/api/settings/test-proxy")
+            self.assertEqual(tp.status_code, 200)
+            self.assertTrue(tp.json()["ok"])
+            self.assertIn("Google: HTTP 204", tp.json()["message"])
+
+        update_settings({"global_proxy_url": "", "email_use_proxy": "0", "ibkr_use_proxy": "0"})
 
 
 if __name__ == "__main__":

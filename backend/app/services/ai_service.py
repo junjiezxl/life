@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
+from .proxy_service import build_httpx_kwargs
+
 
 WEEKDAY_MAP = {
     "一": 0,
@@ -58,7 +60,7 @@ async def _call_llm_json(
             },
         }
         try:
-            async with httpx.AsyncClient(timeout=timeout_s) as client:
+            async with httpx.AsyncClient(**build_httpx_kwargs(timeout_s, "ai_use_proxy", settings)) as client:
                 resp = await client.post(url, json=payload)
                 resp.raise_for_status()
                 data = resp.json()
@@ -84,7 +86,7 @@ async def _call_llm_json(
             ],
         }
         try:
-            async with httpx.AsyncClient(timeout=timeout_s) as client:
+            async with httpx.AsyncClient(**build_httpx_kwargs(timeout_s, "ai_use_proxy", settings)) as client:
                 resp = await client.post(f"{base_url}/chat/completions", headers=headers, json=payload)
                 resp.raise_for_status()
                 data = resp.json()

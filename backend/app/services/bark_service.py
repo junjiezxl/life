@@ -2,6 +2,8 @@ from typing import Any, Dict, Optional
 
 import httpx
 
+from .proxy_service import build_httpx_kwargs
+
 
 def _build_bark_push_url(server_url: str, device_key: str) -> str:
     key = (device_key or "").strip().strip("/")
@@ -52,7 +54,7 @@ async def send_bark_push(
         payload["sound"] = sound
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(**build_httpx_kwargs(10.0, "bark_use_proxy", settings)) as client:
             resp = await client.post(push_url, json=payload)
             resp.raise_for_status()
             data = resp.json()

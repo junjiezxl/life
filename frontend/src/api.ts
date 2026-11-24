@@ -359,6 +359,7 @@ export const api = {
   updateSettings: (updates: Partial<AppSettings>) =>
     request<AppSettings>('/api/settings', { method: 'PUT', body: JSON.stringify(updates) }),
   testAi: () => request<{ ok: boolean; provider: string; message: string }>('/api/settings/test-ai', { method: 'POST' }),
+  testProxy: () => request<{ ok: boolean; message: string }>('/api/settings/test-proxy', { method: 'POST' }),
   testBark: () => request<{ ok: boolean; message: string }>('/api/settings/test-bark', { method: 'POST' }),
   getCTraderDeals: (limit = 5000) => request<import('./types').CTraderDealsResponse>(`/api/ctrader/deals?limit=${limit}`),
   getCTraderSyncStatus: () => request<import('./types').CTraderSyncStatus>('/api/ctrader/sync/status'),

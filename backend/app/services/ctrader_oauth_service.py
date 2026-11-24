@@ -12,6 +12,7 @@ import httpx
 
 from ..db import get_all_settings, update_settings
 from .bark_service import send_bark_push
+from .proxy_service import build_httpx_kwargs
 
 logger = logging.getLogger("lifehub.ctrader_oauth")
 
@@ -101,16 +102,12 @@ def _compute_expires_iso(expires_in: Any) -> tuple[int, str]:
 
 
 async def _request_ctrader_token(params: Dict[str, str], *, proxy_url: str = "") -> Dict[str, Any]:
-    effective_proxy = (
-        proxy_url
-        or (get_all_settings().get("ctrader_oauth_proxy") or "")
-        or os.environ.get("HTTPS_PROXY")
-        or os.environ.get("HTTP_PROXY")
-        or ""
-    ).strip()
-    client_kwargs: Dict[str, Any] = {"timeout": 20.0}
-    if effective_proxy:
-        client_kwargs["proxy"] = effective_proxy
+    client_kwargs = build_httpx_kwargs(
+        20.0,
+        "ctrader_oauth_use_proxy",
+        legacy_key="ctrader_oauth_proxy",
+        explicit_proxy=proxy_url,
+    )
 
     try:
         async with httpx.AsyncClient(**client_kwargs) as client:
@@ -119,7 +116,7 @@ async def _request_ctrader_token(params: Dict[str, str], *, proxy_url: str = "")
         detail = str(exc).strip() or type(exc).__name__
         raise RuntimeError(
             f"无法连接 cTrader OAuth 服务器 ({CTRADER_TOKEN_URL}) [{type(exc).__name__}: {detail}]。"
-            "国内网络通常会屏蔽或重置 openapi.ctrader.com，请在设置页「OAuth 出站代理」填入可用的 HTTP 代理（例如 http://10.0.0.x:7890）后重试。"
+            "国内网络通常会屏蔽或重置 openapi.ctrader.com，请在「系统设置 → 全局网络代理配置」填写可用代理并开启 cTrader OAuth 代理开关。"
         ) from exc
 
     try:

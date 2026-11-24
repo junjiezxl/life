@@ -18,6 +18,7 @@ import httpx
 
 from ..db import get_all_settings, get_conn, now_iso, update_settings
 from .bark_service import send_bark_push
+from .proxy_service import resolve_proxy_url
 
 logger = logging.getLogger("lifehub.ibkr")
 
@@ -95,12 +96,7 @@ def _format_executed_at(date_str: str, time_str: str) -> str:
 
 
 def _resolve_proxy(cfg: Dict[str, str]) -> str:
-    return (
-        (cfg.get("ibkr_proxy_url") or "").strip()
-        or os.environ.get("HTTPS_PROXY")
-        or os.environ.get("HTTP_PROXY")
-        or ""
-    ).strip()
+    return resolve_proxy_url("ibkr_use_proxy", cfg, legacy_key="ibkr_proxy_url")
 
 
 def _parse_flex_service_response(xml_text: str) -> Dict[str, str]:

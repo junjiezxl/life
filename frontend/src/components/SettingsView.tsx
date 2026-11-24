@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { BellRing, Bot, CheckCircle2, Copy, Database, ExternalLink, KeyRound, LogOut, Mail, PlugZap, RefreshCw, Save, ShieldCheck, XCircle } from 'lucide-react';
+import { BellRing, Bot, CheckCircle2, Copy, Database, ExternalLink, Globe, KeyRound, LogOut, Mail, PlugZap, RefreshCw, Save, ShieldCheck, XCircle } from 'lucide-react';
 import { api } from '../api';
 import type { AppSettings } from '../types';
 
@@ -26,6 +26,8 @@ export const SettingsView: React.FC<Props> = ({
   } | null>(null);
   const [emailTestResult, setEmailTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [barkTestResult, setBarkTestResult] = useState<{ ok: boolean; message: string } | null>(null);
+  const [proxyTestResult, setProxyTestResult] = useState<{ ok: boolean; message: string } | null>(null);
+  const [proxyTesting, setProxyTesting] = useState(false);
   const [ctraderTestResult, setCtraderTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [ibkrTestResult, setIbkrTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [ctraderOAuthScope, setCtraderOAuthScope] = useState<'accounts' | 'trading'>('accounts');
@@ -85,6 +87,23 @@ export const SettingsView: React.FC<Props> = ({
     await api.updateSettings(settings);
     const res = await api.testAi();
     setAiTestResult(res);
+  };
+
+  const handleTestProxy = async () => {
+    setProxyTesting(true);
+    setProxyTestResult(null);
+    try {
+      await api.updateSettings(settings);
+      const res = await api.testProxy();
+      setProxyTestResult(res);
+    } catch (err) {
+      setProxyTestResult({
+        ok: false,
+        message: err instanceof Error ? err.message : '代理测试失败',
+      });
+    } finally {
+      setProxyTesting(false);
+    }
   };
 
   const handleTestSiyuan = async () => {
@@ -302,6 +321,111 @@ export const SettingsView: React.FC<Props> = ({
   return (
     <div className="space-y-6 max-w-4xl">
     <form onSubmit={handleSave} className="space-y-6">
+      {/* Global Outbound Proxy Config */}
+      <div className="rounded-2xl border border-slate-200/80 bg-white p-6 shadow-xs space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-3">
+          <div className="flex items-center gap-2">
+            <Globe className="h-5 w-5 text-cyan-600" />
+            <div>
+              <h3 className="text-base font-semibold text-slate-900">全局网络代理配置（独立出站网关）</h3>
+              <p className="text-xs text-slate-500">
+                统一管理代理服务器地址，并可按功能独立控制哪些服务走代理（例如 Gmail 邮箱、Gemini AI、cTrader OAuth、IBKR）
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={handleTestProxy}
+            disabled={proxyTesting}
+            className="rounded-xl border border-cyan-200 bg-cyan-50 px-3.5 py-1.5 text-xs font-medium text-cyan-700 hover:bg-cyan-100 disabled:opacity-50 cursor-pointer"
+          >
+            {proxyTesting ? '测试中...' : '测试代理连通性'}
+          </button>
+        </div>
+
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-3 items-end">
+          <div className="sm:col-span-2">
+            <label className="block text-xs font-medium text-slate-700 mb-1">
+              全局代理服务器地址（推荐 HTTP 代理端口，兼容全部 API 与 Gmail IMAP）
+            </label>
+            <input
+              type="text"
+              value={settings.global_proxy_url || ''}
+              onChange={(e) => updateField('global_proxy_url', e.target.value)}
+              placeholder="例如 http://10.0.0.x:7890（需局域网设备开启允许局域网连接）"
+              className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm font-mono outline-none focus:border-cyan-500"
+            />
+          </div>
+          <div className="pb-2">
+            <label className="inline-flex items-center gap-2 text-xs font-semibold text-slate-800 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={settings.global_proxy_enabled !== '0'}
+                onChange={(e) => updateField('global_proxy_enabled', e.target.checked ? '1' : '0')}
+              />
+              <span>启用全局代理总开关</span>
+            </label>
+          </div>
+        </div>
+
+        <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3.5 space-y-2">
+          <div className="text-xs font-semibold text-slate-700">按功能开启代理（勾选后对应功能将通过上方代理出站）：</div>
+          <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 md:grid-cols-3 text-xs text-slate-700">
+            <label className="inline-flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={settings.email_use_proxy === '1'}
+                onChange={(e) => updateField('email_use_proxy', e.target.checked ? '1' : '0')}
+              />
+              <span>Google Gmail / 个人邮箱</span>
+            </label>
+            <label className="inline-flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={settings.ai_use_proxy === '1'}
+                onChange={(e) => updateField('ai_use_proxy', e.target.checked ? '1' : '0')}
+              />
+              <span>Google Gemini / AI 接口</span>
+            </label>
+            <label className="inline-flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={settings.ctrader_oauth_use_proxy !== '0'}
+                onChange={(e) => updateField('ctrader_oauth_use_proxy', e.target.checked ? '1' : '0')}
+              />
+              <span>cTrader OAuth Token 续期</span>
+            </label>
+            <label className="inline-flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={settings.ibkr_use_proxy === '1'}
+                onChange={(e) => updateField('ibkr_use_proxy', e.target.checked ? '1' : '0')}
+              />
+              <span>盈透证券 (IBKR) Flex</span>
+            </label>
+            <label className="inline-flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={settings.bark_use_proxy === '1'}
+                onChange={(e) => updateField('bark_use_proxy', e.target.checked ? '1' : '0')}
+              />
+              <span>Bark 消息推送</span>
+            </label>
+          </div>
+        </div>
+
+        {proxyTestResult && (
+          <div
+            className={`flex items-center gap-2 rounded-xl px-4 py-2.5 text-xs ${
+              proxyTestResult.ok ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-700'
+            }`}
+          >
+            {proxyTestResult.ok ? <CheckCircle2 className="h-4 w-4" /> : <XCircle className="h-4 w-4" />}
+            <span>{proxyTestResult.message}</span>
+          </div>
+        )}
+      </div>
+
       {/* AI Config */}
       <div className="rounded-2xl border border-slate-200/80 bg-white p-6 shadow-xs space-y-4">
         <div className="flex items-center justify-between border-b border-slate-100 pb-3">
@@ -363,6 +487,16 @@ export const SettingsView: React.FC<Props> = ({
               placeholder="https://api.openai.com/v1 或 http://127.0.0.1:11434/v1"
               className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm"
             />
+          </div>
+          <div className="sm:col-span-2">
+            <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-700 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={settings.ai_use_proxy === '1'}
+                onChange={(e) => updateField('ai_use_proxy', e.target.checked ? '1' : '0')}
+              />
+              <span>通过全局代理访问 AI 接口（国内使用 Google Gemini 推荐开启）</span>
+            </label>
           </div>
         </div>
 
@@ -533,28 +667,57 @@ export const SettingsView: React.FC<Props> = ({
           </button>
         </div>
 
-        <div className="flex flex-wrap gap-2 text-xs">
-          <span className="text-slate-500 py-1">常用预设：</span>
-          {[
-            { label: 'QQ 邮箱', host: 'imap.qq.com', port: '993' },
-            { label: '163 邮箱', host: 'imap.163.com', port: '993' },
-            { label: 'Gmail', host: 'imap.gmail.com', port: '993' },
-            { label: '腾讯企业邮', host: 'imap.exmail.qq.com', port: '993' },
-          ].map((preset) => (
-            <button
-              key={preset.host}
-              type="button"
-              onClick={() => {
-                updateField('email_imap_host', preset.host);
-                updateField('email_imap_port', preset.port);
-                updateField('email_use_ssl', '1');
-              }}
-              className="rounded-lg bg-slate-100 px-2.5 py-1 text-slate-700 hover:bg-sky-50 hover:text-sky-700 cursor-pointer"
-            >
-              {preset.label}
-            </button>
-          ))}
+        <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-slate-500 py-1">常用预设：</span>
+            {[
+              { label: 'Gmail (Google 邮箱)', host: 'imap.gmail.com', port: '993', suggestProxy: true },
+              { label: 'QQ 邮箱', host: 'imap.qq.com', port: '993', suggestProxy: false },
+              { label: '163 邮箱', host: 'imap.163.com', port: '993', suggestProxy: false },
+              { label: '腾讯企业邮', host: 'imap.exmail.qq.com', port: '993', suggestProxy: false },
+            ].map((preset) => (
+              <button
+                key={preset.host}
+                type="button"
+                onClick={() => {
+                  updateField('email_imap_host', preset.host);
+                  updateField('email_imap_port', preset.port);
+                  updateField('email_use_ssl', '1');
+                  if (preset.suggestProxy) {
+                    updateField('email_use_proxy', '1');
+                  }
+                }}
+                className={`rounded-lg px-2.5 py-1 cursor-pointer ${
+                  settings.email_imap_host === preset.host
+                    ? 'bg-sky-600 text-white'
+                    : 'bg-slate-100 text-slate-700 hover:bg-sky-50 hover:text-sky-700'
+                }`}
+              >
+                {preset.label}
+              </button>
+            ))}
+          </div>
+          <label className="inline-flex items-center gap-2 font-medium text-slate-700 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={settings.email_use_proxy === '1'}
+              onChange={(e) => updateField('email_use_proxy', e.target.checked ? '1' : '0')}
+            />
+            <span>通过全局代理连接邮箱（Gmail 必开）</span>
+          </label>
         </div>
+
+        {(settings.email_imap_host || '').toLowerCase().includes('gmail') && (
+          <div className="rounded-xl border border-sky-200/80 bg-sky-50/70 p-3 text-[11px] text-sky-900 space-y-1">
+            <div className="font-semibold">Gmail 接入 3 步指引：</div>
+            <div>
+              1. 前往 Google 账号安全设置开启「两步验证」，然后打开{' '}
+              <span className="font-mono underline">myaccount.google.com/apppasswords</span> 创建一个「应用专用密码」（16 位字母）。
+            </div>
+            <div>2. 邮箱账号填完整 Gmail 地址（如 xxx@gmail.com），上方密码框填刚才生成的 16 位应用专用密码。</div>
+            <div>3. 若服务器位于国内，请确保顶部「全局网络代理配置」已填可用代理并勾选「通过全局代理连接邮箱」。</div>
+          </div>
+        )}
 
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div>
@@ -822,6 +985,14 @@ export const SettingsView: React.FC<Props> = ({
             />
             <span>Access Token 到期前自动续期</span>
           </label>
+          <label className="inline-flex items-center gap-2 font-medium cursor-pointer">
+            <input
+              type="checkbox"
+              checked={settings.ctrader_oauth_use_proxy !== '0'}
+              onChange={(e) => updateField('ctrader_oauth_use_proxy', e.target.checked ? '1' : '0')}
+            />
+            <span>OAuth 换取/续期走全局代理</span>
+          </label>
         </div>
 
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
@@ -1011,18 +1182,6 @@ export const SettingsView: React.FC<Props> = ({
                 </button>
               </div>
             </div>
-            <div className="md:col-span-2">
-              <label className="mb-1 block text-[11px] font-medium text-slate-600">
-                OAuth 出站代理（仅换取/自动续期 Token 时访问 openapi.ctrader.com；国内服务器建议填局域网代理，如 http://10.0.0.x:7890）
-              </label>
-              <input
-                type="text"
-                value={settings.ctrader_oauth_proxy || ''}
-                onChange={(e) => updateField('ctrader_oauth_proxy', e.target.value)}
-                placeholder="留空则直连；支持 http://IP:端口 或 socks5://（需与服务器同一局域网并开启允许局域网连接）"
-                className="w-full rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs outline-none focus:border-amber-500"
-              />
-            </div>
           </div>
         </div>
 
@@ -1073,9 +1232,17 @@ export const SettingsView: React.FC<Props> = ({
             />
             <span>出现新报告日时通过 Bark 发送每日净值汇总</span>
           </label>
+          <label className="inline-flex items-center gap-2 font-medium cursor-pointer">
+            <input
+              type="checkbox"
+              checked={settings.ibkr_use_proxy === '1'}
+              onChange={(e) => updateField('ibkr_use_proxy', e.target.checked ? '1' : '0')}
+            />
+            <span>使用全局代理拉取 Flex</span>
+          </label>
         </div>
 
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
           <div>
             <label className="mb-1 block text-xs font-medium text-slate-600">Flex Token</label>
             <input
@@ -1103,16 +1270,6 @@ export const SettingsView: React.FC<Props> = ({
               min={15}
               value={settings.ibkr_sync_interval_min || '360'}
               onChange={(e) => updateField('ibkr_sync_interval_min', e.target.value)}
-              className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-500"
-            />
-          </div>
-          <div>
-            <label className="mb-1 block text-xs font-medium text-slate-600">出站代理（可选，留空直连）</label>
-            <input
-              type="text"
-              value={settings.ibkr_proxy_url || ''}
-              onChange={(e) => updateField('ibkr_proxy_url', e.target.value)}
-              placeholder="例如 http://10.0.0.x:7890"
               className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-500"
             />
           </div>
