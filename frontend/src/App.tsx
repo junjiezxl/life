@@ -21,7 +21,7 @@ import { LoginView } from './components/LoginView';
 import { NotesExtractorView } from './components/NotesExtractorView';
 import { PhoneNumbersView } from './components/PhoneNumbersView';
 import { RemindersChatView } from './components/RemindersChatView';
-import { SettingsView } from './components/SettingsView';
+import { SettingsView, type SettingsTabKey } from './components/SettingsView';
 import type { CTraderMarketStatus, DashboardData, TabKey } from './types';
 
 const NAV_ITEMS: Array<{ key: TabKey; label: string; icon: React.ComponentType<{ className?: string }> }> = [
@@ -37,6 +37,7 @@ const NAV_ITEMS: Array<{ key: TabKey; label: string; icon: React.ComponentType<{
 
 export function App() {
   const [activeTab, setActiveTab] = useState<TabKey>('dashboard');
+  const [settingsTab, setSettingsTab] = useState<SettingsTabKey>('proxy');
   const [dashboard, setDashboard] = useState<DashboardData | null>(null);
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState<string | null>(null);
@@ -365,18 +366,25 @@ export function App() {
             {activeTab === 'ctrader' && (
               <CTraderOrdersView
                 onNotify={notify}
-                onNavigateSettings={() => setActiveTab('settings')}
+                onNavigateSettings={() => {
+                  setSettingsTab('ctrader');
+                  setActiveTab('settings');
+                }}
               />
             )}
             {activeTab === 'ibkr' && (
               <IbkrView
                 onNotify={notify}
-                onNavigateSettings={() => setActiveTab('settings')}
+                onNavigateSettings={() => {
+                  setSettingsTab('ibkr');
+                  setActiveTab('settings');
+                }}
               />
             )}
             {activeTab === 'settings' && (
               <SettingsView
                 currentUsername={username}
+                initialTab={settingsTab}
                 onUsernameChanged={setUsername}
                 onRefreshDashboard={loadDashboard}
                 onNotify={notify}
