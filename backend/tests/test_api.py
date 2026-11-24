@@ -1610,6 +1610,67 @@ class TestLifeHubAPI(unittest.TestCase):
 
         update_settings({"global_proxy_url": "", "email_use_proxy": "0", "ibkr_use_proxy": "0"})
 
+    def test_22_ai_chat_analyze_gmail_za_bank_hkd_and_bookkeep(self):
+        from unittest.mock import patch
+        from app.db import update_settings
+        from app.services import email_service
+
+        update_settings(
+            {
+                "ai_provider": "local_fallback",
+                "email_imap_host": "imap.gmail.com",
+                "email_imap_port": "993",
+                "email_username": "june@gmail.com",
+                "email_password": "app_password_16ch",
+            }
+        )
+
+        za_email_body = (
+            "众安银行\n"
+            "你有一次「最股励」机会\n\n"
+            "你好 June,\n"
+            "你于 2026-11-24 12:14:11 使用 ZA Card (0720) 完成一笔以下消费\n\n"
+            "消费金额:\n"
+            "HKD 11.87\n"
+            "消费商户: WECHAT PAY HONG KONG L\n\n"
+            "你于此笔消费得到一次 4%「最股励」回赠机会，回赠机会将于 48 小时后失效。\n"
+        )
+
+        fake_raw = [
+            {
+                "uid": "<za-bank-20261124-001@za.group>",
+                "imap_uid": "501",
+                "subject": "你有一次「最股励」机会",
+                "sender": "ZA Bank <no-reply@bank.za.group>",
+                "received_at": "2026-11-24 12:15",
+                "body": za_email_body,
+                "attachments": [],
+            }
+        ]
+
+        with patch.object(email_service, "_fetch_raw_emails_sync", return_value=fake_raw):
+            r1 = self.client.post("/api/chat", json={"message": "分析邮件中的数据把消费的内容计入个人财务"})
+            self.assertEqual(r1.status_code, 200, r1.text)
+            b1 = r1.json()
+            self.assertEqual(len(b1["created_transactions"]), 1)
+            tx = b1["created_transactions"][0]
+            self.assertEqual(tx["type"], "expense")
+            self.assertAlmostEqual(tx["amount"], round(11.87 * 0.92, 2), places=2)
+            self.assertEqual(tx["occurred_at"], "2026-11-24 12:14")
+            self.assertIn("WECHAT PAY HONG KONG L", tx["description"])
+            self.assertIn("ZA Card (0720)", tx["description"])
+            self.assertIn("HKD 11.87", tx["description"])
+            self.assertIn("已自动计入个人财务 1 笔", b1["message"]["content"])
+
+            # Second identical chat request must deduplicate and not double-charge
+            r2 = self.client.post("/api/chat", json={"message": "分析邮件中的数据把消费的内容计入个人财务"})
+            self.assertEqual(r2.status_code, 200, r2.text)
+            b2 = r2.json()
+            self.assertEqual(len(b2["created_transactions"]), 0)
+            self.assertIn("跳过重复入账 1 笔", b2["message"]["content"])
+
+        update_settings({"email_imap_host": "", "email_username": "", "email_password": ""})
+
 
 if __name__ == "__main__":
     unittest.main()

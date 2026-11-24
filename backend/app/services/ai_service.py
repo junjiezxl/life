@@ -566,21 +566,84 @@ async def test_ai_connection(settings: Dict[str, str]) -> Dict[str, Any]:
     return {"ok": False, "provider": provider, "message": err or "连接失败"}
 
 
+_FX_TO_CNY: Dict[str, float] = {
+    "CNY": 1.0,
+    "RMB": 1.0,
+    "HKD": 0.92,
+    "USD": 7.25,
+    "SGD": 5.40,
+    "EUR": 7.80,
+    "GBP": 9.15,
+    "JPY": 0.048,
+    "AUD": 4.70,
+    "CAD": 5.15,
+}
+
+
+def _extract_email_amount_and_currency(text: str) -> Tuple[Optional[float], str, Optional[float]]:
+    """Return (cny_amount, currency_code, original_amount)."""
+    currency_patterns = [
+        ("HKD", r"(?:HKD|HK\$|港币|港元)\s*([0-9][0-9,]*(?:\.\d{1,2})?)"),
+        ("HKD", r"([0-9][0-9,]*(?:\.\d{1,2})?)\s*(?:HKD|港币|港元)"),
+        ("USD", r"(?:USD|US\$|美元)\s*([0-9][0-9,]*(?:\.\d{1,2})?)"),
+        ("USD", r"([0-9][0-9,]*(?:\.\d{1,2})?)\s*(?:USD|美元)"),
+        ("SGD", r"(?:SGD|S\$|新币|新加坡元)\s*([0-9][0-9,]*(?:\.\d{1,2})?)"),
+        ("EUR", r"(?:EUR|€|欧元)\s*([0-9][0-9,]*(?:\.\d{1,2})?)"),
+        ("GBP", r"(?:GBP|£|英镑)\s*([0-9][0-9,]*(?:\.\d{1,2})?)"),
+        ("JPY", r"(?:JPY|日元)\s*([0-9][0-9,]*(?:\.\d{1,2})?)"),
+        ("CNY", r"(?:人民币|RMB|CNY|¥|￥)\s*([0-9][0-9,]*(?:\.\d{1,2})?)"),
+        (
+            "CNY",
+            r"(?:消费金额|交易金额|支付金额|扣款金额|支出金额|实付金额|金额|应还|还款|实付|扣款|支出|消费|入账|合计|总计|费用)[：:\s\r\n]*(?:人民币|RMB|CNY|¥|￥)?\s*([0-9][0-9,]*(?:\.\d{1,2})?)\s*(?:元)?",
+        ),
+        ("CNY", r"([0-9][0-9,]*(?:\.\d{1,2})?)\s*元"),
+        ("USD", r"\$\s*([0-9][0-9,]*(?:\.\d{1,2})?)"),
+    ]
+    for code, pat in currency_patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            try:
+                orig = float(m.group(1).replace(",", ""))
+                if orig > 0:
+                    rate = _FX_TO_CNY.get(code, 1.0)
+                    cny = round(orig * rate, 2)
+                    return cny, code, round(orig, 2)
+            except ValueError:
+                continue
+    return None, "CNY", None
+
+
 def _extract_email_amount(text: str) -> Optional[float]:
+    cny, _, _ = _extract_email_amount_and_currency(text)
+    return cny
+
+
+def _extract_email_merchant(text: str) -> str:
     patterns = [
-        r"(?:人民币|RMB|CNY|¥|￥)\s*([0-9][0-9,]*(?:\.\d{1,2})?)",
-        r"(?:金额|应还|还款|实付|扣款|支出|消费|入账|合计|总计|费用)[：:\s]*(?:人民币|RMB|¥|￥)?\s*([0-9][0-9,]*(?:\.\d{1,2})?)\s*(?:元)?",
-        r"([0-9][0-9,]*(?:\.\d{1,2})?)\s*元",
+        r"(?:消费商户|交易商户|收款方|商户名称|商户|商家|Merchant)[：:\s]+([^\r\n]{2,80})",
     ]
     for pat in patterns:
         m = re.search(pat, text, re.IGNORECASE)
         if m:
-            try:
-                val = float(m.group(1).replace(",", ""))
-                if val > 0:
-                    return round(val, 2)
-            except ValueError:
-                continue
+            val = m.group(1).strip(" ：:\t-")
+            if val:
+                return val[:60]
+    return ""
+
+
+def _extract_email_card_hint(text: str) -> str:
+    m = re.search(r"([A-Za-z0-9\u4e00-\u9fa5]{2,20}\s*Card\s*\(\d{4}\)|尾号\s*\d{4})", text, re.IGNORECASE)
+    return m.group(1).strip() if m else ""
+
+
+def _extract_email_exact_datetime(text: str) -> Optional[str]:
+    m = re.search(r"(\d{4}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2})", text)
+    if m:
+        raw = m.group(1).replace("/", "-")
+        parts = raw.split()
+        dparts = parts[0].split("-")
+        tparts = parts[1].split(":")
+        return f"{int(dparts[0]):04d}-{int(dparts[1]):02d}-{int(dparts[2]):02d} {int(tparts[0]):02d}:{int(tparts[1]):02d}"
     return None
 
 
@@ -590,14 +653,42 @@ def _local_parse_email(subject: str, sender: str, received_at: str, body_text: s
     transactions: List[Dict[str, Any]] = []
     reminders: List[Dict[str, Any]] = []
 
-    is_credit_bill = any(k in combined for k in ("信用卡", "账单", "应还金额", "最后还款日", "还款日"))
+    is_credit_bill = any(k in combined for k in ("信用卡账单", "本期账单", "应还金额", "最后还款日", "最低还款额"))
     is_utility = any(k in combined for k in ("水费", "电费", "燃气费", "物业费", "宽带", "话费账单"))
     is_itinerary = any(k in combined for k in ("行程单", "出票成功", "登机", "列车", "高铁", "航班", "入住"))
-    is_receipt = any(k in combined for k in ("付款成功", "支付成功", "消费通知", "扣款成功", "电子发票", "订单确认", "入账通知", "工资条"))
+    is_receipt = any(
+        k in combined.lower()
+        for k in (
+            "付款成功",
+            "支付成功",
+            "消费通知",
+            "扣款成功",
+            "电子发票",
+            "订单确认",
+            "入账通知",
+            "工资条",
+            "消费金额",
+            "完成一笔以下消费",
+            "消费商户",
+            "交易金额",
+            "支出金额",
+            "已扣款",
+            "扣账",
+            "刷卡",
+            "za card",
+            "card (",
+            "charged",
+            "purchase",
+            "payment received",
+        )
+    )
     is_todo = any(k in combined for k in ("截止", "请于", "提醒", "待办", "确认", "到期", "续费"))
 
-    amount = _extract_email_amount(combined)
+    amount, currency, orig_amount = _extract_email_amount_and_currency(combined)
     due_at = _parse_chinese_datetime(combined, now)
+    merchant = _extract_email_merchant(combined)
+    card_hint = _extract_email_card_hint(combined)
+    exact_dt = _extract_email_exact_datetime(combined)
 
     if is_credit_bill or is_utility:
         bill_title = subject.strip()[:60] or "邮件账单缴费提醒"
@@ -628,7 +719,7 @@ def _local_parse_email(subject: str, sender: str, received_at: str, body_text: s
                 "linked_tx_type": "expense" if amount else None,
             }
         )
-    elif is_todo:
+    elif is_todo and not is_receipt:
         reminders.append(
             {
                 "title": subject.strip()[:80] or "邮件待办提醒",
@@ -644,15 +735,26 @@ def _local_parse_email(subject: str, sender: str, received_at: str, body_text: s
         )
 
     if is_receipt and amount and not is_credit_bill:
-        is_income = any(k in combined for k in ("入账", "工资", "薪资", "退款到账", "收款"))
+        is_income = any(k in combined for k in ("入账", "工资", "薪资", "退款到账", "收款", "股息派发"))
         tx_type = "income" if is_income else "expense"
-        occ = (received_at or now.strftime("%Y-%m-%d %H:%M"))[:16]
+        occ = exact_dt or (received_at or now.strftime("%Y-%m-%d %H:%M"))[:16]
+        desc_parts: List[str] = []
+        if merchant:
+            desc_parts.append(merchant)
+        else:
+            desc_parts.append(subject.strip()[:80])
+        if card_hint:
+            desc_parts.append(card_hint)
+        if currency != "CNY" and orig_amount is not None:
+            desc_parts.append(f"{currency} {orig_amount:.2f}")
+        elif sender:
+            desc_parts.append(sender[:36])
         transactions.append(
             {
                 "type": tx_type,
                 "amount": amount,
                 "category": _detect_tx_category(combined, tx_type),
-                "description": f"{subject.strip()[:100]} ({sender[:40]})".strip(),
+                "description": " · ".join(p for p in desc_parts if p),
                 "occurred_at": occ,
                 "source_type": "email",
             }
@@ -671,7 +773,11 @@ async def extract_from_email_content(
     now_str = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
     system_prompt = f"""你是用户的个人邮件助理。请分析以下邮件内容，识别是否包含：
 1. 需要用户处理的提醒事项（如信用卡最后还款日、水电缴费通知、机票高铁行程、会议/工作截止日期、续费提醒等）
-2. 已经真实发生、需要记账的收支流水（如消费电子小票、扣款通知、工资/报销入账通知；注意：信用卡账单汇总不要重复当作单笔消费入账，而是生成还款提醒）
+2. 已经真实发生、需要记账的收支流水（如银行卡/众安银行 ZA Card/信用卡单笔刷卡消费通知、消费电子小票、扣款通知、微信/支付宝消费、App Store 订阅扣款、工资/报销/股息入账通知；注意：信用卡月度总账单不要重复当作单笔消费入账，而是生成还款提醒）
+
+外币处理规则：
+- 若消费/入账为外币（如 HKD、USD、EUR、GBP、SGD、JPY），请按近似汇率折算为人民币金额填入 amount（HKD≈0.92，USD≈7.25，EUR≈7.80，GBP≈9.15，SGD≈5.40，JPY≈0.048，保留两位小数），并在 description 中保留商户名称、卡片信息及原币种金额（例如：WECHAT PAY HONG KONG L · ZA Card (0720) · HKD 11.87）。
+- 注意有些邮件金额与“消费金额:”不在同一行，请结合上下文准确提取。
 
 如果只是普通广告、验证码、系统推广垃圾邮件，请返回空数组。当前时间：{now_str}。
 严格返回 JSON：
@@ -681,7 +787,7 @@ async def extract_from_email_content(
       "type": "expense | income",
       "amount": 100.0,
       "category": "餐饮 | 交通 | 购物 | 住房 | 通讯 | 订阅服务 | 医疗 | 娱乐 | 工资收入 | 理财收益 | 其他",
-      "description": "简短说明",
+      "description": "简短说明（含商户与外币原金额）",
       "occurred_at": "YYYY-MM-DD HH:MM"
     }}
   ],

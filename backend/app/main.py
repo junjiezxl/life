@@ -1248,10 +1248,47 @@ def clear_chat_messages() -> Dict[str, bool]:
     return {"cleared": True}
 
 
+def _detect_email_chat_intent(message: str) -> Optional[Dict[str, Any]]:
+    text = (message or "").strip()
+    lower = text.lower()
+    if not any(k in lower for k in ("邮件", "邮箱", "gmail", "收件箱", "email")):
+        return None
+    action_words = (
+        "分析", "解析", "扫描", "拉取", "同步", "查看", "读取", "获取", "查一下",
+        "计入", "记账", "入账", "导入", "写入", "记录", "消费", "账单", "支出", "财务",
+    )
+    if not any(k in lower for k in action_words):
+        return None
+
+    import re as _re
+
+    days = 14
+    m_days = _re.search(r"(?:最近|近|过去)\s*(\d{1,3})\s*天", text)
+    if m_days:
+        days = max(1, min(int(m_days.group(1)), 90))
+    elif "今天" in text or "今日" in text:
+        days = 1
+    elif "昨天" in text or "昨日" in text:
+        days = 2
+    elif "本周" in text or "这周" in text:
+        days = 7
+    elif "本月" in text or "这个月" in text:
+        days = 30
+
+    auto_import = any(k in text for k in ("计入", "记账", "入账", "导入", "写入", "加到", "加入", "同步到", "记录到"))
+    include_reminders = any(k in text for k in ("提醒", "待办", "日程", "全部"))
+    return {
+        "days": days,
+        "auto_import": auto_import,
+        "include_reminders": include_reminders,
+    }
+
+
 @app.post("/api/chat")
 async def chat_endpoint(payload: ChatRequest) -> Dict[str, Any]:
     settings = get_all_settings()
     ts = now_iso()
+    user_msg = payload.message.strip()
 
     with get_conn() as conn:
         finance = _compute_finance_snapshot(conn)
@@ -1270,10 +1307,175 @@ async def chat_endpoint(payload: ChatRequest) -> Dict[str, Any]:
         }
         conn.execute(
             "INSERT INTO chat_messages (role, content, actions_json, created_at) VALUES (?, ?, ?, ?)",
-            ("user", payload.message.strip(), "[]", ts),
+            ("user", user_msg, "[]", ts),
         )
 
-    parsed = await process_chat_message(payload.message.strip(), context_summary, settings)
+    # Direct mailbox fetch + AI analysis + optional auto-bookkeeping inside AI chat
+    email_intent = _detect_email_chat_intent(user_msg)
+    if email_intent is not None:
+        actions: List[Dict[str, Any]] = []
+        created_reminders: List[Dict[str, Any]] = []
+        created_transactions: List[Dict[str, Any]] = []
+
+        has_email_cfg = bool(
+            (settings.get("email_imap_host") or "").strip()
+            and (settings.get("email_username") or "").strip()
+            and (settings.get("email_password") or "").strip()
+        )
+        if not has_email_cfg:
+            reply_text = "目前尚未配置邮箱连接，请先前往「系统设置 → 邮箱 & Bark」填好 Gmail/邮箱 IMAP 信息并测试连接成功，然后再让我分析邮件。"
+        else:
+            try:
+                with get_conn() as conn:
+                    existing_refs = _get_existing_external_refs(conn)
+                    synced_uids = _get_synced_email_uids(conn)
+                res = await fetch_and_parse_emails(
+                    settings=settings,
+                    existing_refs=existing_refs,
+                    synced_uids=synced_uids,
+                    days=email_intent["days"],
+                    limit=30,
+                    include_body_ai=True,
+                    skip_already_synced=False,
+                )
+                emails = res.get("emails") or []
+                txs = res.get("transactions") or []
+                rems = res.get("reminders") or []
+
+                if not emails:
+                    reply_text = f"已连接邮箱扫描最近 {email_intent['days']} 天收件箱，暂时没有找到新邮件。"
+                elif email_intent["auto_import"]:
+                    tx_models = [
+                        TransactionCreate(
+                            **{
+                                k: t[k]
+                                for k in ("type", "amount", "category", "description", "occurred_at", "source_type", "external_ref")
+                                if k in t
+                            }
+                        )
+                        for t in txs
+                        if float(t.get("amount") or 0) > 0
+                    ]
+                    rem_models = (
+                        [
+                            ReminderCreate(
+                                **{
+                                    k: r[k]
+                                    for k in ("title", "description", "due_at", "priority", "category", "source_type", "source_ref", "linked_amount", "linked_tx_type")
+                                    if k in r
+                                }
+                            )
+                            for r in rems
+                            if (r.get("title") or "").strip()
+                        ]
+                        if email_intent["include_reminders"]
+                        else []
+                    )
+                    logs = [
+                        {
+                            "message_uid": e["uid"],
+                            "subject": e["subject"],
+                            "sender": e["sender"],
+                            "received_at": e["received_at"],
+                            "tx_imported": e["parsed_tx_count"],
+                            "rem_imported": e["parsed_rem_count"],
+                        }
+                        for e in emails
+                    ]
+                    with get_conn() as conn:
+                        batch_res = _commit_email_batch(
+                            conn=conn,
+                            txs=tx_models,
+                            rems=rem_models,
+                            account_id=None,
+                            skip_duplicates=True,
+                            logs=logs,
+                        )
+                    created_transactions = batch_res["transactions"]
+                    created_reminders = batch_res["reminders"]
+                    for tx in created_transactions:
+                        actions.append(
+                            {
+                                "kind": "transaction",
+                                "id": tx["id"],
+                                "type": tx["type"],
+                                "amount": tx["amount"],
+                                "category": tx["category"],
+                            }
+                        )
+                    for rem in created_reminders:
+                        actions.append(
+                            {
+                                "kind": "reminder",
+                                "id": rem["id"],
+                                "title": rem["title"],
+                                "due_at": rem["due_at"],
+                            }
+                        )
+
+                    lines = [f"已扫描最近 {email_intent['days']} 天共 {len(emails)} 封邮件："]
+                    if created_transactions:
+                        total_exp = sum(float(t["amount"]) for t in created_transactions if t["type"] == "expense")
+                        total_inc = sum(float(t["amount"]) for t in created_transactions if t["type"] == "income")
+                        lines.append(
+                            f"• 已自动计入个人财务 {len(created_transactions)} 笔"
+                            f"（支出 ¥{total_exp:,.2f}"
+                            + (f"，收入 ¥{total_inc:,.2f}" if total_inc > 0 else "")
+                            + "）："
+                        )
+                        for tx in created_transactions[:12]:
+                            tag = "支出" if tx["type"] == "expense" else "收入"
+                            lines.append(
+                                f"  - [{tag}] ¥{float(tx['amount']):,.2f} · {tx['category']} · {tx['description']} ({tx['occurred_at']})"
+                            )
+                    else:
+                        lines.append("• 本次没有新增可入账的消费/收入流水。")
+                    if batch_res["skipped_duplicate_count"] > 0:
+                        lines.append(f"• 已自动跳过重复入账 {batch_res['skipped_duplicate_count']} 笔。")
+                    if created_reminders:
+                        lines.append(f"• 同步生成提醒 {len(created_reminders)} 条。")
+                    if not txs and emails:
+                        sample_subjs = "、".join(f"《{e['subject'][:26]}》" for e in emails[:5])
+                        lines.append(f"• 最近扫描到的邮件主题：{sample_subjs}")
+                    reply_text = "\n".join(lines)
+                else:
+                    lines = [f"已扫描最近 {email_intent['days']} 天共 {len(emails)} 封邮件："]
+                    if txs:
+                        lines.append(f"• 识别出 {len(txs)} 笔消费/收入明细：")
+                        for t in txs[:12]:
+                            tag = "支出" if t.get("type") == "expense" else "收入"
+                            dup_mark = "（已入账）" if t.get("already_imported") else "（待入账）"
+                            lines.append(
+                                f"  - [{tag}] ¥{float(t['amount']):,.2f} · {t.get('category', '其他')} · {t.get('description', '')} {dup_mark}"
+                            )
+                        lines.append("\n如需直接写入个人财务，回复「把邮件中的消费计入个人财务」即可自动去重入账。")
+                    else:
+                        sample_subjs = "、".join(f"《{e['subject'][:26]}》" for e in emails[:5])
+                        lines.append(f"• 暂未识别到明确消费/入账流水。最近邮件主题：{sample_subjs}")
+                    if rems:
+                        lines.append(f"• 另发现 {len(rems)} 条待办/账单提醒线索。")
+                    reply_text = "\n".join(lines)
+            except Exception as exc:
+                err_txt = str(exc).strip() or type(exc).__name__
+                reply_text = f"拉取或分析邮件时失败：{err_txt}\n\n请检查「系统设置 → 邮箱 & Bark」的邮箱连接及代理开关。"
+
+        with get_conn() as conn:
+            cur_msg = conn.execute(
+                "INSERT INTO chat_messages (role, content, actions_json, created_at) VALUES (?, ?, ?, ?)",
+                ("assistant", reply_text, json.dumps(actions, ensure_ascii=False), now_iso()),
+            )
+            assistant_msg = _row_to_dict(conn.execute("SELECT * FROM chat_messages WHERE id = ?", (cur_msg.lastrowid,)).fetchone())
+            assistant_msg["actions"] = actions
+
+        await _push_new_reminders_bark(created_reminders, prefix="📧 邮件提醒：")
+        return {
+            "message": assistant_msg,
+            "created_reminders": created_reminders,
+            "created_transactions": created_transactions,
+            "engine": settings.get("ai_provider") or "local_fallback",
+        }
+
+    parsed = await process_chat_message(user_msg, context_summary, settings)
 
     actions: List[Dict[str, Any]] = []
     created_reminders: List[Dict[str, Any]] = []

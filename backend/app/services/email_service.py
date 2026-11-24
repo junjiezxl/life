@@ -1,3 +1,4 @@
+import asyncio
 import email
 import hashlib
 import html
@@ -258,7 +259,13 @@ async def fetch_and_parse_emails(
     skip_already_synced: bool = False,
 ) -> Dict[str, Any]:
     effective_zip_pwd = zip_password or settings.get("email_bill_zip_password") or ""
-    raw_emails = _fetch_raw_emails_sync(settings, days=days, limit=limit, unread_only=unread_only)
+    raw_emails = await asyncio.to_thread(
+        _fetch_raw_emails_sync,
+        settings,
+        days=days,
+        limit=limit,
+        unread_only=unread_only,
+    )
 
     kw_lower = keyword.strip().lower()
     email_summaries: List[Dict[str, Any]] = []
