@@ -1,4 +1,4 @@
-export type TabKey = 'dashboard' | 'reminders' | 'notes' | 'phones' | 'finance' | 'ctrader' | 'ibkr' | 'settings';
+export type TabKey = 'dashboard' | 'reminders' | 'notes' | 'phones' | 'finance' | 'grids' | 'ctrader' | 'ibkr' | 'settings';
 
 export interface IbkrEquitySnapshot {
   report_date: string;
@@ -643,6 +643,154 @@ export interface AuthStatus {
   setup_required: boolean;
   username: string | null;
   active_sessions: number;
+}
+
+export interface GridStrategy {
+  id: number;
+  name: string;
+  symbol: string;
+  market: 'CN' | 'HK' | 'US';
+  currency: string;
+  grid_type: 'arithmetic' | 'geometric';
+  lower_price: number;
+  upper_price: number;
+  step_value: number;
+  shares_per_grid: number;
+  base_price: number;
+  fee_rate: number;
+  min_fee: number;
+  stamp_tax_rate: number;
+  stamp_tax_side: 'sell' | 'both';
+  current_price: number;
+  prev_close: number;
+  quote_name: string;
+  price_updated_at: string;
+  status: 'active' | 'paused' | 'closed';
+  notes: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface GridStrategySummary {
+  currency: string;
+  grid_count: number;
+  level_count: number;
+  held_grid_count: number;
+  holding_qty: number;
+  holding_cost: number;
+  avg_cost: number;
+  market_value: number;
+  unrealized_pnl: number;
+  unrealized_pct: number;
+  realized_pnl: number;
+  total_pnl: number;
+  total_fees: number;
+  buy_amount: number;
+  sell_amount: number;
+  trade_count: number;
+  completed_grids: number;
+  pair_count: number;
+  peak_capital: number;
+  return_on_peak_pct: number;
+  full_grid_capital: number;
+  grid_profit_pct: number;
+  fx_to_cny: number;
+  realized_pnl_cny: number;
+  unrealized_pnl_cny: number;
+  market_value_cny: number;
+  day_change_pct: number | null;
+}
+
+export interface GridLevelRow {
+  index: number;
+  price: number;
+  sell_target: number | null;
+  holding_qty: number;
+  is_current: boolean;
+  distance_pct: number | null;
+}
+
+export interface StockTrade {
+  id: number;
+  strategy_id: number;
+  side: 'buy' | 'sell';
+  price: number;
+  quantity: number;
+  fee: number;
+  tax: number;
+  amount: number;
+  grid_level: number | null;
+  traded_at: string;
+  note: string;
+  remaining_qty?: number;
+  pair_status?: 'open' | 'partial' | 'closed' | 'paired' | 'unmatched';
+  sell_target?: number | null;
+  realized_profit?: number;
+  unmatched_qty?: number;
+  created_at: string;
+}
+
+export interface GridPairRecord {
+  buy_trade_id: number;
+  sell_trade_id: number;
+  quantity: number;
+  buy_price: number;
+  sell_price: number;
+  buy_level: number | null;
+  buy_at: string;
+  sell_at: string;
+  holding_days: number | null;
+  profit: number;
+  profit_pct: number | null;
+}
+
+export interface GridOpenLot {
+  trade_id: number;
+  price: number;
+  cost_ps: number;
+  qty: number;
+  orig_qty: number;
+  level: number | null;
+  traded_at: string;
+}
+
+export interface GridSignals {
+  next_buy: { level: number; price: number; quantity: number } | null;
+  next_sell: { level: number; price: number; quantity: number; from_level: number } | null;
+  buy_triggered: boolean;
+  sell_triggered: boolean;
+  hints: string[];
+}
+
+export interface GridListItem {
+  strategy: GridStrategy;
+  summary: GridStrategySummary;
+  signals: GridSignals;
+}
+
+export interface GridListResponse {
+  items: GridListItem[];
+  portfolio: {
+    strategy_count: number;
+    active_count: number;
+    triggered_count: number;
+    completed_grids: number;
+    market_value_cny: number;
+    holding_cost_cny: number;
+    realized_pnl_cny: number;
+    unrealized_pnl_cny: number;
+    total_pnl_cny: number;
+  };
+}
+
+export interface GridDetailResponse {
+  strategy: GridStrategy;
+  summary: GridStrategySummary;
+  levels: GridLevelRow[];
+  trades: StockTrade[];
+  pairs: GridPairRecord[];
+  open_lots: GridOpenLot[];
+  signals: GridSignals;
 }
 
 export interface CreditCard {

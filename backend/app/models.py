@@ -460,3 +460,54 @@ class DebtOperationCreate(BaseModel):
     op_date: Optional[str] = None
     note: str = ""
     sync_to_finance: bool = False
+
+
+class GridStrategyCreate(BaseModel):
+    name: str = Field("", max_length=60)
+    symbol: str = Field(..., min_length=1, max_length=20)
+    market: Literal["CN", "HK", "US"] = "CN"
+    currency: str = ""
+    grid_type: Literal["arithmetic", "geometric"] = "arithmetic"
+    lower_price: float = Field(0.0, ge=0)
+    upper_price: float = Field(0.0, ge=0)
+    step_value: float = Field(0.0, ge=0)
+    shares_per_grid: float = Field(100.0, ge=0)
+    base_price: float = Field(0.0, ge=0)
+    fee_rate: float = Field(0.00025, ge=0, le=0.05)
+    min_fee: float = Field(5.0, ge=0)
+    stamp_tax_rate: float = Field(0.0, ge=0, le=0.05)
+    stamp_tax_side: Literal["sell", "both"] = "sell"
+    current_price: float = Field(0.0, ge=0)
+    status: Literal["active", "paused", "closed"] = "active"
+    notes: str = ""
+
+
+class GridStrategyUpdate(BaseModel):
+    name: Optional[str] = Field(None, max_length=60)
+    symbol: Optional[str] = Field(None, min_length=1, max_length=20)
+    market: Optional[Literal["CN", "HK", "US"]] = None
+    currency: Optional[str] = None
+    grid_type: Optional[Literal["arithmetic", "geometric"]] = None
+    lower_price: Optional[float] = Field(None, ge=0)
+    upper_price: Optional[float] = Field(None, ge=0)
+    step_value: Optional[float] = Field(None, ge=0)
+    shares_per_grid: Optional[float] = Field(None, ge=0)
+    base_price: Optional[float] = Field(None, ge=0)
+    fee_rate: Optional[float] = Field(None, ge=0, le=0.05)
+    min_fee: Optional[float] = Field(None, ge=0)
+    stamp_tax_rate: Optional[float] = Field(None, ge=0, le=0.05)
+    stamp_tax_side: Optional[Literal["sell", "both"]] = None
+    current_price: Optional[float] = Field(None, ge=0)
+    status: Optional[Literal["active", "paused", "closed"]] = None
+    notes: Optional[str] = None
+
+
+class StockTradeCreate(BaseModel):
+    side: Literal["buy", "sell"]
+    price: float = Field(..., gt=0)
+    quantity: float = Field(..., gt=0)
+    fee: Optional[float] = Field(None, ge=0)
+    tax: Optional[float] = Field(None, ge=0)
+    traded_at: Optional[str] = None
+    grid_level: Optional[int] = Field(None, ge=0)
+    note: str = ""

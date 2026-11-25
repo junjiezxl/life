@@ -541,6 +541,54 @@ export const api = {
       body: JSON.stringify(options || {}),
     }),
   testIbkr: () => request<{ ok: boolean; accounts: string[]; message: string }>('/api/ibkr/test', { method: 'POST' }),
+
+  // Stock Grid Trading Ledger
+  listGridStrategies: () => request<import('./types').GridListResponse>('/api/grids'),
+  createGridStrategy: (payload: Partial<import('./types').GridStrategy>) =>
+    request<import('./types').GridDetailResponse>('/api/grids', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  getGridStrategy: (strategyId: number) =>
+    request<import('./types').GridDetailResponse>(`/api/grids/${strategyId}`),
+  updateGridStrategy: (strategyId: number, payload: Partial<import('./types').GridStrategy>) =>
+    request<import('./types').GridDetailResponse>(`/api/grids/${strategyId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    }),
+  deleteGridStrategy: (strategyId: number) =>
+    request<{ deleted: boolean }>(`/api/grids/${strategyId}`, { method: 'DELETE' }),
+  createGridTrade: (
+    strategyId: number,
+    payload: {
+      side: 'buy' | 'sell';
+      price: number;
+      quantity: number;
+      fee?: number;
+      tax?: number;
+      traded_at?: string;
+      grid_level?: number;
+      note?: string;
+    },
+  ) =>
+    request<{ trade: import('./types').StockTrade; detail: import('./types').GridDetailResponse }>(
+      `/api/grids/${strategyId}/trades`,
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      },
+    ),
+  deleteGridTrade: (tradeId: number) =>
+    request<{ deleted: boolean; strategy_id: number; detail: import('./types').GridDetailResponse }>(
+      `/api/grids/trades/${tradeId}`,
+      { method: 'DELETE' },
+    ),
+  refreshGridQuotes: (strategyId?: number) =>
+    request<{ updated_count: number; quotes: Record<string, unknown>; errors: string[] }>(
+      `/api/grids/refresh-quotes${strategyId ? `?strategy_id=${strategyId}` : ''}`,
+      { method: 'POST' },
+    ),
+
   resetData: (reseed = false) =>
     request<{ ok: boolean; reseeded: boolean }>(`/api/settings/reset-data?reseed=${reseed}`, { method: 'POST' }),
 };

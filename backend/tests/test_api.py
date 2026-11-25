@@ -2021,6 +2021,106 @@ class TestLifeHubAPI(unittest.TestCase):
         self.assertEqual(len(cmb_limit_only["reminders"]), 1)
         self.assertIsNone(cmb_limit_only["reminders"][0]["linked_amount"])
 
+    def test_26_stock_grid_trading_ledger_and_quotes(self):
+        from unittest.mock import AsyncMock, patch
+        from app.services import grid_service
+
+        # 1. Create an A-share ETF arithmetic grid strategy (510300, 3.60 ~ 4.20, step 0.10, 1000 shares/grid)
+        r_create = self.client.post(
+            "/api/grids",
+            json={
+                "name": "沪深300ETF网格",
+                "symbol": "510300",
+                "market": "CN",
+                "grid_type": "arithmetic",
+                "lower_price": 3.60,
+                "upper_price": 4.20,
+                "step_value": 0.10,
+                "shares_per_grid": 1000,
+                "fee_rate": 0.0001,
+                "min_fee": 0.0,
+                "stamp_tax_rate": 0.0,
+                "current_price": 4.00,
+            },
+        )
+        self.assertEqual(r_create.status_code, 200, r_create.text)
+        detail = r_create.json()
+        sid = detail["strategy"]["id"]
+        self.assertEqual(detail["summary"]["level_count"], 7)  # 3.6, 3.7, 3.8, 3.9, 4.0, 4.1, 4.2
+        self.assertEqual(detail["summary"]["grid_count"], 6)
+
+        # 2. Buy two grid tranches: 4.00 (level 4) and 3.90 (level 3)
+        t1 = self.client.post(
+            f"/api/grids/{sid}/trades",
+            json={"side": "buy", "price": 4.00, "quantity": 1000, "traded_at": "2026-11-20 10:00"},
+        )
+        self.assertEqual(t1.status_code, 200, t1.text)
+        self.assertAlmostEqual(t1.json()["trade"]["fee"], 0.40, places=2)
+
+        t2 = self.client.post(
+            f"/api/grids/{sid}/trades",
+            json={"side": "buy", "price": 3.90, "quantity": 1000, "traded_at": "2026-11-21 10:00"},
+        )
+        self.assertEqual(t2.status_code, 200)
+        d2 = t2.json()["detail"]
+        self.assertEqual(d2["summary"]["holding_qty"], 2000.0)
+        # Lowest held lot is level 3 (3.90) -> next buy is level 2 (3.80), next sell is level 4 (4.00)
+        self.assertAlmostEqual(d2["signals"]["next_buy"]["price"], 3.80, places=4)
+        self.assertAlmostEqual(d2["signals"]["next_sell"]["price"], 4.00, places=4)
+        self.assertTrue(d2["signals"]["sell_triggered"])  # current_price=4.00 >= 4.00
+
+        # 3. Sell 1000 shares at 4.00 -> pairs against 3.90 lot (highest buy < 4.00), NOT 4.00!
+        t3 = self.client.post(
+            f"/api/grids/{sid}/trades",
+            json={"side": "sell", "price": 4.00, "quantity": 1000, "traded_at": "2026-11-22 14:30"},
+        )
+        self.assertEqual(t3.status_code, 200)
+        d3 = t3.json()["detail"]
+        self.assertEqual(d3["summary"]["holding_qty"], 1000.0)
+        self.assertEqual(d3["summary"]["completed_grids"], 1)
+        self.assertEqual(len(d3["pairs"]), 1)
+        self.assertAlmostEqual(d3["pairs"][0]["buy_price"], 3.90, places=4)
+        self.assertAlmostEqual(d3["pairs"][0]["sell_price"], 4.00, places=4)
+        # Gross profit 100.00 - buy fee 0.39 - sell fee 0.40 = 99.21
+        self.assertAlmostEqual(d3["summary"]["realized_pnl"], 99.21, places=2)
+        self.assertEqual(d3["pairs"][0]["holding_days"], 1)
+
+        # 4. Refresh quotes (mocked Tencent quote) -> price drops to 3.85, triggers buy at 3.90
+        fake_quote_map = {
+            "sh510300": {"name": "沪深300ETF", "price": 3.85, "prev_close": 3.95, "change_pct": -2.53}
+        }
+        with patch("app.main.fetch_tencent_quotes", new=AsyncMock(return_value=fake_quote_map)):
+            r_q = self.client.post("/api/grids/refresh-quotes")
+            self.assertEqual(r_q.status_code, 200, r_q.text)
+            self.assertEqual(r_q.json()["updated_count"], 1)
+
+        d4 = self.client.get(f"/api/grids/{sid}").json()
+        self.assertAlmostEqual(d4["strategy"]["current_price"], 3.85, places=4)
+        self.assertTrue(d4["signals"]["buy_triggered"])  # remaining lot at 4.00 -> next buy 3.90 >= 3.85
+
+        # 5. List portfolio overview + delete trade + delete strategy
+        r_list = self.client.get("/api/grids")
+        self.assertEqual(r_list.status_code, 200)
+        self.assertEqual(r_list.json()["portfolio"]["completed_grids"], 1)
+        self.assertEqual(r_list.json()["portfolio"]["triggered_count"], 1)
+
+        # Verify Tencent quote text parser & code mapping directly
+        self.assertEqual(grid_service.to_tencent_code("510300", "CN"), "sh510300")
+        self.assertEqual(grid_service.to_tencent_code("000001", "CN"), "sz000001")
+        self.assertEqual(grid_service.to_tencent_code("700", "HK"), "hk00700")
+        self.assertEqual(grid_service.to_tencent_code("AAPL", "US"), "usAAPL")
+        parsed_q = grid_service.parse_tencent_quote_text('v_sh510300="1~沪深300ETF~510300~3.880~3.900~";')
+        self.assertAlmostEqual(parsed_q["sh510300"]["price"], 3.88, places=4)
+
+        sell_tid = t3.json()["trade"]["id"]
+        r_del_t = self.client.delete(f"/api/grids/trades/{sell_tid}")
+        self.assertEqual(r_del_t.status_code, 200)
+        self.assertEqual(r_del_t.json()["detail"]["summary"]["holding_qty"], 2000.0)
+
+        r_del_s = self.client.delete(f"/api/grids/{sid}")
+        self.assertEqual(r_del_s.status_code, 200)
+        self.assertTrue(r_del_s.json()["deleted"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -444,6 +444,47 @@ def init_db(seed_demo: bool = True) -> None:
                 tx_id INTEGER REFERENCES transactions(id) ON DELETE SET NULL,
                 created_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS grid_strategies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL DEFAULT '',
+                symbol TEXT NOT NULL,
+                market TEXT NOT NULL DEFAULT 'CN',
+                currency TEXT NOT NULL DEFAULT 'CNY',
+                grid_type TEXT NOT NULL DEFAULT 'arithmetic',
+                lower_price REAL NOT NULL DEFAULT 0,
+                upper_price REAL NOT NULL DEFAULT 0,
+                step_value REAL NOT NULL DEFAULT 0,
+                shares_per_grid REAL NOT NULL DEFAULT 100,
+                base_price REAL NOT NULL DEFAULT 0,
+                fee_rate REAL NOT NULL DEFAULT 0.00025,
+                min_fee REAL NOT NULL DEFAULT 5,
+                stamp_tax_rate REAL NOT NULL DEFAULT 0,
+                stamp_tax_side TEXT NOT NULL DEFAULT 'sell',
+                current_price REAL NOT NULL DEFAULT 0,
+                prev_close REAL NOT NULL DEFAULT 0,
+                quote_name TEXT DEFAULT '',
+                price_updated_at TEXT DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'active',
+                notes TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS stock_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                strategy_id INTEGER NOT NULL REFERENCES grid_strategies(id) ON DELETE CASCADE,
+                side TEXT NOT NULL,
+                price REAL NOT NULL,
+                quantity REAL NOT NULL,
+                fee REAL NOT NULL DEFAULT 0,
+                tax REAL NOT NULL DEFAULT 0,
+                grid_level INTEGER,
+                traded_at TEXT NOT NULL,
+                note TEXT DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_stock_trades_strategy ON stock_trades(strategy_id, traded_at);
             """
         )
 
@@ -843,6 +884,8 @@ def reset_all_data(reseed: bool = False) -> None:
             DELETE FROM debt_operations;
             DELETE FROM credit_cards;
             DELETE FROM loans;
+            DELETE FROM stock_trades;
+            DELETE FROM grid_strategies;
             """
         )
         conn.execute(

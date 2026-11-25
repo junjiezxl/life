@@ -36,6 +36,8 @@ from .models import (
     EmailFetchRequest,
     EmailImportRequest,
     EmailParseTextRequest,
+    GridStrategyCreate,
+    GridStrategyUpdate,
     LoanCreate,
     LoanUpdate,
     NoteExtractRequest,
@@ -50,6 +52,7 @@ from .models import (
     SettlementCreateRequest,
     SettlementRegenerateRequest,
     SiyuanFetchRequest,
+    StockTradeCreate,
     TransactionCreate,
     TransactionUpdate,
 )
@@ -107,6 +110,15 @@ from .services.email_service import (
     fetch_and_parse_emails,
     fetch_and_parse_multi_emails,
     test_imap_connection,
+)
+from .services.grid_service import (
+    MARKET_CURRENCY,
+    build_grid_levels,
+    calc_trade_fees,
+    compute_strategy_state,
+    fetch_tencent_quotes,
+    nearest_level,
+    to_tencent_code,
 )
 from .services.ibkr_service import (
     get_ibkr_overview,
@@ -3615,6 +3627,265 @@ async def sync_debt_reminders(within_days: int = Query(5, ge=1, le=30)) -> Dict[
     if created:
         await _push_new_reminders_bark(created, prefix="💳 还款日临近：")
     return {"created_count": len(created), "reminders": created}
+
+
+# ---------------- Stock Grid Trading Ledger (股票网格交易记账) ----------------
+
+
+def _load_grid_detail(conn: Any, strategy_id: int) -> Dict[str, Any]:
+    row = conn.execute("SELECT * FROM grid_strategies WHERE id = ?", (strategy_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="网格策略不存在")
+    strat = _row_to_dict(row)
+    trades = [
+        _row_to_dict(r)
+        for r in conn.execute(
+            "SELECT * FROM stock_trades WHERE strategy_id = ? ORDER BY traded_at DESC, id DESC",
+            (strategy_id,),
+        ).fetchall()
+    ]
+    state = compute_strategy_state(strat, trades)
+    return {"strategy": strat, **state}
+
+
+@app.get("/api/grids")
+def list_grid_strategies() -> Dict[str, Any]:
+    with get_conn() as conn:
+        strat_rows = conn.execute(
+            "SELECT * FROM grid_strategies ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'paused' THEN 1 ELSE 2 END, id DESC"
+        ).fetchall()
+        trade_rows = conn.execute("SELECT * FROM stock_trades ORDER BY traded_at ASC, id ASC").fetchall()
+
+    trades_by_strat: Dict[int, List[Dict[str, Any]]] = {}
+    for r in trade_rows:
+        d = _row_to_dict(r)
+        trades_by_strat.setdefault(int(d["strategy_id"]), []).append(d)
+
+    items: List[Dict[str, Any]] = []
+    tot_mv_cny = 0.0
+    tot_real_cny = 0.0
+    tot_unreal_cny = 0.0
+    tot_cost_cny = 0.0
+    active_count = 0
+    triggered_count = 0
+    completed_total = 0
+
+    for sr in strat_rows:
+        strat = _row_to_dict(sr)
+        state = compute_strategy_state(strat, trades_by_strat.get(int(strat["id"]), []))
+        sm = state["summary"]
+        sig = state["signals"]
+        items.append({"strategy": strat, "summary": sm, "signals": sig})
+        tot_mv_cny += sm["market_value_cny"]
+        tot_real_cny += sm["realized_pnl_cny"]
+        tot_unreal_cny += sm["unrealized_pnl_cny"]
+        tot_cost_cny += sm["holding_cost"] * sm["fx_to_cny"]
+        completed_total += sm["completed_grids"]
+        if strat["status"] == "active":
+            active_count += 1
+            if sig["buy_triggered"] or sig["sell_triggered"]:
+                triggered_count += 1
+
+    return {
+        "items": items,
+        "portfolio": {
+            "strategy_count": len(items),
+            "active_count": active_count,
+            "triggered_count": triggered_count,
+            "completed_grids": completed_total,
+            "market_value_cny": round(tot_mv_cny, 2),
+            "holding_cost_cny": round(tot_cost_cny, 2),
+            "realized_pnl_cny": round(tot_real_cny, 2),
+            "unrealized_pnl_cny": round(tot_unreal_cny, 2),
+            "total_pnl_cny": round(tot_real_cny + tot_unreal_cny, 2),
+        },
+    }
+
+
+@app.post("/api/grids")
+def create_grid_strategy(payload: GridStrategyCreate) -> Dict[str, Any]:
+    if payload.upper_price > 0 and payload.lower_price > 0 and payload.upper_price <= payload.lower_price:
+        raise HTTPException(status_code=400, detail="网格上沿价格必须大于下沿价格")
+    ts = now_iso()
+    sym = payload.symbol.strip().upper()
+    market = payload.market
+    currency = (payload.currency or "").strip().upper() or MARKET_CURRENCY.get(market, "CNY")
+    name = payload.name.strip() or sym
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO grid_strategies
+            (name, symbol, market, currency, grid_type, lower_price, upper_price, step_value, shares_per_grid,
+             base_price, fee_rate, min_fee, stamp_tax_rate, stamp_tax_side, current_price, status, notes, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                name,
+                sym,
+                market,
+                currency,
+                payload.grid_type,
+                payload.lower_price,
+                payload.upper_price,
+                payload.step_value,
+                payload.shares_per_grid,
+                payload.base_price or payload.current_price,
+                payload.fee_rate,
+                payload.min_fee,
+                payload.stamp_tax_rate,
+                payload.stamp_tax_side,
+                payload.current_price,
+                payload.status,
+                payload.notes.strip(),
+                ts,
+                ts,
+            ),
+        )
+        return _load_grid_detail(conn, int(cur.lastrowid))
+
+
+@app.get("/api/grids/{strategy_id}")
+def get_grid_strategy_detail(strategy_id: int) -> Dict[str, Any]:
+    with get_conn() as conn:
+        return _load_grid_detail(conn, strategy_id)
+
+
+@app.patch("/api/grids/{strategy_id}")
+def update_grid_strategy(strategy_id: int, payload: GridStrategyUpdate) -> Dict[str, Any]:
+    updates = payload.model_dump(exclude_unset=True)
+    if not updates:
+        raise HTTPException(status_code=400, detail="无更新字段")
+    if "symbol" in updates and updates["symbol"] is not None:
+        updates["symbol"] = updates["symbol"].strip().upper()
+    if "name" in updates and updates["name"] is not None:
+        updates["name"] = updates["name"].strip()
+    if "notes" in updates and updates["notes"] is not None:
+        updates["notes"] = updates["notes"].strip()
+    if "currency" in updates and updates["currency"] is not None:
+        updates["currency"] = updates["currency"].strip().upper()
+    ts = now_iso()
+    if "current_price" in updates:
+        updates["price_updated_at"] = ts
+    updates["updated_at"] = ts
+    with get_conn() as conn:
+        existing = conn.execute("SELECT * FROM grid_strategies WHERE id = ?", (strategy_id,)).fetchone()
+        if not existing:
+            raise HTTPException(status_code=404, detail="网格策略不存在")
+        low = updates.get("lower_price", existing["lower_price"])
+        high = updates.get("upper_price", existing["upper_price"])
+        if high > 0 and low > 0 and high <= low:
+            raise HTTPException(status_code=400, detail="网格上沿价格必须大于下沿价格")
+        sets = ", ".join(f"{k} = ?" for k in updates.keys())
+        conn.execute(f"UPDATE grid_strategies SET {sets} WHERE id = ?", list(updates.values()) + [strategy_id])
+        return _load_grid_detail(conn, strategy_id)
+
+
+@app.delete("/api/grids/{strategy_id}")
+def delete_grid_strategy(strategy_id: int) -> Dict[str, bool]:
+    with get_conn() as conn:
+        cur = conn.execute("DELETE FROM grid_strategies WHERE id = ?", (strategy_id,))
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="网格策略不存在")
+        return {"deleted": True}
+
+
+@app.post("/api/grids/{strategy_id}/trades")
+def create_grid_trade(strategy_id: int, payload: StockTradeCreate) -> Dict[str, Any]:
+    ts = now_iso()
+    traded_at = (payload.traded_at or datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")).strip()
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM grid_strategies WHERE id = ?", (strategy_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="网格策略不存在")
+        strat = _row_to_dict(row)
+        auto_fee, auto_tax = calc_trade_fees(strat, payload.side, payload.price, payload.quantity)
+        fee = round(payload.fee, 2) if payload.fee is not None else auto_fee
+        tax = round(payload.tax, 2) if payload.tax is not None else auto_tax
+        grid_level = payload.grid_level
+        if grid_level is None:
+            levels = build_grid_levels(
+                strat["lower_price"], strat["upper_price"], strat["grid_type"], strat["step_value"]
+            )
+            grid_level = nearest_level(levels, payload.price)
+        cur = conn.execute(
+            """INSERT INTO stock_trades
+            (strategy_id, side, price, quantity, fee, tax, grid_level, traded_at, note, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                strategy_id,
+                payload.side,
+                round(payload.price, 4),
+                round(payload.quantity, 4),
+                fee,
+                tax,
+                grid_level,
+                traded_at,
+                payload.note.strip(),
+                ts,
+            ),
+        )
+        # If current_price not yet set, use latest trade price as reference
+        if float(strat.get("current_price") or 0) <= 0:
+            conn.execute(
+                "UPDATE grid_strategies SET current_price = ?, updated_at = ? WHERE id = ?",
+                (round(payload.price, 4), ts, strategy_id),
+            )
+        trade = _row_to_dict(conn.execute("SELECT * FROM stock_trades WHERE id = ?", (cur.lastrowid,)).fetchone())
+        detail = _load_grid_detail(conn, strategy_id)
+        return {"trade": trade, "detail": detail}
+
+
+@app.delete("/api/grids/trades/{trade_id}")
+def delete_grid_trade(trade_id: int) -> Dict[str, Any]:
+    with get_conn() as conn:
+        row = conn.execute("SELECT strategy_id FROM stock_trades WHERE id = ?", (trade_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="成交记录不存在")
+        strategy_id = int(row["strategy_id"])
+        conn.execute("DELETE FROM stock_trades WHERE id = ?", (trade_id,))
+        detail = _load_grid_detail(conn, strategy_id)
+        return {"deleted": True, "strategy_id": strategy_id, "detail": detail}
+
+
+@app.post("/api/grids/refresh-quotes")
+async def refresh_grid_quotes(strategy_id: Optional[int] = Query(None)) -> Dict[str, Any]:
+    with get_conn() as conn:
+        if strategy_id is not None:
+            rows = conn.execute("SELECT * FROM grid_strategies WHERE id = ?", (strategy_id,)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM grid_strategies WHERE status != 'closed'").fetchall()
+        strats = [_row_to_dict(r) for r in rows]
+
+    if not strats:
+        return {"updated_count": 0, "quotes": {}, "errors": []}
+
+    errors: List[str] = []
+    quotes: Dict[str, Dict[str, Any]] = {}
+    try:
+        quotes = await fetch_tencent_quotes([(s["symbol"], s["market"]) for s in strats])
+    except Exception as exc:
+        errors.append(f"拉取实时行情失败: {exc}")
+        return {"updated_count": 0, "quotes": {}, "errors": errors}
+
+    ts = now_iso()
+    updated = 0
+    with get_conn() as conn:
+        for s in strats:
+            code = to_tencent_code(s["symbol"], s["market"])
+            q = quotes.get(code)
+            if not q:
+                errors.append(f"未获取到 {s['symbol']} ({code}) 报价")
+                continue
+            new_name = s["name"]
+            if (not new_name or new_name.upper() == s["symbol"].upper()) and q.get("name"):
+                new_name = q["name"]
+            conn.execute(
+                """UPDATE grid_strategies
+                SET current_price = ?, prev_close = ?, quote_name = ?, name = ?, price_updated_at = ?, updated_at = ?
+                WHERE id = ?""",
+                (q["price"], q["prev_close"], q.get("name") or "", new_name, ts, ts, s["id"]),
+            )
+            updated += 1
+
+    return {"updated_count": updated, "quotes": quotes, "errors": errors}
 
 
 # ---------------- Settings ----------------
