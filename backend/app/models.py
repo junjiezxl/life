@@ -32,6 +32,8 @@ class AccountCreate(BaseModel):
     balance: float = 0.0
     credit_limit: float = 0.0
     currency: str = "CNY"
+    bank_name: str = ""
+    card_last4: str = Field("", max_length=8)
 
 
 class AccountUpdate(BaseModel):
@@ -40,6 +42,8 @@ class AccountUpdate(BaseModel):
     balance: Optional[float] = None
     credit_limit: Optional[float] = None
     currency: Optional[str] = None
+    bank_name: Optional[str] = None
+    card_last4: Optional[str] = None
 
 
 class TransactionCreate(BaseModel):
@@ -51,11 +55,23 @@ class TransactionCreate(BaseModel):
     occurred_at: Optional[str] = None
     source_type: str = "manual"
     external_ref: str = ""
+    payment_channel: str = ""  # alipay | wechat | card_direct | cash | bank | email | manual
+    payment_method: str = ""
+    bank_name: str = ""
+    card_last4: str = ""
+    merchant: str = ""
+    original_currency: str = "CNY"
+    original_amount: Optional[float] = None
+    auto_match_account: bool = True
 
 
 class TransactionUpdate(BaseModel):
     category: Optional[str] = Field(None, min_length=1, max_length=40)
     description: Optional[str] = Field(None, max_length=300)
+    payment_channel: Optional[str] = None
+    payment_method: Optional[str] = None
+    card_last4: Optional[str] = None
+    account_id: Optional[int] = None
 
 
 class RecurringBillCreate(BaseModel):
@@ -124,6 +140,13 @@ class BatchImportTransactionsRequest(BaseModel):
     transactions: List[TransactionCreate]
     account_id: Optional[int] = None
     skip_duplicates: bool = True
+    auto_create_accounts: bool = True
+    auto_reconcile: bool = True
+
+
+class BillReconcileRequest(BaseModel):
+    backfill_accounts: bool = True
+    auto_create_accounts: bool = True
 
 
 class EmailFetchRequest(BaseModel):
@@ -181,6 +204,8 @@ class EmailImportRequest(BaseModel):
     reminders: List[ReminderCreate] = Field(default_factory=list)
     account_id: Optional[int] = None
     skip_duplicates: bool = True
+    auto_create_accounts: bool = True
+    auto_reconcile: bool = True
     email_logs: List[EmailSyncLogInput] = Field(default_factory=list)
 
 

@@ -1779,6 +1779,153 @@ class TestLifeHubAPI(unittest.TestCase):
         self.assertEqual(len(self.client.get("/api/email-accounts").json()), 0)
         update_settings({"global_proxy_url": ""})
 
+    def test_24_multi_channel_bill_reconciliation_and_auto_cards(self):
+        # Clean DB to test end-to-end Alipay + WeChat + Bank Email + Cash reconciliation cleanly
+        from app.db import reset_all_data
+
+        reset_all_data(reseed=False)
+
+        # 1. Upload Alipay CSV with real combined payment methods & installment formats
+        alipay_csv = (
+            "支付宝交易记录明细查询\n"
+            "交易时间,交易分类,交易对方,对方账号,商品说明,收/支,金额,收/付款方式,交易状态,交易订单号,商家订单号,备注\n"
+            "2026-11-20 12:30:00,餐饮美食,瑞幸咖啡,luckin,生椰拿铁,支出,28.50,广发银行信用卡(3955)&红包,交易成功,ALI20261120001,,\n"
+            "2026-11-21 18:10:00,数码电器,京东商城,jd,显示器,支出,1549.00,招商银行信用卡分期(9613) 12期&招商银行满减,交易成功,ALI20261121002,,\n"
+            "2026-11-21 19:00:00,日用百货,便利店,store,矿泉水,支出,5.00,花呗,交易成功,ALI20261121003,,\n"
+            "2026-11-21 20:00:00,信用借还,广发银行,cgb,还款,不计收支,2000.00,工商银行储蓄卡(1797),还款成功,ALI20261121004,,\n"
+            "2026-11-21 21:00:00,家居家装,某店,shop,关闭订单,支出,99.00,广发银行信用卡(3955),交易关闭,ALI20261121005,,\n"
+        ).encode("gb18030")
+
+        p_ali = self.client.post(
+            "/api/bills/parse-upload",
+            files={"file": ("支付宝交易明细.csv", alipay_csv, "text/csv")},
+        )
+        self.assertEqual(p_ali.status_code, 200, p_ali.text)
+        ali_body = p_ali.json()
+        self.assertEqual(len(ali_body["transactions"]), 3)
+        self.assertEqual(ali_body["transactions"][0]["card_last4"], "3955")
+        self.assertEqual(ali_body["transactions"][0]["bank_name"], "广发银行")
+        self.assertEqual(ali_body["transactions"][1]["card_last4"], "9613")
+        self.assertEqual(ali_body["transactions"][1]["bank_name"], "招商银行")
+        self.assertEqual(ali_body["transactions"][2]["account_display_name"], "支付宝花呗")
+        self.assertGreaterEqual(len(ali_body["detected_cards"]), 3)
+
+        # 2. Upload WeChat CSV sharing card (3955) + debit card (1797) + 零钱 + skipped full refund
+        wechat_csv = (
+            "微信支付账单明细\n"
+            "交易时间,交易类型,交易对方,商品,收/支,金额(元),支付方式,当前状态,交易单号,商户单号,备注\n"
+            "2026-11-22 19:15:00,商户消费,海底捞火锅,聚餐,支出,¥286.00,广发银行信用卡(3955),支付成功,WX20261122001,,\n"
+            "2026-11-22 20:00:00,商户消费,山姆会员店,日用品,支出,¥199.00,工商银行储蓄卡(1797),支付成功,WX20261122002,,\n"
+            "2026-11-22 21:00:00,商户消费,退单商户,退货,支出,¥88.00,广发银行信用卡(3955),已全额退款,WX20261122003,,\n"
+            "2026-11-23 09:00:00,商户消费,早餐店,豆浆油条,支出,¥12.00,零钱,支付成功,WX20261123004,,\n"
+        ).encode("utf-8-sig")
+
+        p_wx = self.client.post(
+            "/api/bills/parse-upload",
+            files={"file": ("微信支付账单.csv", wechat_csv, "text/csv")},
+        )
+        self.assertEqual(p_wx.status_code, 200, p_wx.text)
+        wx_body = p_wx.json()
+        self.assertEqual(len(wx_body["transactions"]), 3)  # full refund skipped
+
+        # 3. Parse bank credit card monthly statement email containing BOTH a WeChat-via-3955 duplicate AND a direct POS swipe!
+        stmt_res = self.client.post(
+            "/api/emails/parse-text",
+            json={
+                "subject": "广发银行信用卡11月电子账单（尾号3955）",
+                "sender": "cgb@cgbchina.com.cn",
+                "body": (
+                    "本期应还金额：人民币 1,500.00 元，最后还款日：2026-12-10。\n"
+                    "2026-11-22 财付通-海底捞火锅 3955 286.00\n"
+                    "2026-11-23 中石化加油站POS 3955 320.00\n"
+                    "2026-11-24 自动还款 3955 -1000.00\n"
+                ),
+            },
+        )
+        self.assertEqual(stmt_res.status_code, 200, stmt_res.text)
+        stmt_body = stmt_res.json()
+        self.assertEqual(len(stmt_body["reminders"]), 1)
+        self.assertEqual(len(stmt_body["transactions"]), 2)  # auto repayment skipped, 2 swipes kept
+
+        # 4. Parse ZA Card HKD direct swipe email (0720)
+        za_res = self.client.post(
+            "/api/emails/parse-text",
+            json={
+                "subject": "众安银行消费通知",
+                "sender": "ZA Bank <no-reply@za.group>",
+                "body": "你于 2026-11-24 12:14:11 使用 ZA Card (0720) 完成一笔以下消费\n消费金额:\nHKD 100.00\n消费商户: APPLE STORE HK",
+            },
+        )
+        self.assertEqual(za_res.status_code, 200)
+        za_txs = za_res.json()["transactions"]
+        self.assertEqual(len(za_txs), 1)
+        self.assertEqual(za_txs[0]["card_last4"], "0720")
+
+        # 5. Batch import Alipay + WeChat + Bank Email transactions with auto_create_accounts & auto_reconcile
+        all_import_txs = ali_body["transactions"] + wx_body["transactions"] + stmt_body["transactions"] + za_txs
+        imp = self.client.post(
+            "/api/emails/import",
+            json={
+                "transactions": all_import_txs,
+                "reminders": stmt_body["reminders"],
+                "account_id": None,
+                "skip_duplicates": True,
+                "auto_create_accounts": True,
+                "auto_reconcile": True,
+                "email_logs": [],
+            },
+        )
+        self.assertEqual(imp.status_code, 200, imp.text)
+        imp_body = imp.json()
+        self.assertEqual(imp_body["imported_tx_count"], 9)
+        self.assertEqual(imp_body["reconciliation"]["newly_matched_count"], 1)  # 海底捞 ¥286 matched across WeChat & CGB 3955!
+
+        # 6. Verify auto-created credit_cards & accounts (no duplicates for card 3955 shared across Alipay, WeChat & Email!)
+        debt_ov = self.client.get("/api/debt/overview").json()
+        cc_last4s = [c["last4"] for c in debt_ov["cards"]]
+        self.assertIn("3955", cc_last4s)
+        self.assertIn("9613", cc_last4s)
+        self.assertEqual(cc_last4s.count("3955"), 1)  # deduplicated across 3 sources!
+
+        accs = self.client.get("/api/accounts").json()["accounts"]
+        acc_names = [a["name"] for a in accs]
+        self.assertTrue(any("1797" in n for n in acc_names))
+        self.assertTrue(any("0720" in n for n in acc_names))
+        self.assertTrue(any("微信零钱" in n for n in acc_names))
+
+        # 7. Add a Cash transaction and verify auto-created 现金钱包
+        cash_res = self.client.post(
+            "/api/transactions",
+            json={
+                "type": "expense",
+                "amount": 45.0,
+                "category": "餐饮",
+                "description": "菜市场买菜",
+                "source_type": "cash",
+                "payment_channel": "cash",
+                "payment_method": "现金",
+            },
+        )
+        self.assertEqual(cash_res.status_code, 200, cash_res.text)
+        self.assertEqual(cash_res.json()["reconcile_status"], "cash")
+        self.assertIn("现金", cash_res.json()["account_name"])
+
+        # 8. Check unified reconciliation overview: zero double-counting of ¥286, direct swipes (¥320 + ¥92) & cash (¥45) included!
+        ov = self.client.get("/api/bills/reconcile/overview").json()
+        # Effective = 3 Alipay + 3 WeChat + 2 Direct Cards (¥320 + ¥92) + 1 Cash (¥45) = 9 (duplicate ¥286 excluded!)
+        self.assertEqual(ov["summary"]["total_effective_count"], 9)
+        self.assertEqual(ov["summary"]["matched_count"], 1)
+        self.assertEqual(ov["summary"]["deduped_count"], 1)
+        self.assertAlmostEqual(ov["summary"]["deduped_expense_saved"], 286.0, places=2)
+        self.assertEqual(ov["summary"]["direct_card_count"], 2)
+        self.assertEqual(ov["summary"]["cash_count"], 1)
+        expected_total_exp = round(28.50 + 1549.00 + 5.00 + 286.00 + 199.00 + 12.00 + 320.00 + 92.00 + 45.00, 2)
+        self.assertAlmostEqual(ov["summary"]["total_expense"], expected_total_exp, places=2)
+
+        # Verify /api/transactions default unsettled_summary also excludes the duplicate ¥286!
+        tx_list = self.client.get("/api/transactions").json()
+        self.assertAlmostEqual(tx_list["unsettled_summary"]["expense"], expected_total_exp, places=2)
+
 
 if __name__ == "__main__":
     unittest.main()

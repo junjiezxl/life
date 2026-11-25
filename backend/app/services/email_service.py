@@ -11,7 +11,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .ai_service import extract_from_email_content
-from .bill_parser import parse_bill_file
+from .bill_parser import parse_bill_file, summarize_detected_cards
 from .proxy_service import create_proxied_socket, resolve_proxy_url
 
 
@@ -325,7 +325,7 @@ async def fetch_and_parse_emails(
                 settings=settings,
             )
             for tx in body_res.get("transactions", []):
-                fp_raw = f"email|{uid}|{tx.get('amount')}|{tx.get('description')}"
+                fp_raw = f"email|{uid}|{tx.get('occurred_at') or ''}|{tx.get('card_last4') or ''}|{tx.get('amount')}|{tx.get('description')}"
                 ext_ref = "email:" + hashlib.sha256(fp_raw.encode("utf-8")).hexdigest()[:16]
                 tx["external_ref"] = ext_ref
                 tx["already_imported"] = ext_ref in existing_refs
@@ -446,6 +446,7 @@ async def fetch_and_parse_multi_emails(
         "emails": all_emails,
         "transactions": all_txs,
         "reminders": all_rems,
+        "detected_cards": summarize_detected_cards(all_txs),
         "warnings": list(dict.fromkeys(all_warnings)),
         "scanned_accounts": scanned_accounts,
     }

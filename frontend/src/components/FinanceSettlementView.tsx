@@ -20,7 +20,8 @@ import {
 } from 'lucide-react';
 import { api } from '../api';
 import type { Account, RecurringBill, Settlement, SettlementCategoryStat, Transaction } from '../types';
-import { ACCOUNT_TYPE_LABELS, formatMoney } from '../utils/format';
+import { ACCOUNT_TYPE_LABELS, CHANNEL_META, formatMoney, RECONCILE_META } from '../utils/format';
+import { BillReconcileView } from './BillReconcileView';
 import { DebtPlannerView } from './DebtPlannerView';
 import { EmailBillsView } from './EmailBillsView';
 
@@ -32,10 +33,10 @@ interface Props {
   onNotify: (msg: string) => void;
 }
 
-type SubTab = 'checkout' | 'debt' | 'transactions' | 'accounts' | 'bills' | 'emails';
+type SubTab = 'reconcile' | 'checkout' | 'debt' | 'transactions' | 'accounts' | 'bills' | 'emails';
 
 export const FinanceSettlementView: React.FC<Props> = ({ onRefreshDashboard, onNotify }) => {
-  const [subTab, setSubTab] = useState<SubTab>('checkout');
+  const [subTab, setSubTab] = useState<SubTab>('reconcile');
 
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [totalAssets, setTotalAssets] = useState(0);
@@ -69,11 +70,14 @@ export const FinanceSettlementView: React.FC<Props> = ({ onRefreshDashboard, onN
   // Transaction tab filters
   const [txSettledFilter, setTxSettledFilter] = useState<'all' | 'unsettled' | 'settled'>('all');
   const [txTypeFilter, setTxTypeFilter] = useState<'all' | 'expense' | 'income'>('all');
+  const [txChannelFilter, setTxChannelFilter] = useState<string>('all');
   const [txCategoryFilter, setTxCategoryFilter] = useState<string>('ALL');
   const [txSearchQuery, setTxSearchQuery] = useState('');
 
   // Add transaction state
   const [txType, setTxType] = useState<'expense' | 'income'>('expense');
+  const [txChannel, setTxChannel] = useState<'cash' | 'card_direct' | 'alipay' | 'wechat' | 'manual'>('cash');
+  const [txCardLast4, setTxCardLast4] = useState('');
   const [txAmount, setTxAmount] = useState('');
   const [txCategory, setTxCategory] = useState('餐饮');
   const [txAccountId, setTxAccountId] = useState<string>('');
@@ -145,16 +149,27 @@ export const FinanceSettlementView: React.FC<Props> = ({ onRefreshDashboard, onN
     const amt = Number(txAmount);
     if (!amt || amt <= 0) return;
     try {
+      const pm =
+        txChannel === 'cash'
+          ? '现金'
+          : txCardLast4.trim()
+            ? `银行卡(${txCardLast4.trim()})`
+            : '';
       await api.createTransaction({
         type: txType,
         amount: amt,
         category: txCategory,
         account_id: txAccountId ? Number(txAccountId) : null,
         description: txDesc,
+        source_type: txChannel === 'manual' ? 'manual' : txChannel,
+        payment_channel: txChannel,
+        payment_method: pm,
+        card_last4: txCardLast4.trim(),
       });
       setTxAmount('');
       setTxDesc('');
-      onNotify('记账成功，账户余额与待结账池已更新');
+      setTxCardLast4('');
+      onNotify('记账成功，账户余额与全渠道账单已更新');
       await loadAll();
       onRefreshDashboard();
     } catch (err) {
@@ -320,13 +335,27 @@ export const FinanceSettlementView: React.FC<Props> = ({ onRefreshDashboard, onN
       if (txSettledFilter === 'unsettled' && t.settlement_id !== null) return false;
       if (txSettledFilter === 'settled' && t.settlement_id === null) return false;
       if (txTypeFilter !== 'all' && t.type !== txTypeFilter) return false;
+      if (txChannelFilter !== 'all') {
+        const ch = (t.payment_channel || t.source_type || 'manual').toLowerCase();
+        if (txChannelFilter === 'card_direct') {
+          if (ch !== 'card_direct' && ch !== 'email') return false;
+        } else if (ch !== txChannelFilter) {
+          return false;
+        }
+      }
       if (txCategoryFilter !== 'ALL' && (t.category || '其他') !== txCategoryFilter) return false;
-      if (kw && !(t.description || '').toLowerCase().includes(kw) && !(t.category || '').toLowerCase().includes(kw)) {
+      if (
+        kw &&
+        !(t.description || '').toLowerCase().includes(kw) &&
+        !(t.category || '').toLowerCase().includes(kw) &&
+        !(t.card_last4 || '').toLowerCase().includes(kw) &&
+        !(t.payment_method || '').toLowerCase().includes(kw)
+      ) {
         return false;
       }
       return true;
     });
-  }, [transactions, txSettledFilter, txTypeFilter, txCategoryFilter, txSearchQuery]);
+  }, [transactions, txSettledFilter, txTypeFilter, txChannelFilter, txCategoryFilter, txSearchQuery]);
 
   const filteredTxStats = useMemo(() => {
     let inc = 0;
@@ -389,12 +418,13 @@ export const FinanceSettlementView: React.FC<Props> = ({ onRefreshDashboard, onN
       {/* Sub-navigation */}
       <div className="flex flex-wrap gap-2 rounded-2xl bg-white p-1.5 border border-slate-200/80 w-fit">
         {[
+          { key: 'reconcile', label: '全渠道账单 & 多方对账' },
+          { key: 'emails', label: '账单导入 & 邮箱解析' },
           { key: 'checkout', label: '一键结账 & 财务总结' },
           { key: 'debt', label: '信用卡 & 贷款规划' },
           { key: 'transactions', label: '记账与流水明细' },
           { key: 'accounts', label: '资产与负债账户' },
           { key: 'bills', label: '周期固定账单' },
-          { key: 'emails', label: '邮箱账单 & 解析' },
         ].map((t) => (
           <button
             key={t.key}
@@ -407,6 +437,18 @@ export const FinanceSettlementView: React.FC<Props> = ({ onRefreshDashboard, onN
           </button>
         ))}
       </div>
+
+      {/* SubTab 0: Multi-Channel Unified Bills & Cross-Source Reconciliation */}
+      {subTab === 'reconcile' && (
+        <BillReconcileView
+          onRefreshDashboard={async () => {
+            await loadAll();
+            onRefreshDashboard();
+          }}
+          onNotify={onNotify}
+          onJumpToImport={() => setSubTab('emails')}
+        />
+      )}
 
       {/* SubTab 1: Checkout & Settlement Reports */}
       {subTab === 'checkout' && (
@@ -801,11 +843,36 @@ export const FinanceSettlementView: React.FC<Props> = ({ onRefreshDashboard, onN
               ))}
             </select>
             <select
+              value={txChannel}
+              onChange={(e) => {
+                const next = e.target.value as 'cash' | 'card_direct' | 'alipay' | 'wechat' | 'manual';
+                setTxChannel(next);
+                if (next === 'cash') setTxAccountId('');
+              }}
+              className="w-full rounded-xl border border-slate-200 px-3.5 py-2 text-sm"
+            >
+              <option value="cash">支付渠道：现金（自动绑定现金钱包）</option>
+              <option value="card_direct">支付渠道：直接刷卡（POS/Apple Pay）</option>
+              <option value="alipay">支付渠道：支付宝</option>
+              <option value="wechat">支付渠道：微信支付</option>
+              <option value="manual">支付渠道：其他手动记账</option>
+            </select>
+            {txChannel !== 'cash' && (
+              <input
+                type="text"
+                maxLength={4}
+                value={txCardLast4}
+                onChange={(e) => setTxCardLast4(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                placeholder="卡尾号 4 位（可选，填了可自动匹配/创建卡账户）"
+                className="w-full rounded-xl border border-slate-200 px-3.5 py-2 text-sm focus:border-indigo-500 focus:outline-none"
+              />
+            )}
+            <select
               value={txAccountId}
               onChange={(e) => setTxAccountId(e.target.value)}
               className="w-full rounded-xl border border-slate-200 px-3.5 py-2 text-sm"
             >
-              <option value="">不关联特定账户</option>
+              <option value="">自动匹配/创建对应账户（或留空）</option>
               {accounts.map((a) => (
                 <option key={a.id} value={a.id}>{a.name} ({formatMoney(a.balance)})</option>
               ))}
@@ -856,6 +923,17 @@ export const FinanceSettlementView: React.FC<Props> = ({ onRefreshDashboard, onN
                   <option value="income">收入</option>
                 </select>
                 <select
+                  value={txChannelFilter}
+                  onChange={(e) => setTxChannelFilter(e.target.value)}
+                  className="rounded-xl border border-slate-200 px-2.5 py-1.5 text-xs"
+                >
+                  <option value="all">全部渠道</option>
+                  <option value="alipay">支付宝</option>
+                  <option value="wechat">微信支付</option>
+                  <option value="card_direct">直接刷卡</option>
+                  <option value="cash">现金</option>
+                </select>
+                <select
                   value={txCategoryFilter}
                   onChange={(e) => setTxCategoryFilter(e.target.value)}
                   className="rounded-xl border border-slate-200 px-2.5 py-1.5 text-xs"
@@ -888,6 +966,13 @@ export const FinanceSettlementView: React.FC<Props> = ({ onRefreshDashboard, onN
                   >
                     <div className="min-w-0">
                       <div className="flex flex-wrap items-center gap-2">
+                        <span
+                          className={`rounded-md border px-1.5 py-0.5 text-[10px] font-medium ${
+                            (CHANNEL_META[tx.payment_channel || tx.source_type] || CHANNEL_META.other).cls
+                          }`}
+                        >
+                          {(CHANNEL_META[tx.payment_channel || tx.source_type] || CHANNEL_META.other).label}
+                        </span>
                         <select
                           value={tx.category}
                           onChange={(e) => handleQuickChangeCategory(tx, e.target.value)}
@@ -898,6 +983,16 @@ export const FinanceSettlementView: React.FC<Props> = ({ onRefreshDashboard, onN
                             <option key={c} value={c}>{c}</option>
                           ))}
                         </select>
+                        {tx.card_last4 && (
+                          <span className="rounded-md bg-indigo-50 border border-indigo-200 px-1.5 py-0.5 text-[10px] font-medium text-indigo-700">
+                            {tx.bank_name || '卡'}({tx.card_last4})
+                          </span>
+                        )}
+                        {tx.reconcile_status && tx.reconcile_status !== 'unmatched' && RECONCILE_META[tx.reconcile_status] && (
+                          <span className={`rounded-md border px-1.5 py-0.5 text-[10px] font-medium ${RECONCILE_META[tx.reconcile_status].cls}`}>
+                            {RECONCILE_META[tx.reconcile_status].label}
+                          </span>
+                        )}
                         {tx.description && <span className="text-xs text-slate-500 truncate">{tx.description}</span>}
                         <span
                           className={`rounded-md px-1.5 py-0.5 text-[10px] font-medium ${
@@ -909,6 +1004,7 @@ export const FinanceSettlementView: React.FC<Props> = ({ onRefreshDashboard, onN
                       </div>
                       <div className="mt-1 text-[11px] text-slate-400">
                         {tx.occurred_at} · {tx.account_name || '未关联账户'}
+                        {tx.payment_method ? ` · ${tx.payment_method}` : ''}
                       </div>
                     </div>
                     <div className="flex items-center gap-3 shrink-0">

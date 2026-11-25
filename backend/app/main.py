@@ -25,6 +25,7 @@ from .models import (
     AuthSetupRequest,
     BatchImportRemindersRequest,
     BatchImportTransactionsRequest,
+    BillReconcileRequest,
     ChatRequest,
     CreditCardCreate,
     CreditCardUpdate,
@@ -88,7 +89,14 @@ from .services.ctrader_oauth_service import (
     refresh_ctrader_token,
 )
 from .services.ctrader_market_service import market_service
-from .services.bill_parser import parse_bill_file
+from .services.bill_parser import parse_bill_file, summarize_detected_cards
+from .services.reconciliation_service import (
+    build_reconciliation_overview,
+    parse_payment_method_info,
+    resolve_or_create_account_and_card,
+    run_cross_source_reconciliation,
+    unmatch_reconciled_pair,
+)
 from .services.debt_planner_service import (
     enrich_credit_card,
     enrich_loan,
@@ -266,10 +274,26 @@ async def _email_auto_sync_loop() -> None:
                         skip_already_synced=True,
                     )
                     if res["emails"] or res["transactions"] or res["reminders"]:
+                        tx_fields = (
+                            "type",
+                            "amount",
+                            "category",
+                            "description",
+                            "occurred_at",
+                            "source_type",
+                            "external_ref",
+                            "payment_channel",
+                            "payment_method",
+                            "bank_name",
+                            "card_last4",
+                            "merchant",
+                            "original_currency",
+                            "original_amount",
+                        )
                         with get_conn() as conn:
                             _commit_email_batch(
                                 conn=conn,
-                                txs=[TransactionCreate(**{k: t[k] for k in ("type", "amount", "category", "description", "occurred_at", "source_type", "external_ref") if k in t}) for t in res["transactions"]],
+                                txs=[TransactionCreate(**{k: t[k] for k in tx_fields if k in t}) for t in res["transactions"]],
                                 rems=[ReminderCreate(**{k: r[k] for k in ("title", "description", "due_at", "priority", "category", "source_type", "source_ref", "linked_amount", "linked_tx_type") if k in r}) for r in res["reminders"]],
                                 account_id=None,
                                 skip_duplicates=True,
@@ -997,7 +1021,7 @@ def _compute_finance_snapshot(conn: Any) -> Dict[str, Any]:
     net_worth = round(total_assets - total_liabilities, 2)
 
     unsettled_rows = conn.execute(
-        "SELECT * FROM transactions WHERE settlement_id IS NULL ORDER BY occurred_at DESC, id DESC"
+        "SELECT * FROM transactions WHERE settlement_id IS NULL AND COALESCE(reconcile_status, 'unmatched') != 'reconciled_duplicate' ORDER BY occurred_at DESC, id DESC"
     ).fetchall()
     unsettled = [_row_to_dict(r) for r in unsettled_rows]
 
@@ -1422,14 +1446,24 @@ async def chat_endpoint(payload: ChatRequest) -> Dict[str, Any]:
                 if not emails:
                     reply_text = f"已连接邮箱{acct_prefix}扫描最近 {email_intent['days']} 天收件箱，暂时没有找到新邮件。"
                 elif email_intent["auto_import"]:
+                    tx_fields = (
+                        "type",
+                        "amount",
+                        "category",
+                        "description",
+                        "occurred_at",
+                        "source_type",
+                        "external_ref",
+                        "payment_channel",
+                        "payment_method",
+                        "bank_name",
+                        "card_last4",
+                        "merchant",
+                        "original_currency",
+                        "original_amount",
+                    )
                     tx_models = [
-                        TransactionCreate(
-                            **{
-                                k: t[k]
-                                for k in ("type", "amount", "category", "description", "occurred_at", "source_type", "external_ref")
-                                if k in t
-                            }
-                        )
+                        TransactionCreate(**{k: t[k] for k in tx_fields if k in t})
                         for t in txs
                         if float(t.get("amount") or 0) > 0
                     ]
@@ -1509,6 +1543,15 @@ async def chat_endpoint(payload: ChatRequest) -> Dict[str, Any]:
                         lines.append("• 本次没有新增可入账的消费/收入流水。")
                     if batch_res["skipped_duplicate_count"] > 0:
                         lines.append(f"• 已自动跳过重复入账 {batch_res['skipped_duplicate_count']} 笔。")
+                    if batch_res.get("auto_created_cards"):
+                        c_names = "、".join(c["name"] for c in batch_res["auto_created_cards"][:5])
+                        lines.append(f"• 已自动新建信用卡档案：{c_names}。")
+                    elif batch_res.get("auto_created_accounts"):
+                        a_names = "、".join(a["name"] for a in batch_res["auto_created_accounts"][:5])
+                        lines.append(f"• 已自动新建对应账户：{a_names}。")
+                    rec = batch_res.get("reconciliation") or {}
+                    if rec.get("newly_matched_count", 0) > 0:
+                        lines.append(f"• 已与支付宝/微信账单多方核对匹配 {rec['newly_matched_count']} 笔（自动去重不重复计入总支出）。")
                     if created_reminders:
                         lines.append(f"• 同步生成提醒 {len(created_reminders)} 条。")
                     if not txs and emails:
@@ -1688,8 +1731,17 @@ def create_account(payload: AccountCreate) -> Dict[str, Any]:
     ts = now_iso()
     with get_conn() as conn:
         cur = conn.execute(
-            "INSERT INTO accounts (name, type, balance, credit_limit, currency, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (payload.name.strip(), payload.type, round(payload.balance, 2), round(payload.credit_limit, 2), payload.currency, ts),
+            "INSERT INTO accounts (name, type, balance, credit_limit, currency, bank_name, card_last4, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                payload.name.strip(),
+                payload.type,
+                round(payload.balance, 2),
+                round(payload.credit_limit, 2),
+                payload.currency,
+                payload.bank_name.strip(),
+                payload.card_last4.strip(),
+                ts,
+            ),
         )
         return _row_to_dict(conn.execute("SELECT * FROM accounts WHERE id = ?", (cur.lastrowid,)).fetchone())
 
@@ -1724,14 +1776,20 @@ def list_transactions(
     settlement_id: Optional[int] = Query(None),
     category: Optional[str] = Query(None),
     tx_type: Optional[str] = Query(None),
+    channel: Optional[str] = Query(None),
+    card_last4: Optional[str] = Query(None),
+    include_duplicates: bool = Query(False),
     q: Optional[str] = Query(None),
     limit: int = Query(1000, ge=1, le=5000),
 ) -> Dict[str, Any]:
-    sql = """SELECT t.*, a.name AS account_name
+    sql = """SELECT t.*, a.name AS account_name, cc.name AS credit_card_name
              FROM transactions t
              LEFT JOIN accounts a ON t.account_id = a.id
+             LEFT JOIN credit_cards cc ON t.credit_card_id = cc.id
              WHERE 1=1"""
     params: List[Any] = []
+    if not include_duplicates:
+        sql += " AND COALESCE(t.reconcile_status, 'unmatched') != 'reconciled_duplicate'"
     if settled == "unsettled":
         sql += " AND t.settlement_id IS NULL"
     elif settled == "settled":
@@ -1745,10 +1803,16 @@ def list_transactions(
     if tx_type:
         sql += " AND t.type = ?"
         params.append(tx_type)
+    if channel and channel != "all":
+        sql += " AND COALESCE(t.payment_channel, t.source_type) = ?"
+        params.append(channel)
+    if card_last4 and card_last4.strip():
+        sql += " AND t.card_last4 = ?"
+        params.append(card_last4.strip())
     if q and q.strip():
         like_q = f"%{q.strip()}%"
-        sql += " AND (t.description LIKE ? OR t.category LIKE ?)"
-        params.extend([like_q, like_q])
+        sql += " AND (t.description LIKE ? OR t.category LIKE ? OR t.payment_method LIKE ? OR t.card_last4 LIKE ? OR t.merchant LIKE ?)"
+        params.extend([like_q, like_q, like_q, like_q, like_q])
     sql += " ORDER BY t.occurred_at DESC, t.id DESC LIMIT ?"
     params.append(limit)
     with get_conn() as conn:
@@ -1770,16 +1834,78 @@ def list_transactions(
 def create_transaction(payload: TransactionCreate) -> Dict[str, Any]:
     ts = now_iso()
     occ = payload.occurred_at or datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
+    raw_pm = (payload.payment_method or "").strip()
+    if not raw_pm and payload.card_last4.strip():
+        raw_pm = f"{payload.bank_name.strip()}信用卡({payload.card_last4.strip()})" if payload.bank_name.strip() else f"银行卡({payload.card_last4.strip()})"
+    pm_info = parse_payment_method_info(
+        payment_method=raw_pm,
+        source_type=payload.source_type,
+        description=payload.description,
+        merchant=payload.merchant,
+        payment_channel=payload.payment_channel,
+    )
+    bank_name = payload.bank_name.strip() or pm_info["bank_name"]
+    card_last4 = payload.card_last4.strip() or pm_info["card_last4"]
+    pay_channel = pm_info["payment_channel"]
+    pay_method = raw_pm or pm_info["payment_method"]
+    rec_status = "cash" if pay_channel == "cash" else ("direct_card" if pay_channel == "card_direct" else "unmatched")
+
     with get_conn() as conn:
+        target_acc_id = payload.account_id
+        credit_card_id: Optional[int] = None
+        if target_acc_id is None and payload.auto_match_account and (card_last4 or pay_channel in ("cash", "card_direct") or pay_method):
+            resolved = resolve_or_create_account_and_card(
+                conn,
+                {**pm_info, "bank_name": bank_name, "card_last4": card_last4},
+                auto_create=True,
+                currency=payload.original_currency or "CNY",
+            )
+            target_acc_id = resolved["account_id"]
+            credit_card_id = resolved["credit_card_id"]
+            if not bank_name and resolved["bank_name"]:
+                bank_name = resolved["bank_name"]
+        elif target_acc_id is not None:
+            cc_row = conn.execute("SELECT id, bank_name, last4 FROM credit_cards WHERE account_id = ? LIMIT 1", (target_acc_id,)).fetchone()
+            if cc_row:
+                credit_card_id = cc_row["id"]
+                if not bank_name and cc_row["bank_name"]:
+                    bank_name = cc_row["bank_name"]
+                if not card_last4 and cc_row["last4"]:
+                    card_last4 = cc_row["last4"]
+
         cur = conn.execute(
             """INSERT INTO transactions
-            (type, amount, category, account_id, description, occurred_at, settlement_id, source_type, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)""",
-            (payload.type, round(payload.amount, 2), payload.category, payload.account_id, payload.description.strip(), occ, payload.source_type, ts),
+            (type, amount, category, account_id, description, occurred_at, settlement_id, source_type, external_ref,
+             payment_channel, payment_method, bank_name, card_last4, credit_card_id, reconcile_status, merchant, original_currency, original_amount, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                payload.type,
+                round(payload.amount, 2),
+                payload.category,
+                target_acc_id,
+                payload.description.strip(),
+                occ,
+                payload.source_type,
+                payload.external_ref.strip(),
+                pay_channel,
+                pay_method,
+                bank_name,
+                card_last4,
+                credit_card_id,
+                rec_status,
+                payload.merchant.strip(),
+                (payload.original_currency or "CNY").upper(),
+                payload.original_amount if payload.original_amount is not None else round(payload.amount, 2),
+                ts,
+            ),
         )
-        _apply_tx_to_account(conn, payload.account_id, payload.type, float(payload.amount))
+        _apply_tx_to_account(conn, target_acc_id, payload.type, float(payload.amount))
         row = conn.execute(
-            "SELECT t.*, a.name AS account_name FROM transactions t LEFT JOIN accounts a ON t.account_id = a.id WHERE t.id = ?",
+            """SELECT t.*, a.name AS account_name, cc.name AS credit_card_name
+               FROM transactions t
+               LEFT JOIN accounts a ON t.account_id = a.id
+               LEFT JOIN credit_cards cc ON t.credit_card_id = cc.id
+               WHERE t.id = ?""",
             (cur.lastrowid,),
         ).fetchone()
         return _row_to_dict(row)
@@ -1792,16 +1918,33 @@ def update_transaction(tx_id: int, payload: TransactionUpdate) -> Dict[str, Any]
         updates["category"] = payload.category.strip() or "其他"
     if payload.description is not None:
         updates["description"] = payload.description.strip()
+    if payload.payment_channel is not None:
+        updates["payment_channel"] = payload.payment_channel.strip()
+    if payload.payment_method is not None:
+        updates["payment_method"] = payload.payment_method.strip()
+    if payload.card_last4 is not None:
+        updates["card_last4"] = payload.card_last4.strip()
+    if payload.account_id is not None:
+        updates["account_id"] = payload.account_id
     if not updates:
         raise HTTPException(status_code=400, detail="无更新字段")
-    sets = ", ".join(f"{k} = ?" for k in updates.keys())
-    params = list(updates.values()) + [tx_id]
     with get_conn() as conn:
-        cur = conn.execute(f"UPDATE transactions SET {sets} WHERE id = ?", params)
-        if cur.rowcount == 0:
+        old_row = conn.execute("SELECT * FROM transactions WHERE id = ?", (tx_id,)).fetchone()
+        if not old_row:
             raise HTTPException(status_code=404, detail="账目不存在")
+        old_tx = _row_to_dict(old_row)
+        if "account_id" in updates and updates["account_id"] != old_tx.get("account_id") and old_tx.get("reconcile_status") != "reconciled_duplicate":
+            _apply_tx_to_account(conn, old_tx.get("account_id"), old_tx["type"], float(old_tx["amount"]), reverse=True)
+            _apply_tx_to_account(conn, updates["account_id"], old_tx["type"], float(old_tx["amount"]))
+        sets = ", ".join(f"{k} = ?" for k in updates.keys())
+        params = list(updates.values()) + [tx_id]
+        conn.execute(f"UPDATE transactions SET {sets} WHERE id = ?", params)
         row = conn.execute(
-            "SELECT t.*, a.name AS account_name FROM transactions t LEFT JOIN accounts a ON t.account_id = a.id WHERE t.id = ?",
+            """SELECT t.*, a.name AS account_name, cc.name AS credit_card_name
+               FROM transactions t
+               LEFT JOIN accounts a ON t.account_id = a.id
+               LEFT JOIN credit_cards cc ON t.credit_card_id = cc.id
+               WHERE t.id = ?""",
             (tx_id,),
         ).fetchone()
         return _row_to_dict(row)
@@ -1814,7 +1957,17 @@ def delete_transaction(tx_id: int) -> Dict[str, bool]:
         if not row:
             raise HTTPException(status_code=404, detail="账目不存在")
         tx = _row_to_dict(row)
-        _apply_tx_to_account(conn, tx.get("account_id"), tx["type"], float(tx["amount"]), reverse=True)
+        if tx.get("matched_tx_id"):
+            peer_id = tx["matched_tx_id"]
+            peer = conn.execute("SELECT * FROM transactions WHERE id = ?", (peer_id,)).fetchone()
+            if peer:
+                if peer["reconcile_status"] == "reconciled_duplicate":
+                    conn.execute("UPDATE transactions SET reconcile_status = 'direct_card', matched_tx_id = NULL WHERE id = ?", (peer_id,))
+                    _apply_tx_to_account(conn, peer["account_id"], peer["type"], float(peer["amount"]))
+                else:
+                    conn.execute("UPDATE transactions SET reconcile_status = 'unmatched', matched_tx_id = NULL WHERE id = ?", (peer_id,))
+        if tx.get("reconcile_status") != "reconciled_duplicate":
+            _apply_tx_to_account(conn, tx.get("account_id"), tx["type"], float(tx["amount"]), reverse=True)
         conn.execute("DELETE FROM transactions WHERE id = ?", (tx_id,))
         return {"deleted": True}
 
@@ -1969,12 +2122,12 @@ async def create_settlement(payload: SettlementCreateRequest) -> Dict[str, Any]:
         if payload.transaction_ids:
             placeholders = ",".join("?" for _ in payload.transaction_ids)
             tx_rows = conn.execute(
-                f"SELECT * FROM transactions WHERE settlement_id IS NULL AND id IN ({placeholders}) ORDER BY occurred_at ASC",
+                f"SELECT * FROM transactions WHERE settlement_id IS NULL AND COALESCE(reconcile_status, 'unmatched') != 'reconciled_duplicate' AND id IN ({placeholders}) ORDER BY occurred_at ASC",
                 payload.transaction_ids,
             ).fetchall()
         else:
             tx_rows = conn.execute(
-                "SELECT * FROM transactions WHERE settlement_id IS NULL ORDER BY occurred_at ASC"
+                "SELECT * FROM transactions WHERE settlement_id IS NULL AND COALESCE(reconcile_status, 'unmatched') != 'reconciled_duplicate' ORDER BY occurred_at ASC"
             ).fetchall()
 
         txs = [_row_to_dict(r) for r in tx_rows]
@@ -2122,7 +2275,7 @@ async def regenerate_settlement(
         txs = [
             _row_to_dict(r)
             for r in conn.execute(
-                "SELECT * FROM transactions WHERE settlement_id = ? ORDER BY occurred_at ASC",
+                "SELECT * FROM transactions WHERE settlement_id = ? AND COALESCE(reconcile_status, 'unmatched') != 'reconciled_duplicate' ORDER BY occurred_at ASC",
                 (settlement_id,),
             ).fetchall()
         ]
@@ -2217,23 +2370,70 @@ def _commit_email_batch(
     account_id: Optional[int],
     skip_duplicates: bool,
     logs: List[Dict[str, Any]],
+    auto_create_accounts: bool = True,
+    auto_reconcile: bool = True,
 ) -> Dict[str, Any]:
     ts = now_iso()
     existing_refs = _get_existing_external_refs(conn) if skip_duplicates else set()
     imported_txs: List[Dict[str, Any]] = []
     skipped_txs = 0
+    auto_created_accounts: List[Dict[str, Any]] = []
+    auto_created_cards: List[Dict[str, Any]] = []
 
     for item in txs:
         ext_ref = (item.external_ref or "").strip()
         if skip_duplicates and ext_ref and ext_ref in existing_refs:
             skipped_txs += 1
             continue
+
+        raw_pm = (item.payment_method or "").strip()
+        if not raw_pm and (item.card_last4 or "").strip():
+            raw_pm = f"{item.bank_name.strip()}信用卡({item.card_last4.strip()})" if item.bank_name.strip() else f"银行卡({item.card_last4.strip()})"
+
+        pm_info = parse_payment_method_info(
+            payment_method=raw_pm,
+            source_type=item.source_type or "bill_import",
+            description=item.description or "",
+            merchant=item.merchant or "",
+            payment_channel=item.payment_channel or "",
+        )
+        bank_name = (item.bank_name or "").strip() or pm_info["bank_name"]
+        card_last4 = (item.card_last4 or "").strip() or pm_info["card_last4"]
+        pay_channel = pm_info["payment_channel"]
+        pay_method = raw_pm or pm_info["payment_method"]
+        orig_ccy = (item.original_currency or "CNY").upper()
+        orig_amt = item.original_amount if item.original_amount is not None else round(item.amount, 2)
+
         target_acc = item.account_id if item.account_id is not None else account_id
+        credit_card_id: Optional[int] = None
+
+        if target_acc is None and auto_create_accounts:
+            resolved = resolve_or_create_account_and_card(
+                conn,
+                {**pm_info, "bank_name": bank_name, "card_last4": card_last4},
+                auto_create=True,
+                currency=orig_ccy,
+            )
+            target_acc = resolved["account_id"]
+            credit_card_id = resolved["credit_card_id"]
+            if not bank_name and resolved["bank_name"]:
+                bank_name = resolved["bank_name"]
+            if resolved["created_account"]:
+                auto_created_accounts.append(resolved["created_account"])
+            if resolved["created_credit_card"]:
+                auto_created_cards.append(resolved["created_credit_card"])
+        elif target_acc is not None:
+            cc_row = conn.execute("SELECT id FROM credit_cards WHERE account_id = ? LIMIT 1", (target_acc,)).fetchone()
+            if cc_row:
+                credit_card_id = cc_row["id"]
+
+        rec_status = "cash" if pay_channel == "cash" else ("direct_card" if pay_channel == "card_direct" else "unmatched")
         occ = item.occurred_at or datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
         cur = conn.execute(
             """INSERT INTO transactions
-            (type, amount, category, account_id, description, occurred_at, settlement_id, source_type, external_ref, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)""",
+            (type, amount, category, account_id, description, occurred_at, settlement_id, source_type, external_ref,
+             payment_channel, payment_method, bank_name, card_last4, credit_card_id, reconcile_status, merchant, original_currency, original_amount, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 item.type,
                 round(item.amount, 2),
@@ -2243,6 +2443,15 @@ def _commit_email_batch(
                 occ,
                 item.source_type or "bill_import",
                 ext_ref,
+                pay_channel,
+                pay_method,
+                bank_name,
+                card_last4,
+                credit_card_id,
+                rec_status,
+                (item.merchant or "").strip(),
+                orig_ccy,
+                orig_amt,
                 ts,
             ),
         )
@@ -2250,10 +2459,38 @@ def _commit_email_batch(
         if ext_ref:
             existing_refs.add(ext_ref)
         row = conn.execute(
-            "SELECT t.*, a.name AS account_name FROM transactions t LEFT JOIN accounts a ON t.account_id = a.id WHERE t.id = ?",
+            """SELECT t.*, a.name AS account_name, cc.name AS credit_card_name
+               FROM transactions t
+               LEFT JOIN accounts a ON t.account_id = a.id
+               LEFT JOIN credit_cards cc ON t.credit_card_id = cc.id
+               WHERE t.id = ?""",
             (cur.lastrowid,),
         ).fetchone()
         imported_txs.append(_row_to_dict(row))
+
+    reconciliation: Dict[str, Any] = {}
+    if auto_reconcile and imported_txs:
+        reconciliation = run_cross_source_reconciliation(
+            conn,
+            backfill_accounts=False,
+            auto_create_accounts=auto_create_accounts,
+        )
+        # Refresh imported_txs statuses after cross-source reconciliation
+        refreshed_ids = [t["id"] for t in imported_txs]
+        if refreshed_ids:
+            ph = ",".join("?" for _ in refreshed_ids)
+            refreshed_map = {
+                r["id"]: _row_to_dict(r)
+                for r in conn.execute(
+                    f"""SELECT t.*, a.name AS account_name, cc.name AS credit_card_name
+                        FROM transactions t
+                        LEFT JOIN accounts a ON t.account_id = a.id
+                        LEFT JOIN credit_cards cc ON t.credit_card_id = cc.id
+                        WHERE t.id IN ({ph})""",
+                    refreshed_ids,
+                ).fetchall()
+            }
+            imported_txs = [refreshed_map.get(tid, t) for tid, t in zip(refreshed_ids, imported_txs)]
 
     imported_rems: List[Dict[str, Any]] = []
     for rem in rems:
@@ -2306,6 +2543,9 @@ def _commit_email_batch(
         "imported_rem_count": len(imported_rems),
         "transactions": imported_txs,
         "reminders": imported_rems,
+        "auto_created_accounts": auto_created_accounts,
+        "auto_created_cards": auto_created_cards,
+        "reconciliation": reconciliation,
     }
 
 
@@ -2325,6 +2565,49 @@ async def parse_uploaded_bill(
     )
 
 
+@app.get("/api/bills/reconcile/overview")
+def get_bills_reconcile_overview(
+    month: str = Query(""),
+    channel: str = Query("all"),
+    card_last4: str = Query(""),
+    reconcile_status: str = Query("all"),
+    q: str = Query(""),
+    include_duplicates: bool = Query(False),
+) -> Dict[str, Any]:
+    with get_conn() as conn:
+        return build_reconciliation_overview(
+            conn=conn,
+            month=month,
+            channel=channel,
+            card_last4=card_last4,
+            reconcile_status=reconcile_status,
+            q=q,
+            include_duplicates=include_duplicates,
+        )
+
+
+@app.post("/api/bills/reconcile")
+def run_bills_reconciliation(payload: Optional[BillReconcileRequest] = None) -> Dict[str, Any]:
+    req = payload or BillReconcileRequest()
+    with get_conn() as conn:
+        res = run_cross_source_reconciliation(
+            conn,
+            backfill_accounts=req.backfill_accounts,
+            auto_create_accounts=req.auto_create_accounts,
+        )
+        overview = build_reconciliation_overview(conn)
+    return {"reconciliation": res, "overview": overview}
+
+
+@app.post("/api/bills/reconcile/unmatch/{tx_id}")
+def unmatch_bills_pair(tx_id: int) -> Dict[str, Any]:
+    with get_conn() as conn:
+        try:
+            return unmatch_reconciled_pair(conn, tx_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+
 @app.post("/api/transactions/batch-import")
 def batch_import_transactions(payload: BatchImportTransactionsRequest) -> Dict[str, Any]:
     with get_conn() as conn:
@@ -2335,6 +2618,8 @@ def batch_import_transactions(payload: BatchImportTransactionsRequest) -> Dict[s
             account_id=payload.account_id,
             skip_duplicates=payload.skip_duplicates,
             logs=[],
+            auto_create_accounts=payload.auto_create_accounts,
+            auto_reconcile=payload.auto_reconcile,
         )
 
 
@@ -2473,10 +2758,13 @@ async def parse_email_text_endpoint(payload: EmailParseTextRequest) -> Dict[str,
     with get_conn() as conn:
         existing_refs = _get_existing_external_refs(conn)
     for tx in res.get("transactions", []):
-        fp = hashlib.sha256(f"{payload.subject}|{payload.body}|{tx.get('amount')}".encode("utf-8")).hexdigest()[:16]
+        fp = hashlib.sha256(
+            f"{payload.subject}|{tx.get('occurred_at') or ''}|{tx.get('card_last4') or ''}|{tx.get('amount')}|{tx.get('description') or ''}".encode("utf-8")
+        ).hexdigest()[:16]
         ext_ref = tx.get("external_ref") or f"email_text:{fp}"
         tx["external_ref"] = ext_ref
         tx["already_imported"] = ext_ref in existing_refs
+    res["detected_cards"] = summarize_detected_cards(res.get("transactions", []))
     return res
 
 
@@ -2490,6 +2778,8 @@ async def import_email_items_endpoint(payload: EmailImportRequest) -> Dict[str, 
             account_id=payload.account_id,
             skip_duplicates=payload.skip_duplicates,
             logs=[l.model_dump() for l in payload.email_logs],
+            auto_create_accounts=payload.auto_create_accounts,
+            auto_reconcile=payload.auto_reconcile,
         )
     await _push_new_reminders_bark(res.get("reminders", []), prefix="📧 邮件提醒：")
     return res

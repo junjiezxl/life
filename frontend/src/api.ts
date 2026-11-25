@@ -8,6 +8,7 @@ import type {
   DebtOperation,
   DebtOverviewResponse,
   DebtPlanResponse,
+  DetectedCardSummary,
   EmailFetchResponse,
   EmailSyncLog,
   Loan,
@@ -16,6 +17,8 @@ import type {
   ParsedBillTransaction,
   PhoneNumber,
   PhoneNumbersResponse,
+  ReconcileOverviewResponse,
+  ReconcileRunResult,
   RecurringBill,
   Reminder,
   Settlement,
@@ -239,17 +242,59 @@ export const api = {
     return resp.json() as Promise<{
       transactions: ParsedBillTransaction[];
       platforms: string[];
+      detected_cards?: DetectedCardSummary[];
       errors: string[];
     }>;
   },
+  getReconcileOverview: (params?: {
+    month?: string;
+    channel?: string;
+    card_last4?: string;
+    reconcile_status?: string;
+    q?: string;
+    include_duplicates?: boolean;
+  }) => {
+    const qs = new URLSearchParams();
+    if (params?.month) qs.set('month', params.month);
+    if (params?.channel && params.channel !== 'all') qs.set('channel', params.channel);
+    if (params?.card_last4) qs.set('card_last4', params.card_last4);
+    if (params?.reconcile_status && params.reconcile_status !== 'all') qs.set('reconcile_status', params.reconcile_status);
+    if (params?.q) qs.set('q', params.q);
+    if (params?.include_duplicates) qs.set('include_duplicates', 'true');
+    const qstr = qs.toString();
+    return request<ReconcileOverviewResponse>(`/api/bills/reconcile/overview${qstr ? `?${qstr}` : ''}`);
+  },
+  runReconcile: (payload?: { backfill_accounts?: boolean; auto_create_accounts?: boolean }) =>
+    request<{ reconciliation: ReconcileRunResult; overview: ReconcileOverviewResponse }>('/api/bills/reconcile', {
+      method: 'POST',
+      body: JSON.stringify(payload || { backfill_accounts: true, auto_create_accounts: true }),
+    }),
+  unmatchReconciledPair: (txId: number) =>
+    request<{ unmatched: boolean; tx_id: number; peer_id: number }>(`/api/bills/reconcile/unmatch/${txId}`, {
+      method: 'POST',
+    }),
   batchImportTransactions: (
     transactions: ParsedBillTransaction[],
     accountId: number | null,
     skipDuplicates = true,
+    autoCreateAccounts = true,
+    autoReconcile = true,
   ) =>
-    request<{ imported_tx_count: number; skipped_duplicate_count: number }>('/api/transactions/batch-import', {
+    request<{
+      imported_tx_count: number;
+      skipped_duplicate_count: number;
+      auto_created_accounts?: Account[];
+      auto_created_cards?: CreditCard[];
+      reconciliation?: ReconcileRunResult;
+    }>('/api/transactions/batch-import', {
       method: 'POST',
-      body: JSON.stringify({ transactions, account_id: accountId, skip_duplicates: skipDuplicates }),
+      body: JSON.stringify({
+        transactions,
+        account_id: accountId,
+        skip_duplicates: skipDuplicates,
+        auto_create_accounts: autoCreateAccounts,
+        auto_reconcile: autoReconcile,
+      }),
     }),
   listEmailAccounts: () => request<import('./types').EmailAccount[]>('/api/email-accounts'),
   createEmailAccount: (payload: {
@@ -302,15 +347,20 @@ export const api = {
     account_id?: number;
   }) => request<EmailFetchResponse>('/api/emails/fetch-parse', { method: 'POST', body: JSON.stringify(params) }),
   parseEmailText: (params: { subject: string; sender: string; body: string }) =>
-    request<{ transactions: ParsedBillTransaction[]; reminders: NoteCandidate[]; engine: string; warning?: string }>(
-      '/api/emails/parse-text',
-      { method: 'POST', body: JSON.stringify(params) },
-    ),
+    request<{
+      transactions: ParsedBillTransaction[];
+      reminders: NoteCandidate[];
+      detected_cards?: DetectedCardSummary[];
+      engine: string;
+      warning?: string;
+    }>('/api/emails/parse-text', { method: 'POST', body: JSON.stringify(params) }),
   importEmailItems: (params: {
     transactions: ParsedBillTransaction[];
     reminders: NoteCandidate[];
     account_id: number | null;
     skip_duplicates: boolean;
+    auto_create_accounts?: boolean;
+    auto_reconcile?: boolean;
     email_logs: Array<{
       message_uid: string;
       subject: string;
@@ -320,10 +370,14 @@ export const api = {
       rem_imported: number;
     }>;
   }) =>
-    request<{ imported_tx_count: number; skipped_duplicate_count: number; imported_rem_count: number }>(
-      '/api/emails/import',
-      { method: 'POST', body: JSON.stringify(params) },
-    ),
+    request<{
+      imported_tx_count: number;
+      skipped_duplicate_count: number;
+      imported_rem_count: number;
+      auto_created_accounts?: Account[];
+      auto_created_cards?: CreditCard[];
+      reconciliation?: ReconcileRunResult;
+    }>('/api/emails/import', { method: 'POST', body: JSON.stringify(params) }),
   listEmailLogs: () => request<EmailSyncLog[]>('/api/emails/logs'),
 
   // Phone Numbers

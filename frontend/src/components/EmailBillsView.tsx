@@ -14,13 +14,14 @@ import {
 import { api } from '../api';
 import type {
   Account,
+  DetectedCardSummary,
   EmailAccount,
   EmailScanSummary,
   EmailSyncLog,
   NoteCandidate,
   ParsedBillTransaction,
 } from '../types';
-import { formatMoney, SOURCE_META } from '../utils/format';
+import { CHANNEL_META, formatMoney, SOURCE_META } from '../utils/format';
 
 interface Props {
   onRefreshDashboard: () => void;
@@ -37,6 +38,9 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
 
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [targetAccountId, setTargetAccountId] = useState<string>('');
+  const [autoCreateAccounts, setAutoCreateAccounts] = useState<boolean>(true);
+  const [autoReconcile, setAutoReconcile] = useState<boolean>(true);
+  const [detectedCards, setDetectedCards] = useState<DetectedCardSummary[]>([]);
   const [mailboxes, setMailboxes] = useState<EmailAccount[]>([]);
   const [selectedMailboxId, setSelectedMailboxId] = useState<string>('');
 
@@ -65,9 +69,6 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
       ]);
       setAccounts(accRes.accounts);
       setMailboxes(mbRes.filter((m) => m.enabled));
-      if (!targetAccountId && accRes.accounts.length > 0) {
-        setTargetAccountId(String(accRes.accounts[0].id));
-      }
       setLogs(logRes);
     } catch {
       // ignore
@@ -135,6 +136,7 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
       });
       setEmails(res.emails || []);
       setWarnings(res.warnings || []);
+      setDetectedCards(res.detected_cards || []);
       populateCandidates(res.transactions || [], res.reminders || [], false);
       onNotify(
         `已扫描 ${res.emails.length} 封邮件，识别出 ${res.transactions.length} 笔账目与 ${res.reminders.length} 条提醒`,
@@ -152,8 +154,28 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
     try {
       const res = await api.parseBillUpload(file, zipPassword);
       setWarnings(res.errors || []);
+      if (res.detected_cards?.length) {
+        setDetectedCards((prev) => {
+          const map = new Map<string, DetectedCardSummary>();
+          [...prev, ...res.detected_cards!].forEach((c) => {
+            const k = `${c.card_kind}:${c.card_last4 || c.account_display_name}`;
+            const ex = map.get(k);
+            if (ex) {
+              ex.count += c.count;
+              ex.expense = Number((ex.expense + c.expense).toFixed(2));
+              ex.income = Number((ex.income + c.income).toFixed(2));
+            } else {
+              map.set(k, { ...c });
+            }
+          });
+          return Array.from(map.values()).sort((a, b) => b.count - a.count);
+        });
+      }
       populateCandidates(res.transactions || [], [], true);
-      onNotify(`已从 ${file.name} 解析出 ${res.transactions.length} 笔账目`);
+      onNotify(
+        `已从 ${file.name} 解析出 ${res.transactions.length} 笔账目` +
+          (res.detected_cards?.length ? `，识别到 ${res.detected_cards.length} 个支付卡/账户` : ''),
+      );
     } catch (err) {
       onNotify(err instanceof Error ? err.message : '账单文件解析失败');
     } finally {
@@ -170,6 +192,9 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
         sender: '手动粘贴',
         body: pasteBody.trim(),
       });
+      if (res.detected_cards?.length) {
+        setDetectedCards((prev) => [...prev, ...res.detected_cards!]);
+      }
       populateCandidates(res.transactions || [], res.reminders || [], true);
       onNotify(`从正文识别出 ${res.transactions.length} 笔账目、${res.reminders.length} 条提醒`);
     } catch (err) {
@@ -193,6 +218,8 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
         reminders: pickedRems,
         account_id: targetAccountId ? Number(targetAccountId) : null,
         skip_duplicates: true,
+        auto_create_accounts: autoCreateAccounts,
+        auto_reconcile: autoReconcile,
         email_logs: emails.map((em) => ({
           message_uid: em.uid,
           subject: em.subject,
@@ -202,11 +229,17 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
           rem_imported: em.parsed_rem_count,
         })),
       });
+      const extra: string[] = [];
+      if (res.auto_created_cards?.length) extra.push(`自动建信用卡 ${res.auto_created_cards.length} 张`);
+      if (res.auto_created_accounts?.length) extra.push(`自动建账户 ${res.auto_created_accounts.length} 个`);
+      if (res.reconciliation?.newly_matched_count) extra.push(`多方核对去重 ${res.reconciliation.newly_matched_count} 笔`);
       onNotify(
-        `导入完成：新增 ${res.imported_tx_count} 笔账目（跳过重复 ${res.skipped_duplicate_count} 笔），新增 ${res.imported_rem_count} 条提醒`,
+        `导入完成：新增 ${res.imported_tx_count} 笔账目（跳过重复 ${res.skipped_duplicate_count} 笔），新增 ${res.imported_rem_count} 条提醒` +
+          (extra.length ? `；${extra.join('，')}` : ''),
       );
       setTxCandidates([]);
       setRemCandidates([]);
+      setDetectedCards([]);
       setTxSelected({});
       setRemSelected({});
       await loadMeta();
@@ -417,9 +450,9 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
                 onChange={(e) => setTargetAccountId(e.target.value)}
                 className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs"
               >
-                <option value="">入账账户：不绑定特定账户</option>
+                <option value="">入账方式：按卡尾号/支付方式智能自动分配（推荐）</option>
                 {accounts.map((a) => (
-                  <option key={a.id} value={a.id}>入账到：{a.name}</option>
+                  <option key={a.id} value={a.id}>强制全部入账到：{a.name}</option>
                 ))}
               </select>
               <button
@@ -428,10 +461,55 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
                 className="inline-flex items-center gap-1.5 rounded-xl bg-slate-900 px-4 py-2 text-xs font-medium text-white hover:bg-slate-800 disabled:opacity-40 cursor-pointer"
               >
                 <Download className="h-3.5 w-3.5" />
-                {importing ? '正在导入...' : '一键确认入账并导入提醒'}
+                {importing ? '正在导入...' : '一键确认入账并多方核对'}
               </button>
             </div>
           </div>
+
+          {/* Smart Auto-Account & Reconciliation Options */}
+          <div className="flex flex-wrap items-center gap-4 rounded-xl bg-indigo-50/50 border border-indigo-100 px-3.5 py-2.5 text-xs text-slate-700">
+            <label className="inline-flex items-center gap-1.5 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={autoCreateAccounts}
+                onChange={(e) => setAutoCreateAccounts(e.target.checked)}
+              />
+              <span>自动按支付方式/卡尾号匹配并创建对应信用卡与账户</span>
+            </label>
+            <label className="inline-flex items-center gap-1.5 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={autoReconcile}
+                onChange={(e) => setAutoReconcile(e.target.checked)}
+              />
+              <span>导入后自动与邮箱信用卡账单/支付宝/微信多方交叉核对去重</span>
+            </label>
+          </div>
+
+          {/* Detected Cards / Accounts Summary */}
+          {detectedCards.length > 0 && (
+            <div className="rounded-xl border border-emerald-200/80 bg-emerald-50/40 p-3 space-y-2">
+              <div className="text-xs font-semibold text-emerald-800">
+                识别到 {detectedCards.length} 个支付卡/钱包账户（导入时自动归属或新建）：
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {detectedCards.map((c, idx) => (
+                  <span
+                    key={`${c.account_display_name}-${idx}`}
+                    className="inline-flex items-center gap-1 rounded-lg bg-white border border-emerald-200 px-2.5 py-1 text-[11px] text-slate-700"
+                  >
+                    <span className="font-medium text-slate-900">{c.account_display_name}</span>
+                    {c.card_kind === 'credit_card' && (
+                      <span className="rounded bg-rose-50 px-1 text-[10px] text-rose-600">信用卡</span>
+                    )}
+                    <span className="text-slate-400">
+                      {c.count}笔 · {formatMoney(c.expense)}
+                    </span>
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
 
           {/* Reminders candidates */}
           {remCandidates.length > 0 && (
@@ -494,14 +572,27 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
                       <div className="min-w-0">
                         <div className="flex flex-wrap items-center gap-1.5">
                           <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${src.cls}`}>{src.label}</span>
-                          <span className="font-medium text-slate-900 truncate max-w-[260px]">{tx.description}</span>
+                          {tx.payment_channel && CHANNEL_META[tx.payment_channel] && tx.payment_channel !== tx.source_type && (
+                            <span className={`rounded border px-1.5 py-0.5 text-[10px] font-medium ${CHANNEL_META[tx.payment_channel].cls}`}>
+                              {CHANNEL_META[tx.payment_channel].label}
+                            </span>
+                          )}
+                          {(tx.account_display_name || tx.card_last4) && (
+                            <span className="rounded bg-indigo-50 border border-indigo-200 px-1.5 py-0.5 text-[10px] font-medium text-indigo-700">
+                              {tx.account_display_name || `${tx.bank_name || '卡'}(${tx.card_last4})`}
+                            </span>
+                          )}
+                          <span className="font-medium text-slate-900 truncate max-w-[240px]">{tx.description}</span>
                           {tx.already_imported && (
                             <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700">
                               已存在（自动去重）
                             </span>
                           )}
                         </div>
-                        <div className="mt-0.5 text-[11px] text-slate-400">{tx.occurred_at}</div>
+                        <div className="mt-0.5 text-[11px] text-slate-400">
+                          {tx.occurred_at}
+                          {tx.payment_method ? ` · ${tx.payment_method}` : ''}
+                        </div>
                       </div>
                     </div>
 

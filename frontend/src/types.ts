@@ -293,6 +293,8 @@ export interface Account {
   balance: number;
   credit_limit: number;
   currency: string;
+  bank_name?: string;
+  card_last4?: string;
   updated_at: string;
 }
 
@@ -303,10 +305,21 @@ export interface Transaction {
   category: string;
   account_id: number | null;
   account_name?: string;
+  credit_card_id?: number | null;
+  credit_card_name?: string;
   description: string;
+  merchant?: string;
   occurred_at: string;
   settlement_id: number | null;
   source_type: string;
+  payment_channel?: string;
+  payment_method?: string;
+  bank_name?: string;
+  card_last4?: string;
+  reconcile_status?: 'unmatched' | 'matched' | 'direct_card' | 'reconciled_duplicate' | 'cash' | string;
+  matched_tx_id?: number | null;
+  original_currency?: string;
+  original_amount?: number | null;
   created_at: string;
 }
 
@@ -437,14 +450,33 @@ export interface EmailAccount {
   updated_at?: string;
 }
 
+export interface DetectedCardSummary {
+  account_display_name: string;
+  bank_name: string;
+  card_last4: string;
+  card_kind: string;
+  count: number;
+  expense: number;
+  income: number;
+}
+
 export interface ParsedBillTransaction {
   type: 'expense' | 'income';
   amount: number;
   category: string;
   description: string;
+  merchant?: string;
   occurred_at: string;
   source_type: string;
   external_ref: string;
+  payment_channel?: string;
+  payment_method?: string;
+  bank_name?: string;
+  card_last4?: string;
+  card_kind?: string;
+  account_display_name?: string;
+  original_currency?: string;
+  original_amount?: number | null;
   already_imported?: boolean;
   email_subject?: string;
   email_uid?: string;
@@ -467,7 +499,71 @@ export interface EmailFetchResponse {
   emails: EmailScanSummary[];
   transactions: ParsedBillTransaction[];
   reminders: NoteCandidate[];
+  detected_cards?: DetectedCardSummary[];
   warnings: string[];
+}
+
+export interface ReconcileChannelStat {
+  channel: string;
+  label: string;
+  count: number;
+  expense: number;
+  income: number;
+}
+
+export interface ReconcileCardStat {
+  key: string;
+  account_id: number | null;
+  credit_card_id: number | null;
+  name: string;
+  bank_name: string;
+  card_last4: string;
+  is_credit_card: boolean;
+  count: number;
+  expense: number;
+  income: number;
+  matched_count: number;
+  direct_count: number;
+  channels: string[];
+}
+
+export interface ReconcileMatchedPair {
+  primary_tx: Transaction;
+  duplicate_tx: Transaction | null;
+  card_last4: string;
+  bank_name: string;
+  amount: number;
+}
+
+export interface ReconcileOverviewResponse {
+  summary: {
+    total_effective_count: number;
+    total_expense: number;
+    total_income: number;
+    net_cashflow: number;
+    matched_count: number;
+    deduped_count: number;
+    deduped_expense_saved: number;
+    direct_card_count: number;
+    cash_count: number;
+    tracked_cards_count: number;
+  };
+  channel_breakdown: ReconcileChannelStat[];
+  card_breakdown: ReconcileCardStat[];
+  matched_pairs: ReconcileMatchedPair[];
+  direct_card_transactions: Transaction[];
+  transactions: Transaction[];
+  available_months: string[];
+}
+
+export interface ReconcileRunResult {
+  newly_matched_count: number;
+  total_matched_count: number;
+  total_direct_card_count: number;
+  total_deduped_count: number;
+  backfilled_count: number;
+  auto_created_accounts: Account[];
+  auto_created_cards: CreditCard[];
 }
 
 export interface EmailSyncLog {

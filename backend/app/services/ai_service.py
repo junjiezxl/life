@@ -632,8 +632,154 @@ def _extract_email_merchant(text: str) -> str:
 
 
 def _extract_email_card_hint(text: str) -> str:
-    m = re.search(r"([A-Za-z0-9\u4e00-\u9fa5]{2,20}\s*Card\s*\(\d{4}\)|尾号\s*\d{4})", text, re.IGNORECASE)
-    return m.group(1).strip() if m else ""
+    patterns = [
+        r"([\u4e00-\u9fa5]{2,10}?(?:银行)?\s*(?:信用卡|贷记卡|储蓄卡|借记卡)\s*[（(]?\s*(?:尾号)?\s*\d{4}\s*[）)]?)",
+        r"([A-Za-z0-9\u4e00-\u9fa5]{2,20}\s*Card\s*[（(]\d{4}[）)])",
+        r"([\u4e00-\u9fa5]{2,10}?(?:银行)?\s*尾号\s*[是为:：]?\s*\d{4})",
+        r"(尾号\s*[是为:：]?\s*\d{4})",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def _extract_credit_bill_statement_lines(
+    subject: str,
+    sender: str,
+    body_text: str,
+    base_year: int,
+    default_card_hint: str,
+) -> List[Dict[str, Any]]:
+    """Extract individual card swipe rows from a credit card monthly statement email body."""
+    from .reconciliation_service import parse_payment_method_info
+
+    header_info = parse_payment_method_info(
+        payment_method=f"{subject} {default_card_hint} {sender}".strip(),
+        source_type="email",
+        description=subject,
+    )
+    items: List[Dict[str, Any]] = []
+    skip_words = (
+        "本期应还",
+        "最低还款",
+        "信用额度",
+        "可用额度",
+        "上期账单",
+        "账单日",
+        "最后还款日",
+        "合计",
+        "小计",
+        "总计",
+        "自动还款",
+        "网银还款",
+        "购汇还款",
+        "约定还款",
+        "支付宝还款",
+        "微信还款",
+        "跨行还款",
+        "还款入账",
+        "本期还款",
+    )
+
+    for raw_line in body_text.splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if len(line) < 10 or any(w in line for w in skip_words):
+            continue
+
+        occ = ""
+        rest = ""
+        # Format A: YYYY-MM-DD [HH:MM] ... amount
+        m_full = re.match(r"^(\d{4}[-/]\d{1,2}[-/]\d{1,2})(?:\s+(\d{1,2}:\d{2}))?\s+(.+)$", line)
+        # Format B: MM/DD [MM/DD] ... amount (common in CMB / CGB / CEB statements)
+        m_short = re.match(r"^(\d{1,2}/\d{1,2})(?:\s+\d{1,2}/\d{1,2})?\s+(.+)$", line)
+        if m_full:
+            d_part = m_full.group(1).replace("/", "-")
+            dp = d_part.split("-")
+            t_part = m_full.group(2) or "12:00"
+            occ = f"{int(dp[0]):04d}-{int(dp[1]):02d}-{int(dp[2]):02d} {t_part}"
+            rest = m_full.group(3)
+        elif m_short:
+            mp = m_short.group(1).split("/")
+            mm, dd = int(mp[0]), int(mp[1])
+            if not (1 <= mm <= 12 and 1 <= dd <= 31):
+                continue
+            occ = f"{base_year:04d}-{mm:02d}-{dd:02d} 12:00"
+            rest = m_short.group(2)
+        else:
+            continue
+
+        # Must end with an amount (possibly with currency prefix like RMB / CNY / HKD / USD / ¥ / -)
+        m_amt = re.search(
+            r"(?:(HKD|USD|EUR|GBP|SGD|JPY|CNY|RMB|¥|￥)\s*)?(-?\d[\d,]*\.\d{2})\s*$",
+            rest,
+            re.IGNORECASE,
+        )
+        if not m_amt:
+            continue
+        raw_ccy = (m_amt.group(1) or "CNY").upper()
+        if raw_ccy in ("¥", "￥", "RMB"):
+            raw_ccy = "CNY"
+        try:
+            signed_val = float(m_amt.group(2).replace(",", ""))
+        except ValueError:
+            continue
+        if abs(signed_val) <= 0:
+            continue
+
+        middle = rest[: m_amt.start()].strip()
+        # Extract optional trailing 4-digit card suffix in the row (e.g. "星巴克 3955")
+        row_last4 = header_info["card_last4"]
+        m_row_l4 = re.search(r"(?:\b|尾号)(\d{4})\s*$", middle)
+        if m_row_l4:
+            row_last4 = m_row_l4.group(1)
+            middle = middle[: m_row_l4.start()].strip()
+
+        merchant = re.sub(r"\s+", " ", middle).strip(" -|·")
+        if len(merchant) < 2 or any(w in merchant for w in skip_words):
+            continue
+
+        orig_amt = round(abs(signed_val), 2)
+        cny_amt = round(orig_amt * _FX_TO_CNY.get(raw_ccy, 1.0), 2)
+        tx_type = "income" if signed_val < 0 else "expense"
+
+        bank = header_info["bank_name"]
+        pm_str = f"{bank}信用卡({row_last4})" if (bank and row_last4) else (f"信用卡({row_last4})" if row_last4 else header_info["payment_method"] or "信用卡账单")
+        pm_info = parse_payment_method_info(
+            payment_method=pm_str,
+            source_type="email",
+            description=merchant,
+            merchant=merchant,
+            payment_channel="card_direct",
+        )
+        desc = merchant
+        if pm_info["payment_method"]:
+            desc = f"{merchant} · {pm_info['payment_method']}"
+        if raw_ccy != "CNY":
+            desc = f"{desc} · {raw_ccy} {orig_amt:.2f}"
+
+        items.append(
+            {
+                "type": tx_type,
+                "amount": cny_amt,
+                "category": _detect_tx_category(merchant, tx_type),
+                "description": desc[:200],
+                "merchant": merchant[:100],
+                "occurred_at": occ,
+                "source_type": "email",
+                "payment_channel": "card_direct",
+                "payment_method": pm_info["payment_method"],
+                "bank_name": pm_info["bank_name"],
+                "card_last4": pm_info["card_last4"],
+                "card_kind": pm_info["card_kind"],
+                "account_display_name": pm_info["account_display_name"],
+                "original_currency": raw_ccy,
+                "original_amount": orig_amt,
+            }
+        )
+
+    return items
 
 
 def _extract_email_exact_datetime(text: str) -> Optional[str]:
@@ -648,12 +794,14 @@ def _extract_email_exact_datetime(text: str) -> Optional[str]:
 
 
 def _local_parse_email(subject: str, sender: str, received_at: str, body_text: str) -> Dict[str, Any]:
+    from .reconciliation_service import parse_payment_method_info
+
     now = datetime.now().astimezone()
     combined = f"{subject}\n{body_text}"
     transactions: List[Dict[str, Any]] = []
     reminders: List[Dict[str, Any]] = []
 
-    is_credit_bill = any(k in combined for k in ("信用卡账单", "本期账单", "应还金额", "最后还款日", "最低还款额"))
+    is_credit_bill = any(k in combined for k in ("信用卡账单", "本期账单", "应还金额", "最后还款日", "最低还款额", "电子对账单", "电子账单"))
     is_utility = any(k in combined for k in ("水费", "电费", "燃气费", "物业费", "宽带", "话费账单"))
     is_itinerary = any(k in combined for k in ("行程单", "出票成功", "登机", "列车", "高铁", "航班", "入住"))
     is_receipt = any(
@@ -705,6 +853,20 @@ def _local_parse_email(subject: str, sender: str, received_at: str, body_text: s
                 "linked_tx_type": "expense" if amount else None,
             }
         )
+        # Also extract individual line-item card spends from credit card statements for cross-reconciliation!
+        if is_credit_bill:
+            stmt_year = now.year
+            m_yr = re.search(r"(20\d{2})", received_at or subject or "")
+            if m_yr:
+                stmt_year = int(m_yr.group(1))
+            stmt_txs = _extract_credit_bill_statement_lines(
+                subject=subject,
+                sender=sender,
+                body_text=body_text,
+                base_year=stmt_year,
+                default_card_hint=card_hint,
+            )
+            transactions.extend(stmt_txs)
     elif is_itinerary:
         reminders.append(
             {
@@ -738,6 +900,12 @@ def _local_parse_email(subject: str, sender: str, received_at: str, body_text: s
         is_income = any(k in combined for k in ("入账", "工资", "薪资", "退款到账", "收款", "股息派发"))
         tx_type = "income" if is_income else "expense"
         occ = exact_dt or (received_at or now.strftime("%Y-%m-%d %H:%M"))[:16]
+        pm_info = parse_payment_method_info(
+            payment_method=card_hint or f"{subject} {sender}",
+            source_type="email",
+            description=f"{subject} {body_text[:240]}",
+            merchant=merchant,
+        )
         desc_parts: List[str] = []
         if merchant:
             desc_parts.append(merchant)
@@ -745,9 +913,11 @@ def _local_parse_email(subject: str, sender: str, received_at: str, body_text: s
             desc_parts.append(subject.strip()[:80])
         if card_hint:
             desc_parts.append(card_hint)
+        elif pm_info["payment_method"]:
+            desc_parts.append(pm_info["payment_method"])
         if currency != "CNY" and orig_amount is not None:
             desc_parts.append(f"{currency} {orig_amount:.2f}")
-        elif sender:
+        elif sender and not card_hint:
             desc_parts.append(sender[:36])
         transactions.append(
             {
@@ -755,8 +925,17 @@ def _local_parse_email(subject: str, sender: str, received_at: str, body_text: s
                 "amount": amount,
                 "category": _detect_tx_category(combined, tx_type),
                 "description": " · ".join(p for p in desc_parts if p),
+                "merchant": merchant[:100],
                 "occurred_at": occ,
                 "source_type": "email",
+                "payment_channel": pm_info["payment_channel"],
+                "payment_method": pm_info["payment_method"],
+                "bank_name": pm_info["bank_name"],
+                "card_last4": pm_info["card_last4"],
+                "card_kind": pm_info["card_kind"],
+                "account_display_name": pm_info["account_display_name"],
+                "original_currency": currency,
+                "original_amount": orig_amount if orig_amount is not None else amount,
             }
         )
 
@@ -770,13 +949,18 @@ async def extract_from_email_content(
     body_text: str,
     settings: Dict[str, str],
 ) -> Dict[str, Any]:
+    from .reconciliation_service import parse_payment_method_info
+
     now_str = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
     system_prompt = f"""你是用户的个人邮件助理。请分析以下邮件内容，识别是否包含：
 1. 需要用户处理的提醒事项（如信用卡最后还款日、水电缴费通知、机票高铁行程、会议/工作截止日期、续费提醒等）
-2. 已经真实发生、需要记账的收支流水（如银行卡/众安银行 ZA Card/信用卡单笔刷卡消费通知、消费电子小票、扣款通知、微信/支付宝消费、App Store 订阅扣款、工资/报销/股息入账通知；注意：信用卡月度总账单不要重复当作单笔消费入账，而是生成还款提醒）
+2. 已经真实发生、需要记账的收支流水：
+   - 银行卡/众安银行 ZA Card/信用卡单笔刷卡消费通知、消费电子小票、扣款通知、App Store 订阅扣款、工资/报销/股息入账通知；
+   - 若邮件是「信用卡月度电子账单」且正文里列出了逐笔消费明细，请把每一笔具体刷卡消费明细提取到 transactions 中（便于与支付宝/微信多方核账去重并发现直接刷卡记录），但绝对不要把「本期应还总额」当作单笔消费入账，而是生成一条还款提醒。
+   - 请务必提取卡片信息字段：bank_name（银行名称，如招商银行/广发银行/众安银行）、card_last4（4位卡尾号，如3955/0720）、payment_method（如广发银行信用卡(3955)/ZA Card (0720)）、merchant（商户名）。
 
 外币处理规则：
-- 若消费/入账为外币（如 HKD、USD、EUR、GBP、SGD、JPY），请按近似汇率折算为人民币金额填入 amount（HKD≈0.92，USD≈7.25，EUR≈7.80，GBP≈9.15，SGD≈5.40，JPY≈0.048，保留两位小数），并在 description 中保留商户名称、卡片信息及原币种金额（例如：WECHAT PAY HONG KONG L · ZA Card (0720) · HKD 11.87）。
+- 若消费/入账为外币（如 HKD、USD、EUR、GBP、SGD、JPY），请按近似汇率折算为人民币金额填入 amount（HKD≈0.92，USD≈7.25，EUR≈7.80，GBP≈9.15，SGD≈5.40，JPY≈0.048，保留两位小数），填入 original_currency 和 original_amount，并在 description 中保留商户名称、卡片信息及原币种金额（例如：WECHAT PAY HONG KONG L · ZA Card (0720) · HKD 11.87）。
 - 注意有些邮件金额与“消费金额:”不在同一行，请结合上下文准确提取。
 
 如果只是普通广告、验证码、系统推广垃圾邮件，请返回空数组。当前时间：{now_str}。
@@ -787,7 +971,13 @@ async def extract_from_email_content(
       "type": "expense | income",
       "amount": 100.0,
       "category": "餐饮 | 交通 | 购物 | 住房 | 通讯 | 订阅服务 | 医疗 | 娱乐 | 工资收入 | 理财收益 | 其他",
-      "description": "简短说明（含商户与外币原金额）",
+      "description": "简短说明（含商户、卡尾号与外币原金额）",
+      "merchant": "商户名称",
+      "bank_name": "银行名称或空字符串",
+      "card_last4": "4位卡尾号或空字符串",
+      "payment_method": "支付方式如 广发银行信用卡(3955) 或 ZA Card (0720)",
+      "original_currency": "CNY | HKD | USD | ...",
+      "original_amount": 100.0,
       "occurred_at": "YYYY-MM-DD HH:MM"
     }}
   ],
@@ -804,7 +994,7 @@ async def extract_from_email_content(
   ]
 }}"""
     user_prompt = (
-        f"主题: {subject}\n发件人: {sender}\n时间: {received_at}\n正文:\n{body_text[:2500]}"
+        f"主题: {subject}\n发件人: {sender}\n时间: {received_at}\n正文:\n{body_text[:4000]}"
     )
 
     llm_res, warning = await _call_llm_json(system_prompt, user_prompt, settings, timeout_s=30.0)
@@ -813,6 +1003,21 @@ async def extract_from_email_content(
         rems = llm_res.get("reminders") or []
         for t in txs:
             t["source_type"] = "email"
+            pm_info = parse_payment_method_info(
+                payment_method=str(t.get("payment_method") or f"{t.get('bank_name') or ''} {t.get('card_last4') or ''}".strip()),
+                source_type="email",
+                description=f"{t.get('description') or ''} {subject}",
+                merchant=str(t.get("merchant") or ""),
+            )
+            t["payment_channel"] = pm_info["payment_channel"]
+            t["payment_method"] = t.get("payment_method") or pm_info["payment_method"]
+            t["bank_name"] = t.get("bank_name") or pm_info["bank_name"]
+            t["card_last4"] = t.get("card_last4") or pm_info["card_last4"]
+            t["card_kind"] = pm_info["card_kind"]
+            t["account_display_name"] = pm_info["account_display_name"]
+            t.setdefault("merchant", "")
+            t.setdefault("original_currency", "CNY")
+            t.setdefault("original_amount", t.get("amount"))
         for r in rems:
             r["source_type"] = "email"
             r["source_ref"] = f"邮件: {subject[:60]}"

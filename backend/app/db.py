@@ -131,6 +131,8 @@ def init_db(seed_demo: bool = True) -> None:
                 balance REAL NOT NULL DEFAULT 0,
                 credit_limit REAL DEFAULT 0,
                 currency TEXT NOT NULL DEFAULT 'CNY',
+                bank_name TEXT DEFAULT '',
+                card_last4 TEXT DEFAULT '',
                 updated_at TEXT NOT NULL
             );
 
@@ -161,6 +163,16 @@ def init_db(seed_demo: bool = True) -> None:
                 settlement_id INTEGER REFERENCES settlements(id) ON DELETE SET NULL,
                 source_type TEXT NOT NULL DEFAULT 'manual',
                 external_ref TEXT DEFAULT '',
+                payment_channel TEXT DEFAULT 'manual',
+                payment_method TEXT DEFAULT '',
+                bank_name TEXT DEFAULT '',
+                card_last4 TEXT DEFAULT '',
+                credit_card_id INTEGER REFERENCES credit_cards(id) ON DELETE SET NULL,
+                reconcile_status TEXT DEFAULT 'unmatched',
+                matched_tx_id INTEGER REFERENCES transactions(id) ON DELETE SET NULL,
+                merchant TEXT DEFAULT '',
+                original_currency TEXT DEFAULT 'CNY',
+                original_amount REAL,
                 created_at TEXT NOT NULL
             );
 
@@ -440,10 +452,40 @@ def init_db(seed_demo: bool = True) -> None:
         ensure_env_auth_user(conn)
 
         # Safe column migration for existing databases
+        acc_cols = {r["name"] for r in conn.execute("PRAGMA table_info(accounts)").fetchall()}
+        if "bank_name" not in acc_cols:
+            conn.execute("ALTER TABLE accounts ADD COLUMN bank_name TEXT DEFAULT ''")
+        if "card_last4" not in acc_cols:
+            conn.execute("ALTER TABLE accounts ADD COLUMN card_last4 TEXT DEFAULT ''")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_acc_card_last4 ON accounts(card_last4)")
+
         tx_cols = {r["name"] for r in conn.execute("PRAGMA table_info(transactions)").fetchall()}
         if "external_ref" not in tx_cols:
             conn.execute("ALTER TABLE transactions ADD COLUMN external_ref TEXT DEFAULT ''")
+        if "payment_channel" not in tx_cols:
+            conn.execute("ALTER TABLE transactions ADD COLUMN payment_channel TEXT DEFAULT 'manual'")
+        if "payment_method" not in tx_cols:
+            conn.execute("ALTER TABLE transactions ADD COLUMN payment_method TEXT DEFAULT ''")
+        if "bank_name" not in tx_cols:
+            conn.execute("ALTER TABLE transactions ADD COLUMN bank_name TEXT DEFAULT ''")
+        if "card_last4" not in tx_cols:
+            conn.execute("ALTER TABLE transactions ADD COLUMN card_last4 TEXT DEFAULT ''")
+        if "credit_card_id" not in tx_cols:
+            conn.execute("ALTER TABLE transactions ADD COLUMN credit_card_id INTEGER REFERENCES credit_cards(id) ON DELETE SET NULL")
+        if "reconcile_status" not in tx_cols:
+            conn.execute("ALTER TABLE transactions ADD COLUMN reconcile_status TEXT DEFAULT 'unmatched'")
+        if "matched_tx_id" not in tx_cols:
+            conn.execute("ALTER TABLE transactions ADD COLUMN matched_tx_id INTEGER REFERENCES transactions(id) ON DELETE SET NULL")
+        if "merchant" not in tx_cols:
+            conn.execute("ALTER TABLE transactions ADD COLUMN merchant TEXT DEFAULT ''")
+        if "original_currency" not in tx_cols:
+            conn.execute("ALTER TABLE transactions ADD COLUMN original_currency TEXT DEFAULT 'CNY'")
+        if "original_amount" not in tx_cols:
+            conn.execute("ALTER TABLE transactions ADD COLUMN original_amount REAL")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_external_ref ON transactions(external_ref)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_card_last4 ON transactions(card_last4)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_reconcile_status ON transactions(reconcile_status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tx_payment_channel ON transactions(payment_channel)")
 
         phone_cols = {r["name"] for r in conn.execute("PRAGMA table_info(phone_numbers)").fetchall()}
         if "remind_before_days" not in phone_cols:
