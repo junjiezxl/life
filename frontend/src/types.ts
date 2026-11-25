@@ -493,6 +493,7 @@ export interface EmailScanSummary {
   parsed_tx_count: number;
   parsed_rem_count: number;
   email_account_name?: string;
+  body_preview?: string;
 }
 
 export interface EmailFetchResponse {

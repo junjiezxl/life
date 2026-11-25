@@ -2,6 +2,7 @@ import asyncio
 import email
 import hashlib
 import html
+from html.parser import HTMLParser
 import imaplib
 import re
 from datetime import datetime, timedelta
@@ -32,7 +33,112 @@ def _decode_mime_str(raw: Optional[str]) -> str:
     return "".join(decoded).strip()
 
 
+class _TableAwareHTMLToText(HTMLParser):
+    """Convert HTML email bodies to text while preserving leaf <tr> table rows as single tab-separated lines."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._skip_depth = 0
+        self._out: List[str] = []
+        # Stack of tables -> each table tracks active row stack: {"cells": List[str], "cur_cell": Optional[List[str]], "has_nested_table": bool}
+        self._row_stack: List[Dict[str, Any]] = []
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        t = tag.lower()
+        if t in ("script", "style", "head", "title"):
+            self._skip_depth += 1
+            return
+        if self._skip_depth > 0:
+            return
+        if t == "table":
+            if self._row_stack:
+                self._row_stack[-1]["has_nested_table"] = True
+            return
+        if t == "tr":
+            self._row_stack.append({"cells": [], "cur_cell": None, "has_nested_table": False})
+            return
+        if t in ("td", "th") and self._row_stack:
+            row = self._row_stack[-1]
+            if row["cur_cell"] is not None:
+                txt = re.sub(r"\s+", " ", "".join(row["cur_cell"])).strip()
+                if txt:
+                    row["cells"].append(txt)
+            row["cur_cell"] = []
+            return
+        if t == "br":
+            if self._row_stack and self._row_stack[-1]["cur_cell"] is not None:
+                self._row_stack[-1]["cur_cell"].append(" ")
+            else:
+                self._out.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        t = tag.lower()
+        if t in ("script", "style", "head", "title"):
+            self._skip_depth = max(0, self._skip_depth - 1)
+            return
+        if self._skip_depth > 0:
+            return
+        if t in ("td", "th") and self._row_stack:
+            row = self._row_stack[-1]
+            if row["cur_cell"] is not None:
+                txt = re.sub(r"\s+", " ", "".join(row["cur_cell"])).strip()
+                if txt:
+                    row["cells"].append(txt)
+                row["cur_cell"] = None
+            return
+        if t == "tr" and self._row_stack:
+            row = self._row_stack.pop()
+            if row["cur_cell"] is not None:
+                txt = re.sub(r"\s+", " ", "".join(row["cur_cell"])).strip()
+                if txt:
+                    row["cells"].append(txt)
+            if row["cells"]:
+                if not row["has_nested_table"] and len(row["cells"]) >= 2:
+                    self._out.append("\n" + "\t".join(row["cells"]) + "\n")
+                else:
+                    self._out.append("\n" + "\n".join(row["cells"]) + "\n")
+            return
+        if t in ("p", "div", "li", "h1", "h2", "h3", "h4", "h5", "h6"):
+            if self._row_stack and self._row_stack[-1]["cur_cell"] is not None:
+                self._row_stack[-1]["cur_cell"].append(" ")
+            else:
+                self._out.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth > 0 or not data:
+            return
+        cleaned = data.replace("\xa0", " ").replace("\u3000", " ")
+        if self._row_stack and self._row_stack[-1]["cur_cell"] is not None:
+            self._row_stack[-1]["cur_cell"].append(cleaned)
+        else:
+            self._out.append(cleaned)
+
+    def get_text(self) -> str:
+        raw = "".join(self._out)
+        lines: List[str] = []
+        for ln in raw.splitlines():
+            if "\t" in ln:
+                cells = [re.sub(r"[ \r\f\v]+", " ", c).strip() for c in ln.split("\t")]
+                cells = [c for c in cells if c]
+                if cells:
+                    lines.append("\t".join(cells))
+            else:
+                s = re.sub(r"[ \r\f\v]+", " ", ln).strip()
+                if s:
+                    lines.append(s)
+        return "\n".join(lines).strip()
+
+
 def _html_to_text(raw_html: str) -> str:
+    try:
+        parser = _TableAwareHTMLToText()
+        parser.feed(raw_html)
+        parser.close()
+        parsed = parser.get_text()
+        if parsed:
+            return parsed
+    except Exception:
+        pass
     text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", raw_html)
     text = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>|</li>", "\n", text)
     text = re.sub(r"<[^>]+>", " ", text)
@@ -101,9 +207,17 @@ def _extract_body_and_attachments(msg: Message) -> Tuple[str, List[Tuple[str, by
             else:
                 plain_parts.append(txt)
 
-    body = "\n".join(p.strip() for p in plain_parts if p.strip())
-    if not body and html_parts:
-        body = _html_to_text("\n".join(html_parts))
+    plain_body = "\n".join(p.strip() for p in plain_parts if p.strip())
+    html_body = _html_to_text("\n".join(html_parts)) if html_parts else ""
+    # Chinese bank e-statements often ship a stub text/plain ("请用HTML客户端查看") alongside the full HTML table!
+    if html_body and (
+        not plain_body
+        or "\t" in html_body
+        or len(html_body) > max(200, int(len(plain_body) * 1.3))
+    ):
+        body = html_body
+    else:
+        body = plain_body or html_body
     return body, attachments
 
 
@@ -350,6 +464,7 @@ async def fetch_and_parse_emails(
                 "already_synced": uid in synced_uids,
                 "parsed_tx_count": email_tx_count,
                 "parsed_rem_count": email_rem_count,
+                "body_preview": body[:600],
             }
         )
 

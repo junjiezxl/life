@@ -45,6 +45,7 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
   const [selectedMailboxId, setSelectedMailboxId] = useState<string>('');
 
   const [emails, setEmails] = useState<EmailScanSummary[]>([]);
+  const [expandedEmailUid, setExpandedEmailUid] = useState<string | null>(null);
   const [txCandidates, setTxCandidates] = useState<ParsedBillTransaction[]>([]);
   const [txSelected, setTxSelected] = useState<Record<number, boolean>>({});
   const [remCandidates, setRemCandidates] = useState<NoteCandidate[]>([]);
@@ -398,9 +399,23 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
                     {em.attachments.length > 0 && (
                       <div className="mt-1 text-[11px] text-sky-700">附件：{em.attachments.join(', ')}</div>
                     )}
-                    <div className="mt-1 text-[11px] text-slate-600">
-                      识别：{em.parsed_tx_count} 笔账目 / {em.parsed_rem_count} 条提醒
+                    <div className="mt-1 flex items-center justify-between text-[11px] text-slate-600">
+                      <span>识别：{em.parsed_tx_count} 笔账目 / {em.parsed_rem_count} 条提醒</span>
+                      {em.body_preview && (
+                        <button
+                          type="button"
+                          onClick={() => setExpandedEmailUid(expandedEmailUid === em.uid ? null : em.uid)}
+                          className="text-sky-600 hover:underline cursor-pointer"
+                        >
+                          {expandedEmailUid === em.uid ? '收起正文' : '看解析正文'}
+                        </button>
+                      )}
                     </div>
+                    {expandedEmailUid === em.uid && em.body_preview && (
+                      <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-lg border border-slate-200 bg-white p-2 text-[10px] text-slate-600 font-mono">
+                        {em.body_preview}
+                      </pre>
+                    )}
                   </div>
                 ))
               )}

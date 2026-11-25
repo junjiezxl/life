@@ -1926,6 +1926,101 @@ class TestLifeHubAPI(unittest.TestCase):
         tx_list = self.client.get("/api/transactions").json()
         self.assertAlmostEqual(tx_list["unsettled_summary"]["expense"], expected_total_exp, places=2)
 
+    def test_25_chinese_bank_html_statements_cgb_cmb_ignore_credit_limit(self):
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+        from app.services.email_service import _extract_body_and_attachments
+        from app.services.ai_service import _local_parse_email
+
+        # 1. Realistic CGB (广发) nested HTML table e-statement with 个人消费额度 60,000 + tabular summary + detail rows
+        cgb_html = """
+        <html><body>
+        <table><tr><td>
+          <p>尊敬的先生，您好！以下是您2026年11月的信用卡账单：</p>
+          <p>账单周期:2026/10/21-2026/11/20 账单日:2026/11/20 个人消费额度:60,000.00</p>
+          <table>
+            <tr><td>卡号末四位</td><td>本期账单金额</td><td>最低还款额</td><td>最后还款日</td><td>入账货币</td></tr>
+            <tr><td>3955</td><td>3,373.45</td><td>337.35</td><td>2026/12/10</td><td>人民币</td></tr>
+          </table>
+          <table>
+            <tr><td>交易日期</td><td>入账日期</td><td>交易摘要</td><td>交易币种</td><td>交易金额</td><td>入账金额</td></tr>
+            <tr><td><div>2026/11/12</div></td><td><div>2026/11/13</div></td><td><div>支付宝-瑞幸咖啡</div></td><td>RMB</td><td>28.50</td><td>28.50</td></tr>
+            <tr><td><div>2026/11/15</div></td><td><div>2026/11/16</div></td><td><div>中石化加油站POS</div></td><td>RMB</td><td>320.00</td><td>320.00</td></tr>
+            <tr><td><div>2026/11/18</div></td><td><div>2026/11/18</div></td><td><div>支付宝还款</div></td><td>RMB</td><td>-1,000.00</td><td>-1,000.00</td></tr>
+          </table>
+        </td></tr></table>
+        </body></html>
+        """
+        msg_cgb = MIMEMultipart("alternative")
+        msg_cgb.attach(MIMEText("请使用支持HTML的客户端查看广发信用卡电子账单", "plain", "utf-8"))
+        msg_cgb.attach(MIMEText(cgb_html, "html", "utf-8"))
+        cgb_body, _ = _extract_body_and_attachments(msg_cgb)
+        self.assertIn("\t", cgb_body)
+
+        cgb_parsed = _local_parse_email(
+            "广发信用卡 2026年11月电子账单",
+            "广发银行 <creditcard@cgbchina.com.cn>",
+            "2026-11-21 12:43",
+            cgb_body,
+        )
+        self.assertEqual(len(cgb_parsed["reminders"]), 1)
+        cgb_rem = cgb_parsed["reminders"][0]
+        self.assertAlmostEqual(cgb_rem["linked_amount"], 3373.45, places=2)  # NOT 60000 credit limit!
+        self.assertTrue((cgb_rem["due_at"] or "").startswith("2026-12-10"))  # NOT 2026-10-21 cycle start!
+        self.assertIn("60,000.00", cgb_rem["description"])
+        self.assertEqual(len(cgb_parsed["transactions"]), 2)  # repayment skipped, 2 swipes extracted!
+        self.assertEqual(cgb_parsed["transactions"][0]["card_last4"], "3955")
+        self.assertEqual(cgb_parsed["transactions"][0]["bank_name"], "广发银行")
+        self.assertAlmostEqual(cgb_parsed["transactions"][0]["amount"], 28.50, places=2)
+        self.assertAlmostEqual(cgb_parsed["transactions"][1]["amount"], 320.00, places=2)
+
+        # 2. Realistic CMB (招行) nested HTML e-statement with 信用额度 ¥94,000.00 (MUST NOT become reminder amount!) & MMDD rows
+        cmb_html = """
+        <html><body>
+        <table><tr><td>
+          <p>尊敬的先生，您好！以下是您的个人消费卡账户 11月账单</p>
+          <p>信用额度：¥94,000.00 可用额度：¥91,669.91</p>
+          <p>本期应还金额：¥2,330.09 最后还款日：2026/12/09</p>
+          <table>
+            <tr><td>交易日</td><td>记账日</td><td>交易摘要</td><td>人民币金额</td><td>卡号末四位</td><td>交易地金额</td></tr>
+            <tr><td>1112</td><td>1113</td><td>财付通-美团外卖</td><td>38.50</td><td>9613</td><td>38.50(CN)</td></tr>
+            <tr><td>1115</td><td>1116</td><td>APPLE.COM/BILL</td><td>68.00</td><td>9613</td><td>68.00(CN)</td></tr>
+          </table>
+        </td></tr></table>
+        </body></html>
+        """
+        msg_cmb = MIMEMultipart("alternative")
+        msg_cmb.attach(MIMEText("您的招商银行信用卡电子账单已送达", "plain", "utf-8"))
+        msg_cmb.attach(MIMEText(cmb_html, "html", "utf-8"))
+        cmb_body, _ = _extract_body_and_attachments(msg_cmb)
+
+        cmb_parsed = _local_parse_email(
+            "招商银行信用卡电子账单",
+            "招商银行信用卡 <ccsvc@message.cmbchina.com>",
+            "2026-11-21 12:38",
+            cmb_body,
+        )
+        self.assertEqual(len(cmb_parsed["reminders"]), 1)
+        cmb_rem = cmb_parsed["reminders"][0]
+        self.assertAlmostEqual(cmb_rem["linked_amount"], 2330.09, places=2)  # NOT 94000 credit limit!
+        self.assertTrue((cmb_rem["due_at"] or "").startswith("2026-12-09"))
+        self.assertIn("94,000.00", cmb_rem["description"])
+        self.assertEqual(len(cmb_parsed["transactions"]), 2)
+        self.assertEqual(cmb_parsed["transactions"][0]["card_last4"], "9613")
+        self.assertEqual(cmb_parsed["transactions"][0]["bank_name"], "招商银行")
+        self.assertEqual(cmb_parsed["transactions"][0]["occurred_at"], "2026-11-12 12:00")
+        self.assertAlmostEqual(cmb_parsed["transactions"][0]["amount"], 38.50, places=2)
+
+        # 3. Summary-only CMB email where ONLY 信用额度 ¥94,000.00 exists (no due amount) -> linked_amount MUST be None!
+        cmb_limit_only = _local_parse_email(
+            "招商银行信用卡电子账单",
+            "招商银行信用卡 <ccsvc@message.cmbchina.com>",
+            "2026-11-21 12:38",
+            "尊敬的先生，您好！个人消费卡账户 11月账单，信用额度 ¥94,000.00，本期应还金额请登录App查看。",
+        )
+        self.assertEqual(len(cmb_limit_only["reminders"]), 1)
+        self.assertIsNone(cmb_limit_only["reminders"][0]["linked_amount"])
+
 
 if __name__ == "__main__":
     unittest.main()

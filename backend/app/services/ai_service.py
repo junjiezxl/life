@@ -580,9 +580,20 @@ _FX_TO_CNY: Dict[str, float] = {
 }
 
 
-def _extract_email_amount_and_currency(text: str) -> Tuple[Optional[float], str, Optional[float]]:
+_CREDIT_LIMIT_CONTEXT_RE = re.compile(
+    r"(?:信用额度|个人消费额度|固定额度|临时额度|可用额度|信用总额度|预借现金额度|取现额度|分期额度|授信额度|最高额度|最低还款额?)[：:\s￥¥RMB人民币CNY]*$",
+    re.IGNORECASE,
+)
+
+
+def _extract_email_amount_and_currency(text: str, exclude_credit_limit: bool = False) -> Tuple[Optional[float], str, Optional[float]]:
     """Return (cny_amount, currency_code, original_amount)."""
     currency_patterns = [
+        # High-priority explicit bill/payment keywords FIRST (so 应还金额 beats earlier 信用额度!)
+        (
+            "CNY",
+            r"(?:本期应还金额|本期账单金额|人民币应还总额|应还总额|应还款额|剩余应还|本期应还|消费金额|交易金额|支付金额|扣款金额|支出金额|实付金额)[：:\s\r\n]*(?:人民币|RMB|CNY|¥|￥)?\s*([0-9][0-9,]*(?:\.\d{1,2})?)\s*(?:元)?",
+        ),
         ("HKD", r"(?:HKD|HK\$|港币|港元)\s*([0-9][0-9,]*(?:\.\d{1,2})?)"),
         ("HKD", r"([0-9][0-9,]*(?:\.\d{1,2})?)\s*(?:HKD|港币|港元)"),
         ("USD", r"(?:USD|US\$|美元)\s*([0-9][0-9,]*(?:\.\d{1,2})?)"),
@@ -594,14 +605,17 @@ def _extract_email_amount_and_currency(text: str) -> Tuple[Optional[float], str,
         ("CNY", r"(?:人民币|RMB|CNY|¥|￥)\s*([0-9][0-9,]*(?:\.\d{1,2})?)"),
         (
             "CNY",
-            r"(?:消费金额|交易金额|支付金额|扣款金额|支出金额|实付金额|金额|应还|还款|实付|扣款|支出|消费|入账|合计|总计|费用)[：:\s\r\n]*(?:人民币|RMB|CNY|¥|￥)?\s*([0-9][0-9,]*(?:\.\d{1,2})?)\s*(?:元)?",
+            r"(?:金额|应还|还款|实付|扣款|支出|消费|入账|合计|总计|费用)[：:\s\r\n]*(?:人民币|RMB|CNY|¥|￥)?\s*([0-9][0-9,]*(?:\.\d{1,2})?)\s*(?:元)?",
         ),
         ("CNY", r"([0-9][0-9,]*(?:\.\d{1,2})?)\s*元"),
         ("USD", r"\$\s*([0-9][0-9,]*(?:\.\d{1,2})?)"),
     ]
     for code, pat in currency_patterns:
-        m = re.search(pat, text, re.IGNORECASE)
-        if m:
+        for m in re.finditer(pat, text, re.IGNORECASE):
+            if exclude_credit_limit:
+                prefix_ctx = text[max(0, m.start() - 28) : m.start()]
+                if _CREDIT_LIMIT_CONTEXT_RE.search(prefix_ctx):
+                    continue
             try:
                 orig = float(m.group(1).replace(",", ""))
                 if orig > 0:
@@ -611,6 +625,96 @@ def _extract_email_amount_and_currency(text: str) -> Tuple[Optional[float], str,
             except ValueError:
                 continue
     return None, "CNY", None
+
+
+def _extract_credit_bill_metadata(text: str, now: datetime) -> Dict[str, Any]:
+    """Extract statement bill due amount, due date, credit limit, and card last4 cleanly (ignoring credit limits & billing period start dates)."""
+    bill_amount: Optional[float] = None
+    credit_limit: Optional[float] = None
+    due_at: Optional[str] = None
+    last4 = ""
+
+    # 1. Credit limit (kept separate from bill amount!)
+    m_lim = re.search(
+        r"(?:信用额度|个人消费额度|固定额度|信用总额度)[：:\s\t]*(?:人民币|RMB|CNY|¥|￥)?\s*([0-9][0-9,]*(?:\.\d{1,2})?)",
+        text,
+        re.IGNORECASE,
+    )
+    if m_lim:
+        try:
+            credit_limit = round(float(m_lim.group(1).replace(",", "")), 2)
+        except ValueError:
+            pass
+
+    # 2. Tabular summary rows (e.g. CGB/CMB/CEB/ICBC: "卡号末四位\t本期账单金额\t最低还款额\t最后还款日" followed by value row)
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for i, ln in enumerate(lines[:-1]):
+        if "\t" not in ln:
+            continue
+        hdrs = [c.strip() for c in ln.split("\t")]
+        has_bill_hdr = any(any(k in h for k in ("本期账单金额", "本期应还", "应还款额", "人民币应还", "账单金额")) for h in hdrs)
+        has_due_hdr = any(any(k in h for k in ("最后还款日", "到期还款日", "还款日")) for h in hdrs)
+        if not (has_bill_hdr or has_due_hdr):
+            continue
+        # Look at next 1..3 tab rows for the values
+        for nxt in lines[i + 1 : i + 4]:
+            if "\t" not in nxt:
+                continue
+            vals = [c.strip() for c in nxt.split("\t")]
+            for col_i, h in enumerate(hdrs):
+                if col_i >= len(vals):
+                    continue
+                v = vals[col_i]
+                if bill_amount is None and any(k in h for k in ("本期账单金额", "本期应还", "应还款额", "人民币应还", "账单金额")) and "最低" not in h:
+                    m_v = re.search(r"([0-9][0-9,]*(?:\.\d{1,2})?)", v)
+                    if m_v:
+                        try:
+                            val = round(float(m_v.group(1).replace(",", "")), 2)
+                            if val > 0:
+                                bill_amount = val
+                        except ValueError:
+                            pass
+                if due_at is None and any(k in h for k in ("最后还款日", "到期还款日", "还款日")):
+                    dt_parsed = _parse_chinese_datetime(v, now)
+                    if dt_parsed:
+                        due_at = dt_parsed
+                if not last4 and any(k in h for k in ("卡号末四位", "卡号尾号", "卡号")):
+                    m_l4 = re.search(r"(\d{4})\b", v)
+                    if m_l4:
+                        last4 = m_l4.group(1)
+            if bill_amount is not None or due_at is not None:
+                break
+
+    # 3. Inline explicit due-amount patterns (strictly excluding 信用额度 & 最低还款额)
+    if bill_amount is None:
+        m_bill = re.search(
+            r"(?:本期应还金额|本期应还总额|本期账单金额|人民币应还总额|人民币本期应还|应还总额|应还款额|剩余应还|本期应还)[：:\s\t\r\n]*(?:人民币|RMB|CNY|¥|￥)?\s*([0-9][0-9,]*(?:\.\d{1,2})?)",
+            text,
+            re.IGNORECASE,
+        )
+        if m_bill:
+            try:
+                val = round(float(m_bill.group(1).replace(",", "")), 2)
+                if val > 0:
+                    bill_amount = val
+            except ValueError:
+                pass
+
+    # 4. Inline explicit due-date patterns (ignoring 账单周期 / 账单日!)
+    if due_at is None:
+        m_due = re.search(
+            r"(?:最后还款日|到期还款日|还款截止日|还款日)[：:\s\t\r\n]*(\d{4}[-/年]\d{1,2}[-/月]\d{1,2}[日号]?|\d{1,2}[月/-]\d{1,2}[日号]?)",
+            text,
+        )
+        if m_due:
+            due_at = _parse_chinese_datetime(m_due.group(1), now)
+
+    return {
+        "bill_amount": bill_amount,
+        "credit_limit": credit_limit,
+        "due_at": due_at,
+        "last4": last4,
+    }
 
 
 def _extract_email_amount(text: str) -> Optional[float]:
@@ -633,7 +737,7 @@ def _extract_email_merchant(text: str) -> str:
 
 def _extract_email_card_hint(text: str) -> str:
     patterns = [
-        r"([\u4e00-\u9fa5]{2,10}?(?:银行)?\s*(?:信用卡|贷记卡|储蓄卡|借记卡)\s*[（(]?\s*(?:尾号)?\s*\d{4}\s*[）)]?)",
+        r"([\u4e00-\u9fa5]{2,10}?(?:银行)?\s*(?:信用卡|贷记卡|储蓄卡|借记卡)\s*(?:[（(]\s*(?:尾号)?\s*\d{4}\s*[）)]|尾号\s*[是为:：]?\s*\d{4}))",
         r"([A-Za-z0-9\u4e00-\u9fa5]{2,20}\s*Card\s*[（(]\d{4}[）)])",
         r"([\u4e00-\u9fa5]{2,10}?(?:银行)?\s*尾号\s*[是为:：]?\s*\d{4})",
         r"(尾号\s*[是为:：]?\s*\d{4})",
@@ -645,14 +749,122 @@ def _extract_email_card_hint(text: str) -> str:
     return ""
 
 
+_CCY_SHORT_MAP: Dict[str, str] = {
+    "CN": "CNY",
+    "CNY": "CNY",
+    "RMB": "CNY",
+    "人民币": "CNY",
+    "¥": "CNY",
+    "￥": "CNY",
+    "HK": "HKD",
+    "HKD": "HKD",
+    "港币": "HKD",
+    "港元": "HKD",
+    "US": "USD",
+    "USD": "USD",
+    "美元": "USD",
+    "$": "USD",
+    "EU": "EUR",
+    "EUR": "EUR",
+    "欧元": "EUR",
+    "GB": "GBP",
+    "GBP": "GBP",
+    "英镑": "GBP",
+    "JP": "JPY",
+    "JPY": "JPY",
+    "日元": "JPY",
+    "SG": "SGD",
+    "SGD": "SGD",
+    "AU": "AUD",
+    "AUD": "AUD",
+    "CA": "CAD",
+    "CAD": "CAD",
+}
+
+
+def _parse_statement_date_token(tok: str, base_year: int, ref_month: int, allow_mmdd: bool = False) -> Optional[str]:
+    s = (tok or "").strip()
+    if not s:
+        return None
+    # YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD
+    m_full = re.match(r"^(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})(?:\s+(\d{1,2}:\d{2}))?$", s)
+    if m_full:
+        yy, mm, dd = int(m_full.group(1)), int(m_full.group(2)), int(m_full.group(3))
+        if 1 <= mm <= 12 and 1 <= dd <= 31:
+            tm = m_full.group(4) or "12:00"
+            return f"{yy:04d}-{mm:02d}-{dd:02d} {tm}"
+    # YYYYMMDD (8 digits)
+    m_ymd8 = re.match(r"^(20\d{2})(\d{2})(\d{2})$", s)
+    if m_ymd8:
+        yy, mm, dd = int(m_ymd8.group(1)), int(m_ymd8.group(2)), int(m_ymd8.group(3))
+        if 1 <= mm <= 12 and 1 <= dd <= 31:
+            return f"{yy:04d}-{mm:02d}-{dd:02d} 12:00"
+    # MM/DD or MM-DD
+    m_md = re.match(r"^(\d{1,2})[-/](\d{1,2})$", s)
+    if m_md:
+        mm, dd = int(m_md.group(1)), int(m_md.group(2))
+        if 1 <= mm <= 12 and 1 <= dd <= 31:
+            yr = base_year - 1 if (ref_month <= 2 and mm >= 11) else base_year
+            return f"{yr:04d}-{mm:02d}-{dd:02d} 12:00"
+    # MMDD (4 digits, common in CMB statements like 1112 / 1025)
+    if allow_mmdd and re.match(r"^\d{4}$", s):
+        mm, dd = int(s[:2]), int(s[2:])
+        if 1 <= mm <= 12 and 1 <= dd <= 31 and not (2020 <= int(s) <= 2035):
+            yr = base_year - 1 if (ref_month <= 2 and mm >= 11) else base_year
+            return f"{yr:04d}-{mm:02d}-{dd:02d} 12:00"
+    return None
+
+
+def _extract_amount_from_cell(cell: str) -> Optional[Tuple[float, str, bool]]:
+    """Return (signed_val, currency_code, is_credit_marker) if cell looks like a money amount."""
+    s = (cell or "").strip()
+    if not s:
+        return None
+    # Reject dates or bare 4-digit card numbers (must have decimal .XX)
+    m = re.match(
+        r"^(?:(HKD|USD|EUR|GBP|SGD|JPY|AUD|CAD|CNY|RMB|人民币|港币|港元|美元|¥|￥|\$)\s*)?"
+        r"([+-]?\s*\d[\d,]*\.\d{2})"
+        r"(?:\s*(CR|DR|存入|退货))?"
+        r"(?:\s*[（(]\s*([A-Za-z]{2,3})\s*[）)])?"
+        r"(?:\s*(HKD|USD|EUR|GBP|SGD|JPY|AUD|CAD|CNY|RMB|元))?$",
+        s,
+        re.IGNORECASE,
+    )
+    if not m:
+        return None
+    raw_pre = (m.group(1) or "").strip()
+    raw_num = m.group(2).replace(",", "").replace(" ", "")
+    cr_flag = (m.group(3) or "").upper() in ("CR", "存入", "退货")
+    raw_paren = (m.group(4) or "").strip().upper()
+    raw_post = (m.group(5) or "").strip()
+    try:
+        val = float(raw_num)
+    except ValueError:
+        return None
+    if abs(val) <= 0:
+        return None
+    if cr_flag and val > 0:
+        val = -val
+    ccy_key = raw_paren or raw_pre.upper() or raw_post.upper()
+    if raw_pre in _CCY_SHORT_MAP:
+        ccy = _CCY_SHORT_MAP[raw_pre]
+    elif ccy_key in _CCY_SHORT_MAP:
+        ccy = _CCY_SHORT_MAP[ccy_key]
+    else:
+        ccy = "CNY"
+    return val, ccy, cr_flag
+
+
 def _extract_credit_bill_statement_lines(
     subject: str,
     sender: str,
     body_text: str,
     base_year: int,
     default_card_hint: str,
+    ref_month: int = 12,
+    default_last4: str = "",
 ) -> List[Dict[str, Any]]:
-    """Extract individual card swipe rows from a credit card monthly statement email body."""
+    """Extract individual card swipe rows from CGB / CMB / CEB / ICBC / general credit card e-statements."""
     from .reconciliation_service import parse_payment_method_info
 
     header_info = parse_payment_method_info(
@@ -660,6 +872,36 @@ def _extract_credit_bill_statement_lines(
         source_type="email",
         description=subject,
     )
+    current_bank = header_info["bank_name"]
+    if not current_bank:
+        s_low = f"{subject} {sender}".lower()
+        for cue, bname in (
+            ("cgbchina", "广发银行"),
+            ("广发", "广发银行"),
+            ("cmbchina", "招商银行"),
+            ("招商", "招商银行"),
+            ("cebbank", "光大银行"),
+            ("光大", "光大银行"),
+            ("icbc", "工商银行"),
+            ("工商", "工商银行"),
+            ("ccb", "建设银行"),
+            ("建设", "建设银行"),
+            ("ecitic", "中信银行"),
+            ("中信", "中信银行"),
+            ("spdb", "浦发银行"),
+            ("浦发", "浦发银行"),
+            ("bankcomm", "交通银行"),
+            ("交通", "交通银行"),
+            ("pingan", "平安银行"),
+            ("平安", "平安银行"),
+            ("cib", "兴业银行"),
+            ("兴业", "兴业银行"),
+        ):
+            if cue in s_low:
+                current_bank = bname
+                break
+
+    current_last4 = (default_last4 or "").strip() or header_info["card_last4"]
     items: List[Dict[str, Any]] = []
     skip_words = (
         "本期应还",
@@ -667,11 +909,15 @@ def _extract_credit_bill_statement_lines(
         "信用额度",
         "可用额度",
         "上期账单",
+        "上期余额",
+        "本期账单",
         "账单日",
         "最后还款日",
+        "到期还款日",
         "合计",
         "小计",
         "总计",
+        "汇总",
         "自动还款",
         "网银还款",
         "购汇还款",
@@ -679,73 +925,190 @@ def _extract_credit_bill_statement_lines(
         "支付宝还款",
         "微信还款",
         "跨行还款",
+        "快捷还款",
         "还款入账",
         "本期还款",
+        "自动扣款还款",
+        "他行还款",
+        "手机银行还款",
+        "交易日期",
+        "记账日期",
+        "入账日期",
+        "交易摘要",
+        "人民币金额",
+        "卡号末四位",
+        "交易地金额",
+        "本期积分",
+        "积分余额",
+        "温馨提示",
+        "免息期",
+        "账单分期",
     )
 
-    for raw_line in body_text.splitlines():
-        line = re.sub(r"\s+", " ", raw_line).strip()
-        if len(line) < 10 or any(w in line for w in skip_words):
-            continue
+    raw_lines = [ln.strip() for ln in body_text.splitlines() if ln.strip()]
 
-        occ = ""
-        rest = ""
-        # Format A: YYYY-MM-DD [HH:MM] ... amount
-        m_full = re.match(r"^(\d{4}[-/]\d{1,2}[-/]\d{1,2})(?:\s+(\d{1,2}:\d{2}))?\s+(.+)$", line)
-        # Format B: MM/DD [MM/DD] ... amount (common in CMB / CGB / CEB statements)
-        m_short = re.match(r"^(\d{1,2}/\d{1,2})(?:\s+\d{1,2}/\d{1,2})?\s+(.+)$", line)
-        if m_full:
-            d_part = m_full.group(1).replace("/", "-")
-            dp = d_part.split("-")
-            t_part = m_full.group(2) or "12:00"
-            occ = f"{int(dp[0]):04d}-{int(dp[1]):02d}-{int(dp[2]):02d} {t_part}"
-            rest = m_full.group(3)
-        elif m_short:
-            mp = m_short.group(1).split("/")
-            mm, dd = int(mp[0]), int(mp[1])
-            if not (1 <= mm <= 12 and 1 <= dd <= 31):
+    # Merge wrapped lines if a plain-text bank email split a single row across consecutive lines
+    merged_lines: List[str] = []
+    idx = 0
+    while idx < len(raw_lines):
+        ln = raw_lines[idx]
+        # If line is ONLY a date (no tabs and no amount), try merging with following 1..5 non-date lines
+        if "\t" not in ln and _parse_statement_date_token(ln, base_year, ref_month, allow_mmdd=True):
+            buf = [ln]
+            j = idx + 1
+            seen_amt = False
+            while j < len(raw_lines) and (j - idx) <= 6:
+                nxt = raw_lines[j]
+                if "\t" in nxt:
+                    break
+                if len(buf) >= 2 and _parse_statement_date_token(nxt, base_year, ref_month, allow_mmdd=True):
+                    # Second date right after first date = posting date; after merchant/amount = next row!
+                    if seen_amt or len(buf) > 2:
+                        break
+                buf.append(nxt)
+                if re.search(r"\d+\.\d{2}", nxt):
+                    seen_amt = True
+                j += 1
+            if seen_amt and len(buf) >= 3:
+                merged_lines.append("\t".join(buf))
+                idx = j
                 continue
-            occ = f"{base_year:04d}-{mm:02d}-{dd:02d} 12:00"
-            rest = m_short.group(2)
-        else:
+        merged_lines.append(ln)
+        idx += 1
+
+    for raw_line in merged_lines:
+        flat_line = re.sub(r"\s+", " ", raw_line).strip()
+        if len(flat_line) < 6:
             continue
 
-        # Must end with an amount (possibly with currency prefix like RMB / CNY / HKD / USD / ¥ / -)
-        m_amt = re.search(
-            r"(?:(HKD|USD|EUR|GBP|SGD|JPY|CNY|RMB|¥|￥)\s*)?(-?\d[\d,]*\.\d{2})\s*$",
-            rest,
-            re.IGNORECASE,
+        # Detect card section headers like "卡号：6250****3955" / "尾号3955" / "6225********9613"
+        m_sec_card = re.search(
+            r"(?:卡号|尾号|末四位|主卡|附卡)[^\d]{0,12}(?:\d{4,6}[*xX\s]{2,12})?(\d{4})\b",
+            flat_line,
         )
-        if not m_amt:
-            continue
-        raw_ccy = (m_amt.group(1) or "CNY").upper()
-        if raw_ccy in ("¥", "￥", "RMB"):
-            raw_ccy = "CNY"
-        try:
-            signed_val = float(m_amt.group(2).replace(",", ""))
-        except ValueError:
-            continue
-        if abs(signed_val) <= 0:
+        if not m_sec_card:
+            m_sec_card = re.search(r"\b\d{4,6}[*xX]{3,10}(\d{4})\b", flat_line)
+        if m_sec_card and not re.search(r"\d+\.\d{2}", flat_line):
+            cand_l4 = m_sec_card.group(1)
+            if not (2020 <= int(cand_l4) <= 2035):
+                current_last4 = cand_l4
             continue
 
-        middle = rest[: m_amt.start()].strip()
-        # Extract optional trailing 4-digit card suffix in the row (e.g. "星巴克 3955")
-        row_last4 = header_info["card_last4"]
-        m_row_l4 = re.search(r"(?:\b|尾号)(\d{4})\s*$", middle)
-        if m_row_l4:
-            row_last4 = m_row_l4.group(1)
-            middle = middle[: m_row_l4.start()].strip()
+        if any(w in flat_line for w in skip_words):
+            continue
 
-        merchant = re.sub(r"\s+", " ", middle).strip(" -|·")
+        # Split into structured cells
+        if "\t" in raw_line:
+            cells = [c.strip() for c in raw_line.split("\t") if c.strip()]
+        else:
+            cells = flat_line.split(" ")
+
+        if len(cells) < 3:
+            continue
+
+        # Check if line starts with 1 or 2 date tokens
+        is_tab = "\t" in raw_line
+        d1 = _parse_statement_date_token(cells[0], base_year, ref_month, allow_mmdd=is_tab or (len(cells) >= 4 and bool(_parse_statement_date_token(cells[1], base_year, ref_month, allow_mmdd=True))))
+        if not d1:
+            # Handle combined "YYYY-MM-DD HH:MM" split by spaces
+            if len(cells) >= 4 and re.match(r"^\d{1,2}:\d{2}$", cells[1]):
+                d1 = _parse_statement_date_token(f"{cells[0]} {cells[1]}", base_year, ref_month, allow_mmdd=False)
+                rest_cells = cells[2:] if d1 else []
+            else:
+                continue
+        else:
+            start_i = 1
+            # Skip optional posting date cell (e.g. 交易日 + 记账日)
+            if start_i < len(cells) and _parse_statement_date_token(cells[start_i], base_year, ref_month, allow_mmdd=True):
+                start_i += 1
+            elif start_i < len(cells) and re.match(r"^\d{1,2}:\d{2}$", cells[start_i]):
+                d1 = f"{d1[:10]} {cells[start_i]}"
+                start_i += 1
+            rest_cells = cells[start_i:]
+
+        if not d1 or not rest_cells:
+            continue
+
+        # Scan remaining cells for amounts, currency tags, card last4, and merchant description
+        amounts_found: List[Tuple[float, str, bool]] = []
+        row_last4 = current_last4
+        merchant_parts: List[str] = []
+        pending_ccy = ""
+
+        for cell in rest_cells:
+            c_clean = cell.strip()
+            if not c_clean:
+                continue
+            # Pure currency marker cell (e.g. "RMB", "CNY", "人民币", "HKD")
+            if c_clean.upper() in _CCY_SHORT_MAP or c_clean in _CCY_SHORT_MAP:
+                pending_ccy = _CCY_SHORT_MAP.get(c_clean, _CCY_SHORT_MAP.get(c_clean.upper(), "CNY"))
+                continue
+            # Pure 4-digit card last4 or masked card number like ****3955 / 尾号9613
+            m_l4_cell = re.match(r"^(?:尾号|[*xX]{2,}|\d{4,6}[*xX]{2,})?(\d{4})$", c_clean)
+            if m_l4_cell and not (2020 <= int(m_l4_cell.group(1)) <= 2035):
+                row_last4 = m_l4_cell.group(1)
+                continue
+            # Decimal amount cell
+            amt_parsed = _extract_amount_from_cell(c_clean)
+            if amt_parsed is not None:
+                val, ccy, cr_flag = amt_parsed
+                if ccy == "CNY" and pending_ccy:
+                    ccy = pending_ccy
+                pending_ccy = ""
+                amounts_found.append((val, ccy, cr_flag))
+                continue
+            # Check if cell has trailing amount stuck to merchant e.g. "星巴克 38.50"
+            m_stuck = re.search(r"(?:(HKD|USD|EUR|GBP|SGD|JPY|CNY|RMB|¥|￥)\s*)?(-?\d[\d,]*\.\d{2})\s*(CR)?\s*$", c_clean, re.IGNORECASE)
+            if m_stuck and not amounts_found:
+                sub_amt = _extract_amount_from_cell(m_stuck.group(0).strip())
+                if sub_amt is not None:
+                    prefix = c_clean[: m_stuck.start()].strip()
+                    if prefix:
+                        merchant_parts.append(prefix)
+                    amounts_found.append(sub_amt)
+                    continue
+            merchant_parts.append(c_clean)
+
+        if not amounts_found:
+            continue
+
+        merchant = re.sub(r"\s+", " ", " ".join(merchant_parts)).strip(" -|·")
         if len(merchant) < 2 or any(w in merchant for w in skip_words):
             continue
+        # Skip generic repayment rows like "还款" / "网上还款" / "转入还款"
+        if re.search(r"(?:^|[\s\-·])(?:自动|网银|手机|跨行|他行|支付宝|微信|快捷|约定|购汇|转账)?还款", merchant):
+            continue
 
-        orig_amt = round(abs(signed_val), 2)
-        cny_amt = round(orig_amt * _FX_TO_CNY.get(raw_ccy, 1.0), 2)
-        tx_type = "income" if signed_val < 0 else "expense"
+        # Select CNY billing amount + optional original foreign currency amount
+        cny_candidates = [a for a in amounts_found if a[1] == "CNY"]
+        fx_candidates = [a for a in amounts_found if a[1] != "CNY"]
+        if fx_candidates and cny_candidates:
+            signed_cny = cny_candidates[0][0]
+            orig_amt = round(abs(fx_candidates[0][0]), 2)
+            raw_ccy = fx_candidates[0][1]
+            cny_amt = round(abs(signed_cny), 2)
+            tx_type = "income" if signed_cny < 0 else "expense"
+        elif fx_candidates:
+            signed_val = fx_candidates[0][0]
+            raw_ccy = fx_candidates[0][1]
+            orig_amt = round(abs(signed_val), 2)
+            cny_amt = round(orig_amt * _FX_TO_CNY.get(raw_ccy, 1.0), 2)
+            tx_type = "income" if signed_val < 0 else "expense"
+        else:
+            signed_val = cny_candidates[0][0]
+            raw_ccy = "CNY"
+            orig_amt = round(abs(signed_val), 2)
+            cny_amt = orig_amt
+            tx_type = "income" if signed_val < 0 else "expense"
 
-        bank = header_info["bank_name"]
-        pm_str = f"{bank}信用卡({row_last4})" if (bank and row_last4) else (f"信用卡({row_last4})" if row_last4 else header_info["payment_method"] or "信用卡账单")
+        if cny_amt <= 0:
+            continue
+
+        pm_str = (
+            f"{current_bank}信用卡({row_last4})"
+            if (current_bank and row_last4)
+            else (f"信用卡({row_last4})" if row_last4 else (f"{current_bank}信用卡" if current_bank else "信用卡账单"))
+        )
         pm_info = parse_payment_method_info(
             payment_method=pm_str,
             source_type="email",
@@ -766,14 +1129,14 @@ def _extract_credit_bill_statement_lines(
                 "category": _detect_tx_category(merchant, tx_type),
                 "description": desc[:200],
                 "merchant": merchant[:100],
-                "occurred_at": occ,
+                "occurred_at": d1,
                 "source_type": "email",
                 "payment_channel": "card_direct",
                 "payment_method": pm_info["payment_method"],
-                "bank_name": pm_info["bank_name"],
-                "card_last4": pm_info["card_last4"],
-                "card_kind": pm_info["card_kind"],
-                "account_display_name": pm_info["account_display_name"],
+                "bank_name": pm_info["bank_name"] or current_bank,
+                "card_last4": pm_info["card_last4"] or row_last4,
+                "card_kind": "credit_card",
+                "account_display_name": pm_info["account_display_name"] or pm_str,
                 "original_currency": raw_ccy,
                 "original_amount": orig_amt,
             }
@@ -801,7 +1164,10 @@ def _local_parse_email(subject: str, sender: str, received_at: str, body_text: s
     transactions: List[Dict[str, Any]] = []
     reminders: List[Dict[str, Any]] = []
 
-    is_credit_bill = any(k in combined for k in ("信用卡账单", "本期账单", "应还金额", "最后还款日", "最低还款额", "电子对账单", "电子账单"))
+    is_credit_bill = any(
+        k in combined
+        for k in ("信用卡账单", "信用卡电子账单", "本期账单", "应还金额", "最后还款日", "到期还款日", "最低还款额", "电子对账单", "电子账单", "客户对账单", "Bank Statement")
+    )
     is_utility = any(k in combined for k in ("水费", "电费", "燃气费", "物业费", "宽带", "话费账单"))
     is_itinerary = any(k in combined for k in ("行程单", "出票成功", "登机", "列车", "高铁", "航班", "入住"))
     is_receipt = any(
@@ -832,7 +1198,7 @@ def _local_parse_email(subject: str, sender: str, received_at: str, body_text: s
     )
     is_todo = any(k in combined for k in ("截止", "请于", "提醒", "待办", "确认", "到期", "续费"))
 
-    amount, currency, orig_amount = _extract_email_amount_and_currency(combined)
+    amount, currency, orig_amount = _extract_email_amount_and_currency(combined, exclude_credit_limit=is_credit_bill)
     due_at = _parse_chinese_datetime(combined, now)
     merchant = _extract_email_merchant(combined)
     card_hint = _extract_email_card_hint(combined)
@@ -840,31 +1206,61 @@ def _local_parse_email(subject: str, sender: str, received_at: str, body_text: s
 
     if is_credit_bill or is_utility:
         bill_title = subject.strip()[:60] or "邮件账单缴费提醒"
+        rem_amount = amount
+        rem_due_at = due_at
+        rem_desc = f"来自邮件（{sender}）：{body_text.strip()[:160]}"
+        if is_credit_bill:
+            meta = _extract_credit_bill_metadata(combined, now)
+            # For credit card bills, prefer explicit 本期应还/账单金额 & 最后还款日; NEVER use 信用额度!
+            if meta["bill_amount"] is not None:
+                rem_amount = meta["bill_amount"]
+            elif meta["credit_limit"] is not None and rem_amount is not None and abs(rem_amount - meta["credit_limit"]) < 0.01:
+                rem_amount = None
+            if meta["due_at"] is not None:
+                rem_due_at = meta["due_at"]
+            summary_bits: List[str] = []
+            if rem_amount is not None:
+                summary_bits.append(f"本期应还 ¥{rem_amount:,.2f}")
+            if meta["credit_limit"] is not None:
+                summary_bits.append(f"卡片额度 ¥{meta['credit_limit']:,.2f}")
+            if meta["last4"]:
+                summary_bits.append(f"尾号 {meta['last4']}")
+            if summary_bits:
+                rem_desc = f"{' · '.join(summary_bits)} | 来自邮件（{sender}）"
         reminders.append(
             {
                 "title": bill_title,
-                "description": f"来自邮件（{sender}）：{body_text.strip()[:160]}",
-                "due_at": due_at,
+                "description": rem_desc,
+                "due_at": rem_due_at,
                 "priority": "high",
                 "category": "finance",
                 "source_type": "email",
                 "source_ref": f"邮件: {subject[:60]}",
-                "linked_amount": amount,
-                "linked_tx_type": "expense" if amount else None,
+                "linked_amount": rem_amount,
+                "linked_tx_type": "expense" if rem_amount else None,
             }
         )
         # Also extract individual line-item card spends from credit card statements for cross-reconciliation!
         if is_credit_bill:
             stmt_year = now.year
-            m_yr = re.search(r"(20\d{2})", received_at or subject or "")
-            if m_yr:
-                stmt_year = int(m_yr.group(1))
+            stmt_month = now.month
+            m_ym = re.search(r"(20\d{2})[-/年](\d{1,2})", received_at or subject or "")
+            if m_ym:
+                stmt_year = int(m_ym.group(1))
+                stmt_month = int(m_ym.group(2))
+            else:
+                m_yr = re.search(r"(20\d{2})", received_at or subject or "")
+                if m_yr:
+                    stmt_year = int(m_yr.group(1))
+            effective_hint = card_hint or (f"尾号{meta['last4']}" if meta.get("last4") else "")
             stmt_txs = _extract_credit_bill_statement_lines(
                 subject=subject,
                 sender=sender,
                 body_text=body_text,
                 base_year=stmt_year,
-                default_card_hint=card_hint,
+                default_card_hint=effective_hint,
+                ref_month=stmt_month,
+                default_last4=meta.get("last4") or "",
             )
             transactions.extend(stmt_txs)
     elif is_itinerary:
@@ -957,6 +1353,7 @@ async def extract_from_email_content(
 2. 已经真实发生、需要记账的收支流水：
    - 银行卡/众安银行 ZA Card/信用卡单笔刷卡消费通知、消费电子小票、扣款通知、App Store 订阅扣款、工资/报销/股息入账通知；
    - 若邮件是「信用卡月度电子账单」且正文里列出了逐笔消费明细，请把每一笔具体刷卡消费明细提取到 transactions 中（便于与支付宝/微信多方核账去重并发现直接刷卡记录），但绝对不要把「本期应还总额」当作单笔消费入账，而是生成一条还款提醒。
+   - **特别注意**：信用卡账单还款提醒的 `linked_amount` 必须填写「本期应还金额 / 本期账单金额」，绝对不要填「信用额度 / 个人消费额度 / 固定额度 / 可用额度」（例如 60,000 或 94,000 是额度，不是应还金额！）；`due_at` 必须填写「最后还款日 / 到期还款日」，不要填账单周期开始日。
    - 请务必提取卡片信息字段：bank_name（银行名称，如招商银行/广发银行/众安银行）、card_last4（4位卡尾号，如3955/0720）、payment_method（如广发银行信用卡(3955)/ZA Card (0720)）、merchant（商户名）。
 
 外币处理规则：
@@ -1001,6 +1398,10 @@ async def extract_from_email_content(
     if llm_res and isinstance(llm_res, dict):
         txs = llm_res.get("transactions") or []
         rems = llm_res.get("reminders") or []
+        # For credit card statements, deterministic table parser handles full un-truncated HTML tables!
+        local_check = _local_parse_email(subject, sender, received_at, body_text)
+        if len(local_check.get("transactions") or []) > len(txs):
+            txs = local_check["transactions"]
         for t in txs:
             t["source_type"] = "email"
             pm_info = parse_payment_method_info(
