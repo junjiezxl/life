@@ -876,24 +876,41 @@ export const SettingsView: React.FC<Props> = ({
           </button>
         </div>
 
-        <div className="flex flex-wrap items-center gap-4 rounded-xl border border-slate-200/70 bg-slate-50/70 px-3.5 py-2.5 text-xs text-slate-700">
-          <label className="inline-flex items-center gap-2 font-medium cursor-pointer">
-            <input
-              type="checkbox"
-              checked={settings.email_auto_sync_enabled === '1'}
-              onChange={(e) => updateField('email_auto_sync_enabled', e.target.checked ? '1' : '0')}
-            />
-            <span>开启后台定时自动解析全部已启用邮箱</span>
-          </label>
-          <select
-            value={settings.email_sync_interval_min || '30'}
-            onChange={(e) => updateField('email_sync_interval_min', e.target.value)}
-            className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs"
-          >
-            <option value="15">每 15 分钟</option>
-            <option value="30">每 30 分钟</option>
-            <option value="60">每 60 分钟</option>
-          </select>
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200/70 bg-slate-50/70 px-3.5 py-2.5 text-xs text-slate-700">
+          <div className="flex flex-wrap items-center gap-3">
+            <label className="inline-flex items-center gap-2 font-medium cursor-pointer">
+              <input
+                type="checkbox"
+                checked={settings.email_auto_sync_enabled === '1'}
+                onChange={(e) => updateField('email_auto_sync_enabled', e.target.checked ? '1' : '0')}
+              />
+              <span>开启后台定时增量拉取并保存至本地邮件库</span>
+            </label>
+            <select
+              value={settings.email_sync_interval_min || '30'}
+              onChange={(e) => updateField('email_sync_interval_min', e.target.value)}
+              className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs"
+            >
+              <option value="5">每 5 分钟</option>
+              <option value="15">每 15 分钟</option>
+              <option value="30">每 30 分钟</option>
+              <option value="60">每 60 分钟</option>
+            </select>
+            <select
+              value={settings.email_sync_days || '30'}
+              onChange={(e) => updateField('email_sync_days', e.target.value)}
+              className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs"
+            >
+              <option value="14">回溯 14 天</option>
+              <option value="30">回溯 30 天</option>
+              <option value="90">回溯 90 天</option>
+            </select>
+          </div>
+          {settings.email_last_sync_summary && (
+            <span className="text-[11px] text-slate-500">
+              {settings.email_last_sync_summary}
+            </span>
+          )}
         </div>
 
         {/* Configured mailboxes list */}

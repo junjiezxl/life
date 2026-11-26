@@ -496,6 +496,23 @@ export interface EmailScanSummary {
   body_preview?: string;
 }
 
+export interface EmailCacheStats {
+  total_cached: number;
+  stock_hint_count: number;
+  attachment_count: number;
+  last_sync_at: string;
+  last_sync_summary: string;
+  auto_sync_enabled: boolean;
+  sync_interval_min: number;
+  sync_days: number;
+  per_account?: {
+    account_id: number | null;
+    account_name: string;
+    count: number;
+    latest_received_at: string;
+  }[];
+}
+
 export interface EmailFetchResponse {
   emails: EmailScanSummary[];
   transactions: ParsedBillTransaction[];
@@ -503,6 +520,9 @@ export interface EmailFetchResponse {
   stock_trades?: EmailStockTradeCandidate[];
   detected_cards?: DetectedCardSummary[];
   warnings: string[];
+  from_cache?: boolean;
+  fetched_new?: number;
+  cache_stats?: EmailCacheStats;
 }
 
 export interface ReconcileChannelStat {
@@ -858,6 +878,9 @@ export interface GridEmailFetchResponse {
   trades: EmailStockTradeCandidate[];
   scanned_emails?: GridEmailScannedItem[];
   warnings: string[];
+  from_cache?: boolean;
+  fetched_new?: number;
+  cache_stats?: EmailCacheStats;
 }
 
 export interface GridEmailImportResponse {

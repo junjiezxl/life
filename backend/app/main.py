@@ -33,6 +33,7 @@ from .models import (
     DebtPlanRequest,
     EmailAccountCreate,
     EmailAccountUpdate,
+    EmailCacheSyncRequest,
     EmailFetchRequest,
     EmailImportRequest,
     EmailParseTextRequest,
@@ -113,6 +114,10 @@ from .services.email_service import (
     build_account_imap_settings,
     fetch_and_parse_emails,
     fetch_and_parse_multi_emails,
+    get_email_cache_stats,
+    parse_cached_emails,
+    smart_fetch_and_parse_emails,
+    sync_emails_to_local_cache,
     test_imap_connection,
 )
 from .services.grid_service import (
@@ -273,71 +278,85 @@ def _get_active_email_accounts(
 
 
 async def _email_auto_sync_loop() -> None:
+    await asyncio.sleep(5)
     while True:
         interval_min = 30
         try:
             settings = get_all_settings()
             interval_min = max(5, int(settings.get("email_sync_interval_min") or 30))
+            sync_days = max(1, min(365, int(settings.get("email_sync_days") or 30)))
             if settings.get("email_auto_sync_enabled") == "1":
                 accounts = _get_active_email_accounts(settings)
                 if accounts:
-                    with get_conn() as conn:
-                        existing_refs = _get_existing_external_refs(conn)
-                        synced_uids = _get_synced_email_uids(conn)
-                        existing_stk_refs = _get_existing_stock_external_refs(conn)
-                    res = await fetch_and_parse_multi_emails(
+                    sync_res = await sync_emails_to_local_cache(
                         base_settings=settings,
                         accounts=accounts,
-                        existing_refs=existing_refs,
-                        synced_uids=synced_uids,
-                        days=7,
-                        limit=20,
-                        include_body_ai=True,
-                        skip_already_synced=True,
-                        existing_stock_refs=existing_stk_refs,
+                        days=sync_days,
+                        limit=120,
+                        force_refresh=False,
                     )
-                    if res["emails"] or res["transactions"] or res["reminders"] or res.get("stock_trades"):
-                        tx_fields = (
-                            "type",
-                            "amount",
-                            "category",
-                            "description",
-                            "occurred_at",
-                            "source_type",
-                            "external_ref",
-                            "payment_channel",
-                            "payment_method",
-                            "bank_name",
-                            "card_last4",
-                            "merchant",
-                            "original_currency",
-                            "original_amount",
-                        )
+                    fresh_uids = set(sync_res.get("newly_cached_uids") or [])
+                    if fresh_uids:
                         with get_conn() as conn:
-                            _commit_email_batch(
+                            existing_refs = _get_existing_external_refs(conn)
+                            synced_uids = _get_synced_email_uids(conn)
+                            existing_stk_refs = _get_existing_stock_external_refs(conn)
+                            res = await parse_cached_emails(
                                 conn=conn,
-                                txs=[TransactionCreate(**{k: t[k] for k in tx_fields if k in t}) for t in res["transactions"]],
-                                rems=[ReminderCreate(**{k: r[k] for k in ("title", "description", "due_at", "priority", "category", "source_type", "source_ref", "linked_amount", "linked_tx_type") if k in r}) for r in res["reminders"]],
-                                account_id=None,
-                                skip_duplicates=True,
-                                logs=[
-                                    {
-                                        "message_uid": e["uid"],
-                                        "subject": e["subject"],
-                                        "sender": e["sender"],
-                                        "received_at": e["received_at"],
-                                        "tx_imported": e["parsed_tx_count"],
-                                        "rem_imported": e["parsed_rem_count"],
-                                    }
-                                    for e in res["emails"]
-                                ],
+                                base_settings=settings,
+                                accounts=accounts,
+                                existing_refs=existing_refs,
+                                synced_uids=synced_uids,
+                                days=sync_days,
+                                limit=len(fresh_uids) + 20,
+                                include_body_ai=True,
+                                skip_already_synced=True,
+                                existing_stock_refs=existing_stk_refs,
+                                force_include_uids=fresh_uids,
                             )
-                            if res.get("stock_trades"):
-                                sync_email_stock_trades_to_grids(
-                                    conn,
-                                    res["stock_trades"],
-                                    auto_create_missing=False,
+                        if res["emails"] or res["transactions"] or res["reminders"] or res.get("stock_trades"):
+                            tx_fields = (
+                                "type",
+                                "amount",
+                                "category",
+                                "description",
+                                "occurred_at",
+                                "source_type",
+                                "external_ref",
+                                "payment_channel",
+                                "payment_method",
+                                "bank_name",
+                                "card_last4",
+                                "merchant",
+                                "original_currency",
+                                "original_amount",
+                            )
+                            with get_conn() as conn:
+                                batch_out = _commit_email_batch(
+                                    conn=conn,
+                                    txs=[TransactionCreate(**{k: t[k] for k in tx_fields if k in t}) for t in res["transactions"]],
+                                    rems=[ReminderCreate(**{k: r[k] for k in ("title", "description", "due_at", "priority", "category", "source_type", "source_ref", "linked_amount", "linked_tx_type") if k in r}) for r in res["reminders"]],
+                                    account_id=None,
+                                    skip_duplicates=True,
+                                    logs=[
+                                        {
+                                            "message_uid": e["uid"],
+                                            "subject": e["subject"],
+                                            "sender": e["sender"],
+                                            "received_at": e["received_at"],
+                                            "tx_imported": e["parsed_tx_count"],
+                                            "rem_imported": e["parsed_rem_count"],
+                                        }
+                                        for e in res["emails"]
+                                    ],
                                 )
+                                if res.get("stock_trades"):
+                                    sync_email_stock_trades_to_grids(
+                                        conn,
+                                        res["stock_trades"],
+                                        auto_create_missing=False,
+                                    )
+                            await _push_new_reminders_bark(batch_out.get("reminders", []), prefix="📧 自动同步提醒：")
         except Exception:
             pass
         await asyncio.sleep(interval_min * 60)
@@ -1457,16 +1476,17 @@ async def chat_endpoint(payload: ChatRequest) -> Dict[str, Any]:
                     existing_refs = _get_existing_external_refs(conn)
                     synced_uids = _get_synced_email_uids(conn)
                     existing_stk_refs = _get_existing_stock_external_refs(conn)
-                res = await fetch_and_parse_multi_emails(
+                res = await smart_fetch_and_parse_emails(
                     base_settings=settings,
                     accounts=target_mailboxes,
                     existing_refs=existing_refs,
                     synced_uids=synced_uids,
                     days=email_intent["days"],
-                    limit=30,
+                    limit=50,
                     include_body_ai=True,
                     skip_already_synced=False,
                     existing_stock_refs=existing_stk_refs,
+                    source="auto",
                 )
                 emails = res.get("emails") or []
                 txs = res.get("transactions") or []
@@ -2769,6 +2789,34 @@ def test_email_endpoint() -> Dict[str, Any]:
     return test_imap_connection(get_all_settings())
 
 
+@app.get("/api/emails/cache-stats")
+def email_cache_stats_endpoint() -> Dict[str, Any]:
+    settings = get_all_settings()
+    with get_conn() as conn:
+        return get_email_cache_stats(conn, settings)
+
+
+@app.post("/api/emails/sync")
+async def sync_email_cache_endpoint(payload: Optional[EmailCacheSyncRequest] = None) -> Dict[str, Any]:
+    req = payload or EmailCacheSyncRequest()
+    settings = get_all_settings()
+    accounts = _get_active_email_accounts(settings, account_id=req.account_id)
+    try:
+        res = await sync_emails_to_local_cache(
+            base_settings=settings,
+            accounts=accounts,
+            days=req.days,
+            limit=req.limit,
+            force_refresh=req.force_refresh,
+            zip_password=req.zip_password,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    with get_conn() as conn:
+        stats = get_email_cache_stats(conn, get_all_settings())
+    return {**res, "cache_stats": stats}
+
+
 @app.post("/api/emails/fetch-parse")
 async def fetch_parse_emails_endpoint(payload: EmailFetchRequest) -> Dict[str, Any]:
     settings = get_all_settings()
@@ -2778,7 +2826,7 @@ async def fetch_parse_emails_endpoint(payload: EmailFetchRequest) -> Dict[str, A
         synced_uids = _get_synced_email_uids(conn)
         existing_stk_refs = _get_existing_stock_external_refs(conn)
     try:
-        return await fetch_and_parse_multi_emails(
+        return await smart_fetch_and_parse_emails(
             base_settings=settings,
             accounts=accounts,
             existing_refs=existing_refs,
@@ -2791,6 +2839,8 @@ async def fetch_parse_emails_endpoint(payload: EmailFetchRequest) -> Dict[str, A
             unread_only=payload.unread_only,
             skip_already_synced=False,
             existing_stock_refs=existing_stk_refs,
+            account_id=payload.account_id,
+            source=payload.source,
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -3811,7 +3861,7 @@ async def fetch_grid_email_trades(payload: GridEmailFetchRequest) -> Dict[str, A
         strats = [_row_to_dict(r) for r in conn.execute("SELECT id, name, symbol, market, broker FROM grid_strategies").fetchall()]
 
     try:
-        res = await fetch_and_parse_multi_emails(
+        res = await smart_fetch_and_parse_emails(
             base_settings=settings,
             accounts=accounts,
             existing_refs=existing_refs,
@@ -3824,7 +3874,9 @@ async def fetch_grid_email_trades(payload: GridEmailFetchRequest) -> Dict[str, A
             unread_only=False,
             skip_already_synced=False,
             existing_stock_refs=existing_stk_refs,
+            account_id=payload.account_id,
             stock_only=True,
+            source=payload.source,
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -3848,6 +3900,9 @@ async def fetch_grid_email_trades(payload: GridEmailFetchRequest) -> Dict[str, A
         "trades": trades,
         "scanned_emails": scanned_emails,
         "warnings": res.get("warnings", []),
+        "from_cache": bool(res.get("from_cache")),
+        "fetched_new": res.get("fetched_new", 0),
+        "cache_stats": res.get("cache_stats"),
     }
 
 

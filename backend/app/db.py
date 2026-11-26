@@ -55,6 +55,9 @@ DEFAULT_SETTINGS: Dict[str, str] = {
     "email_bill_zip_password": "",
     "email_auto_sync_enabled": "0",
     "email_sync_interval_min": "30",
+    "email_sync_days": "30",
+    "email_last_sync_at": "",
+    "email_last_sync_summary": "",
     "bark_enabled": "0",
     "bark_server_url": "https://api.day.app",
     "bark_device_key": "",
@@ -201,6 +204,35 @@ def init_db(seed_demo: bool = True) -> None:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS email_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_uid TEXT UNIQUE NOT NULL,
+                email_account_id INTEGER REFERENCES email_accounts(id) ON DELETE SET NULL,
+                email_account_name TEXT DEFAULT '',
+                imap_uid TEXT DEFAULT '',
+                folder TEXT DEFAULT 'INBOX',
+                subject TEXT DEFAULT '',
+                sender TEXT DEFAULT '',
+                received_at TEXT DEFAULT '',
+                body_text TEXT DEFAULT '',
+                alt_body_text TEXT DEFAULT '',
+                attachments_json TEXT DEFAULT '[]',
+                extra_docs_json TEXT DEFAULT '[]',
+                stock_hint INTEGER NOT NULL DEFAULT 0,
+                fetched_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_email_messages_received_at ON email_messages(received_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_email_messages_account ON email_messages(email_account_id, folder, imap_uid);
+
+            CREATE TABLE IF NOT EXISTS email_attachments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email_id INTEGER NOT NULL REFERENCES email_messages(id) ON DELETE CASCADE,
+                filename TEXT NOT NULL,
+                content_bytes BLOB NOT NULL,
+                size_bytes INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_email_attachments_email_id ON email_attachments(email_id);
 
             CREATE TABLE IF NOT EXISTS recurring_bills (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -895,6 +927,8 @@ def reset_all_data(reseed: bool = False) -> None:
             DELETE FROM reminders;
             DELETE FROM settlements;
             DELETE FROM accounts;
+            DELETE FROM email_attachments;
+            DELETE FROM email_messages;
             DELETE FROM email_sync_logs;
             DELETE FROM phone_numbers;
             DELETE FROM debt_operations;

@@ -2537,6 +2537,111 @@ class TestLifeHubAPI(unittest.TestCase):
         self.assertEqual(self.client.delete(f"/api/email-accounts/{mb_id}").status_code, 200)
         update_settings({"ibkr_flex_token": "", "ibkr_flex_query_id": ""})
 
+    def test_30_local_email_cache_and_incremental_sync(self) -> None:
+        """Verify emails are cached locally in SQLite, synced incrementally by IMAP UID, and reused across modules without IMAP."""
+        from unittest.mock import patch
+        from app.services import email_service
+        from app.db import get_conn
+
+        mb = self.client.post(
+            "/api/email-accounts",
+            json={"name": "本地缓存测试邮箱", "imap_host": "imap.qq.com", "imap_port": 993, "username": "cache_test@qq.com", "password": "pwd"},
+        )
+        self.assertEqual(mb.status_code, 200, mb.text)
+        mb_id = mb.json()["id"]
+
+        with get_conn() as conn:
+            conn.execute("DELETE FROM email_attachments")
+            conn.execute("DELETE FROM email_messages")
+
+        all_server_mails = [
+            {
+                "uid": "<cache-tx-001@za.group>",
+                "imap_uid": "501",
+                "folder": "INBOX",
+                "subject": "众安银行消费通知",
+                "sender": "ZA Bank <no-reply@za.group>",
+                "received_at": "2026-11-26 10:00",
+                "body": "你于 2026-11-26 10:00:00 使用 ZA Card (0720) 完成一笔以下消费\n消费金额:\nHKD 50.00\n消费商户: CAFE TEST",
+                "alt_body": "",
+                "attachments": [],
+            },
+            {
+                "uid": "<cache-hsbc-002@hsbc.com.hk>",
+                "imap_uid": "502",
+                "folder": "INBOX",
+                "subject": "全部執行: 買入IAUM",
+                "sender": "HSBC <hsbc@hsbc.com.hk>",
+                "received_at": "2026-11-26 11:00",
+                "body": "• 指示類別: 買入\n• 股票名稱/ 股票編號: ISHARES GOLD TRUST MICRO (IAUM)\n• 已成交數量(股/單位): 2\n• 成交價: USD34.50",
+                "alt_body": "",
+                "attachments": [],
+            },
+        ]
+
+        seen_skip_sets = []
+
+        def _fake_incremental(settings, days=30, limit=100, unread_only=False, keyword="", stock_only=False, skip_imap_uids=None):
+            sk = set(skip_imap_uids or set())
+            seen_skip_sets.append(sk)
+            return [m for m in all_server_mails if (m["folder"], m["imap_uid"]) not in sk]
+
+        with patch.object(email_service, "_fetch_raw_emails_sync", side_effect=_fake_incremental):
+            # 1. Initial sync fetches both emails into SQLite cache
+            s1 = self.client.post("/api/emails/sync", json={"days": 30, "account_id": mb_id})
+            self.assertEqual(s1.status_code, 200, s1.text)
+            self.assertEqual(s1.json()["fetched_new"], 2)
+            self.assertEqual(s1.json()["total_cached"], 2)
+
+            # 2. A new HSBC sell mail arrives; incremental sync skips 501 & 502 and downloads only 503!
+            all_server_mails.append(
+                {
+                    "uid": "<cache-hsbc-003@hsbc.com.hk>",
+                    "imap_uid": "503",
+                    "folder": "INBOX",
+                    "subject": "全部執行: 賣出03152",
+                    "sender": "HSBC <hsbc@hsbc.com.hk>",
+                    "received_at": "2026-11-26 12:00",
+                    "body": "• 指示類別: 賣出\n• 股票名稱/ 股票編號: CSOP HKD MMF (03152)\n• 已成交數量(股/單位): 5\n• 成交價: HKD1086.00",
+                    "alt_body": "",
+                    "attachments": [],
+                }
+            )
+            s2 = self.client.post("/api/emails/sync", json={"days": 30, "account_id": mb_id})
+            self.assertEqual(s2.status_code, 200, s2.text)
+            self.assertEqual(s2.json()["fetched_new"], 1)
+            self.assertEqual(s2.json()["total_cached"], 3)
+            self.assertIn(("INBOX", "501"), seen_skip_sets[1])
+            self.assertIn(("INBOX", "502"), seen_skip_sets[1])
+
+        # 3. Verify cache-stats reflects 3 cached emails (2 with stock_hint)
+        cs = self.client.get("/api/emails/cache-stats")
+        self.assertEqual(cs.status_code, 200)
+        self.assertEqual(cs.json()["total_cached"], 3)
+        self.assertEqual(cs.json()["stock_hint_count"], 2)
+
+        # 4. Both EmailBills and StockGrid parse strictly from local cache with ZERO IMAP calls!
+        with patch.object(email_service, "_fetch_raw_emails_sync", side_effect=AssertionError("Should not hit IMAP on source=cache")):
+            r_bills = self.client.post(
+                "/api/emails/fetch-parse",
+                json={"days": 30, "limit": 50, "account_id": mb_id, "source": "cache", "include_body_ai": True},
+            )
+            self.assertEqual(r_bills.status_code, 200, r_bills.text)
+            self.assertTrue(r_bills.json()["from_cache"])
+            self.assertEqual(len(r_bills.json()["emails"]), 3)
+            self.assertGreaterEqual(len(r_bills.json()["transactions"]), 1)
+
+            r_grids = self.client.post(
+                "/api/grids/fetch-email-trades",
+                json={"days": 30, "limit": 50, "account_id": mb_id, "source": "cache", "include_body_ai": True},
+            )
+            self.assertEqual(r_grids.status_code, 200, r_grids.text)
+            self.assertTrue(r_grids.json()["from_cache"])
+            syms = {t["symbol"] for t in r_grids.json()["trades"]}
+            self.assertEqual(syms, {"IAUM", "03152"})
+
+        self.assertEqual(self.client.delete(f"/api/email-accounts/{mb_id}").status_code, 200)
+
 
 if __name__ == "__main__":
     unittest.main()

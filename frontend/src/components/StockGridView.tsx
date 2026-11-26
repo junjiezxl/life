@@ -21,6 +21,7 @@ import {
 import { api } from '../api';
 import type {
   EmailAccount,
+  EmailCacheStats,
   EmailStockTradeCandidate,
   GridDetailResponse,
   GridEmailScannedItem,
@@ -116,6 +117,7 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
   const [emailImporting, setEmailImporting] = useState(false);
   const [emailScannedCount, setEmailScannedCount] = useState<number | null>(null);
   const [emailScannedList, setEmailScannedList] = useState<GridEmailScannedItem[]>([]);
+  const [emailCacheStats, setEmailCacheStats] = useState<EmailCacheStats | null>(null);
   const [emailWarnings, setEmailWarnings] = useState<string[]>([]);
   const [emailCandidates, setEmailCandidates] = useState<EmailStockTradeCandidate[]>([]);
   const [emailSelected, setEmailSelected] = useState<Record<number, boolean>>({});
@@ -221,8 +223,12 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
   const openEmailModal = async () => {
     setShowEmailModal(true);
     try {
-      const mbs = await api.listEmailAccounts();
+      const [mbs, cs] = await Promise.all([
+        api.listEmailAccounts(),
+        api.getEmailCacheStats().catch(() => null),
+      ]);
       setEmailMailboxes(mbs.filter((m) => m.enabled));
+      if (cs) setEmailCacheStats(cs);
     } catch {
       // ignore
     }
@@ -249,23 +255,26 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
     setEmailSelected(sel);
   };
 
-  const handleScanEmailTrades = async () => {
+  const handleScanEmailTrades = async (source: 'auto' | 'cache' = 'auto') => {
     setEmailScanning(true);
     setEmailWarnings([]);
     try {
       const res = await api.fetchGridEmailTrades({
         days: emailDays,
-        limit: 100,
+        limit: 150,
         keyword: emailKeyword.trim(),
         pdf_password: emailPdfPwd.trim(),
         account_id: emailMailboxId ? Number(emailMailboxId) : undefined,
         include_body_ai: true,
+        source,
       });
       setEmailScannedCount(res.emails_scanned);
       setEmailScannedList(res.scanned_emails || []);
+      if (res.cache_stats) setEmailCacheStats(res.cache_stats);
       setEmailWarnings(res.warnings || []);
       populateEmailTrades(res.trades || [], false);
-      onNotify(`已扫描 ${res.emails_scanned} 封邮件，识别到 ${res.trades.length} 笔股票成交`);
+      const prefix = source === 'cache' ? '从本地邮件库重扫' : `增量拉取并扫描`;
+      onNotify(`${prefix} ${res.emails_scanned} 封邮件，识别到 ${res.trades.length} 笔股票成交`);
     } catch (err) {
       onNotify(err instanceof Error ? err.message : '扫描邮箱股票成交失败');
     } finally {
@@ -1923,7 +1932,21 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
 
             {/* Mailbox scan bar */}
             <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3.5 space-y-2.5">
-              <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+              {emailCacheStats && (
+                <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-600 bg-white/80 rounded-lg border border-slate-200/70 px-2.5 py-1.5">
+                  <span>
+                    本地邮件库已缓存 <strong>{emailCacheStats.total_cached}</strong> 封（含{' '}
+                    <strong>{emailCacheStats.stock_hint_count}</strong> 封券商线索）
+                    {emailCacheStats.auto_sync_enabled ? ` · 定时增量每 ${emailCacheStats.sync_interval_min} 分钟` : ' · 未开定时拉取'}
+                  </span>
+                  {emailCacheStats.last_sync_at && (
+                    <span className="text-slate-400">
+                      上次同步：{emailCacheStats.last_sync_at.slice(0, 16).replace('T', ' ')}
+                    </span>
+                  )}
+                </div>
+              )}
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-6">
                 <select
                   value={emailMailboxId}
                   onChange={(e) => setEmailMailboxId(e.target.value)}
@@ -1964,11 +1987,19 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
                 <button
                   type="button"
                   disabled={emailScanning}
-                  onClick={handleScanEmailTrades}
+                  onClick={() => handleScanEmailTrades('cache')}
+                  className="inline-flex items-center justify-center gap-1 rounded-xl border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50 cursor-pointer"
+                >
+                  本地库秒扫
+                </button>
+                <button
+                  type="button"
+                  disabled={emailScanning}
+                  onClick={() => handleScanEmailTrades('auto')}
                   className="inline-flex items-center justify-center gap-1.5 rounded-xl bg-rose-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-rose-700 disabled:opacity-50 cursor-pointer"
                 >
                   <RefreshCw className={`h-3.5 w-3.5 ${emailScanning ? 'animate-spin' : ''}`} />
-                  {emailScanning ? '扫描中...' : '扫描邮箱交易'}
+                  {emailScanning ? '扫描中...' : '增量扫描'}
                 </button>
               </div>
 

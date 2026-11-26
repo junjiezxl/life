@@ -4,7 +4,9 @@ import hashlib
 import html
 from html.parser import HTMLParser
 import imaplib
+import inspect
 import io
+import json
 import re
 from datetime import datetime, timedelta
 from email.header import decode_header
@@ -12,6 +14,7 @@ from email.message import Message
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from ..db import get_conn, now_iso, update_settings
 from .ai_service import _extract_stock_trades_from_email, extract_from_email_content
 from .bill_parser import parse_bill_file, summarize_detected_cards
 from .proxy_service import create_proxied_socket, resolve_proxy_url
@@ -407,10 +410,12 @@ def _fetch_raw_emails_sync(
     unread_only: bool = False,
     keyword: str = "",
     stock_only: bool = False,
+    skip_imap_uids: Optional[Set[Tuple[str, str]]] = None,
 ) -> List[Dict[str, Any]]:
     client = _connect_imap(settings)
     fetched: List[Dict[str, Any]] = []
     seen_msg_ids: Set[str] = set()
+    skip_pairs = skip_imap_uids or set()
     try:
         folders = _discover_imap_folders(client)
         since_date = (datetime.now() - timedelta(days=days)).strftime("%d-%b-%Y")
@@ -435,7 +440,14 @@ def _fetch_raw_emails_sync(
                 continue
 
             uids = data[0].split()
-            reversed_uids = list(reversed(uids))
+            reversed_uids = [
+                u for u in reversed(uids)
+                if (folder, u.decode("utf-8", errors="ignore")) not in skip_pairs
+            ]
+            if not reversed_uids:
+                if "\\all" in folder.lower() or "all mail" in folder.lower():
+                    break
+                continue
             remaining = max(1, limit - len(fetched))
 
             # For keyword or stock_only scan: batch-fetch lightweight headers in 80-UID chunks first
@@ -610,38 +622,218 @@ def _extract_zip_nested_docs(
     return docs, errs
 
 
-async def fetch_and_parse_emails(
-    settings: Dict[str, str],
-    existing_refs: Set[str],
-    synced_uids: Set[str],
-    days: int = 14,
-    limit: int = 25,
-    keyword: str = "",
+_MAX_CACHED_ATTACHMENT_BYTES = 8 * 1024 * 1024
+
+
+def _is_stock_hint_text(subject: str, sender: str, att_names: List[str], body_snippet: str) -> bool:
+    hay = f"{subject} {sender} {' '.join(att_names)} {body_snippet[:1200]}".lower()
+    return any(
+        h in hay
+        for h in (
+            "hsbc",
+            "汇丰",
+            "滙豐",
+            "investdirect",
+            "股票",
+            "證券",
+            "证券",
+            "股份",
+            "contract note",
+            "trade confirmation",
+            "trade advice",
+            "eadvice",
+            "e-advice",
+            "futu",
+            "ibkr",
+            "成交",
+        )
+    )
+
+
+def _extract_docs_from_attachments(
+    attachments: List[Tuple[str, bytes]],
+    effective_zip_pwd: str,
+    existing_refs: Optional[Set[str]] = None,
+    parse_bills: bool = False,
+) -> Tuple[List[Tuple[str, str]], List[Dict[str, Any]], List[str]]:
+    extra_docs: List[Tuple[str, str]] = []
+    bill_txs: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+    refs = existing_refs if existing_refs is not None else set()
+
+    for fname, raw_bytes in attachments:
+        lower_fn = fname.lower()
+        if lower_fn.endswith(".pdf"):
+            ptxt, perr = _extract_pdf_text(raw_bytes, [effective_zip_pwd])
+            if perr:
+                warnings.append(f"{fname}: {perr}")
+            elif ptxt.strip():
+                extra_docs.append((f"PDF附件: {fname}", ptxt.strip()))
+            continue
+        if lower_fn.endswith((".htm", ".html")):
+            htxt = _html_to_text(_decode_bytes_with_charset(raw_bytes, "utf-8"))
+            if htxt.strip():
+                extra_docs.append((f"HTML附件: {fname}", htxt.strip()))
+            continue
+        if not lower_fn.endswith((".zip", ".csv", ".xlsx")):
+            continue
+        if lower_fn.endswith(".zip"):
+            zdocs, zerrs = _extract_zip_nested_docs(raw_bytes, [effective_zip_pwd])
+            extra_docs.extend((f"ZIP内文件: {dn}", dt) for dn, dt in zdocs)
+            warnings.extend(zerrs)
+        if parse_bills:
+            parsed = parse_bill_file(
+                raw_bytes,
+                fname,
+                zip_password=effective_zip_pwd,
+                existing_refs=refs,
+            )
+            if parsed["errors"]:
+                warnings.extend(parsed["errors"])
+            bill_txs.extend(parsed["transactions"])
+    return extra_docs, bill_txs, warnings
+
+
+def save_raw_emails_to_cache(
+    conn: Any,
+    raw_emails: List[Dict[str, Any]],
+    account_id: Optional[int],
+    account_name: str,
     zip_password: str = "",
-    include_body_ai: bool = True,
-    unread_only: bool = False,
-    skip_already_synced: bool = False,
-    existing_stock_refs: Optional[Set[str]] = None,
-    stock_only: bool = False,
 ) -> Dict[str, Any]:
-    effective_zip_pwd = zip_password or settings.get("email_bill_zip_password") or ""
-    import inspect
-    sync_params = inspect.signature(_fetch_raw_emails_sync).parameters
+    """Persist fetched raw emails + extracted docs + binary attachments into SQLite for shared offline reuse."""
+    ts = now_iso()
+    db_account_id = int(account_id) if (account_id is not None and int(account_id) > 0) else None
+    saved_new = 0
+    newly_cached_uids: List[str] = []
+    existing_uids = {
+        r["message_uid"]
+        for r in conn.execute("SELECT message_uid FROM email_messages").fetchall()
+        if r["message_uid"]
+    }
+
+    for item in raw_emails:
+        uid = str(item.get("uid") or "").strip()
+        if not uid:
+            continue
+        is_new = uid not in existing_uids
+        if is_new:
+            saved_new += 1
+            newly_cached_uids.append(uid)
+            existing_uids.add(uid)
+
+        subject = str(item.get("subject") or "(无主题)")
+        sender = str(item.get("sender") or "")
+        received_at = str(item.get("received_at") or "")
+        body = str(item.get("body") or "")
+        alt_body = str(item.get("alt_body") or "")
+        imap_uid = str(item.get("imap_uid") or "")
+        folder = str(item.get("folder") or "INBOX")
+        attachments: List[Tuple[str, bytes]] = item.get("attachments") or []
+        att_names = [a[0] for a in attachments]
+
+        extra_docs, _, _ = _extract_docs_from_attachments(
+            attachments,
+            effective_zip_pwd=zip_password,
+            parse_bills=False,
+        )
+        stock_hint = 1 if _is_stock_hint_text(subject, sender, att_names, body) else 0
+
+        conn.execute(
+            """INSERT INTO email_messages
+            (message_uid, email_account_id, email_account_name, imap_uid, folder, subject, sender, received_at,
+             body_text, alt_body_text, attachments_json, extra_docs_json, stock_hint, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(message_uid) DO UPDATE SET
+              email_account_id = COALESCE(excluded.email_account_id, email_messages.email_account_id),
+              email_account_name = CASE WHEN excluded.email_account_name != '' THEN excluded.email_account_name ELSE email_messages.email_account_name END,
+              imap_uid = CASE WHEN excluded.imap_uid != '' THEN excluded.imap_uid ELSE email_messages.imap_uid END,
+              folder = CASE WHEN excluded.folder != '' THEN excluded.folder ELSE email_messages.folder END,
+              subject = excluded.subject,
+              sender = excluded.sender,
+              received_at = excluded.received_at,
+              body_text = excluded.body_text,
+              alt_body_text = excluded.alt_body_text,
+              attachments_json = excluded.attachments_json,
+              extra_docs_json = CASE WHEN excluded.extra_docs_json != '[]' THEN excluded.extra_docs_json ELSE email_messages.extra_docs_json END,
+              stock_hint = MAX(email_messages.stock_hint, excluded.stock_hint),
+              fetched_at = excluded.fetched_at""",
+            (
+                uid,
+                db_account_id,
+                account_name,
+                imap_uid,
+                folder,
+                subject,
+                sender,
+                received_at,
+                body,
+                alt_body,
+                json.dumps(att_names, ensure_ascii=False),
+                json.dumps(extra_docs, ensure_ascii=False),
+                stock_hint,
+                ts,
+            ),
+        )
+        row = conn.execute("SELECT id FROM email_messages WHERE message_uid = ?", (uid,)).fetchone()
+        if row and attachments:
+            email_id = int(row["id"])
+            conn.execute("DELETE FROM email_attachments WHERE email_id = ?", (email_id,))
+            for fname, raw_bytes in attachments:
+                if raw_bytes and len(raw_bytes) <= _MAX_CACHED_ATTACHMENT_BYTES:
+                    conn.execute(
+                        "INSERT INTO email_attachments (email_id, filename, content_bytes, size_bytes) VALUES (?, ?, ?, ?)",
+                        (email_id, fname, raw_bytes, len(raw_bytes)),
+                    )
+
+    return {
+        "saved_new": saved_new,
+        "total_processed": len(raw_emails),
+        "newly_cached_uids": newly_cached_uids,
+    }
+
+
+def _call_fetch_raw_emails_compat(
+    settings: Dict[str, str],
+    days: int,
+    limit: int,
+    unread_only: bool,
+    keyword: str,
+    stock_only: bool,
+    skip_imap_uids: Optional[Set[Tuple[str, str]]] = None,
+) -> List[Dict[str, Any]]:
+    target_fn = getattr(_fetch_raw_emails_sync, "side_effect", None)
+    sig_target = target_fn if callable(target_fn) else _fetch_raw_emails_sync
+    sync_params = inspect.signature(sig_target).parameters
+    accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sync_params.values())
     fetch_kwargs: Dict[str, Any] = {
         "days": days,
         "limit": limit,
         "unread_only": unread_only,
     }
-    if keyword and "keyword" in sync_params:
+    if keyword and (accepts_var_kw or "keyword" in sync_params):
         fetch_kwargs["keyword"] = keyword
-    if stock_only and "stock_only" in sync_params:
+    if stock_only and (accepts_var_kw or "stock_only" in sync_params):
         fetch_kwargs["stock_only"] = True
-    raw_emails = await asyncio.to_thread(
-        _fetch_raw_emails_sync,
-        settings,
-        **fetch_kwargs,
-    )
+    if skip_imap_uids and (accepts_var_kw or "skip_imap_uids" in sync_params):
+        fetch_kwargs["skip_imap_uids"] = skip_imap_uids
+    return _fetch_raw_emails_sync(settings, **fetch_kwargs)
 
+
+async def _parse_raw_email_items(
+    raw_emails: List[Dict[str, Any]],
+    settings: Dict[str, str],
+    existing_refs: Set[str],
+    synced_uids: Set[str],
+    keyword: str = "",
+    zip_password: str = "",
+    include_body_ai: bool = True,
+    skip_already_synced: bool = False,
+    existing_stock_refs: Optional[Set[str]] = None,
+    stock_only: bool = False,
+    account_settings_map: Optional[Dict[int, Dict[str, str]]] = None,
+) -> Dict[str, Any]:
+    default_zip_pwd = zip_password or settings.get("email_bill_zip_password") or ""
     kw_lower = keyword.strip().lower()
     email_summaries: List[Dict[str, Any]] = []
     all_txs: List[Dict[str, Any]] = []
@@ -655,53 +847,45 @@ async def fetch_and_parse_emails(
         if skip_already_synced and uid in synced_uids:
             continue
 
+        acct_id = item.get("email_account_id")
+        acct_label = str(item.get("email_account_name") or "").strip()
+        item_settings = (account_settings_map or {}).get(acct_id, settings) if acct_id is not None else settings
+        effective_zip_pwd = zip_password or item_settings.get("email_bill_zip_password") or default_zip_pwd
+
         subject = item["subject"]
         sender = item["sender"]
         body = item["body"]
         alt_body = item.get("alt_body") or ""
-        attachments: List[Tuple[str, bytes]] = item["attachments"]
-        att_names = [a[0] for a in attachments]
+        attachments: List[Tuple[str, bytes]] = item.get("attachments") or []
+        att_names = list(item.get("att_names") or [a[0] for a in attachments])
 
         email_tx_count = 0
         email_rem_count = 0
         email_stock_count = 0
-        extra_docs: List[Tuple[str, str]] = []
 
-        # 1. Parse bill/advice attachments (.zip / .csv / .xlsx / .pdf / .html)
-        for fname, raw_bytes in attachments:
-            lower_fn = fname.lower()
-            if lower_fn.endswith(".pdf"):
-                ptxt, perr = _extract_pdf_text(raw_bytes, [effective_zip_pwd])
-                if perr:
-                    warnings.append(f"{fname}: {perr}")
-                elif ptxt.strip():
-                    extra_docs.append((f"PDF附件: {fname}", ptxt.strip()))
-                continue
-            if lower_fn.endswith((".htm", ".html")):
-                htxt = _html_to_text(_decode_bytes_with_charset(raw_bytes, "utf-8"))
-                if htxt.strip():
-                    extra_docs.append((f"HTML附件: {fname}", htxt.strip()))
-                continue
-            if not lower_fn.endswith((".zip", ".csv", ".xlsx")):
-                continue
-            if lower_fn.endswith(".zip"):
-                zdocs, zerrs = _extract_zip_nested_docs(raw_bytes, [effective_zip_pwd])
-                extra_docs.extend((f"ZIP内文件: {dn}", dt) for dn, dt in zdocs)
-                warnings.extend(zerrs)
-            if not stock_only:
-                parsed = parse_bill_file(
-                    raw_bytes,
-                    fname,
-                    zip_password=effective_zip_pwd,
-                    existing_refs=existing_refs,
-                )
-                if parsed["errors"]:
-                    warnings.extend(parsed["errors"])
-                for tx in parsed["transactions"]:
-                    tx["email_subject"] = subject
-                    tx["email_uid"] = uid
-                    all_txs.append(tx)
-                    email_tx_count += 1
+        # Use raw attachments if present (so password-protected PDF/ZIP/bill CSVs always parse with user's zip_password),
+        # otherwise fall back to pre-extracted docs stored in local SQLite cache.
+        if attachments:
+            extra_docs, bill_txs, att_warnings = _extract_docs_from_attachments(
+                attachments,
+                effective_zip_pwd=effective_zip_pwd,
+                existing_refs=existing_refs,
+                parse_bills=not stock_only,
+            )
+            if not extra_docs and item.get("preextracted_docs"):
+                extra_docs = list(item["preextracted_docs"])
+            for w in att_warnings:
+                warnings.append(f"[{acct_label}] {w}" if acct_label else w)
+            for tx in bill_txs:
+                tx["email_subject"] = subject
+                tx["email_uid"] = uid
+                if acct_id is not None:
+                    tx["email_account_id"] = acct_id
+                    tx["email_account_name"] = acct_label
+                all_txs.append(tx)
+                email_tx_count += 1
+        else:
+            extra_docs = list(item.get("preextracted_docs") or [])
 
         doc_blocks = [f"[{dlabel}]\n{dtext}" for dlabel, dtext in extra_docs]
         combined_body = (body + ("\n\n" + "\n\n".join(doc_blocks) if doc_blocks else "")).strip()
@@ -711,30 +895,7 @@ async def fetch_and_parse_emails(
             if not _keyword_matches(kw_lower, haystack):
                 continue
 
-        hint_haystack = f"{subject} {sender} {' '.join(att_names)} {combined_body[:1200]}".lower()
-        is_stock_hint = any(
-            h in hint_haystack
-            for h in (
-                "hsbc",
-                "汇丰",
-                "滙豐",
-                "investdirect",
-                "股票",
-                "證券",
-                "证券",
-                "股份",
-                "contract note",
-                "trade confirmation",
-                "trade advice",
-                "eadvice",
-                "e-advice",
-                "futu",
-                "ibkr",
-                "成交",
-            )
-        )
-
-        # Helper to append deduplicated stock trades for this email
+        is_stock_hint = _is_stock_hint_text(subject, sender, att_names, combined_body)
         email_seen_stk: Set[Tuple[str, str, float, float, str]] = set()
 
         def _append_stock_candidates(cands: List[Dict[str, Any]]) -> None:
@@ -750,12 +911,13 @@ async def fetch_and_parse_emails(
                 st["already_imported"] = stk_ref in stock_refs
                 st["email_subject"] = subject
                 st["email_uid"] = uid
+                if acct_id is not None:
+                    st["email_account_id"] = acct_id
+                    st["email_account_name"] = acct_label
                 all_stock_trades.append(st)
                 email_stock_count += 1
 
-        # 2. Extract bills/reminders/stock trades
         if stock_only:
-            # Fast deterministic extraction across primary body, alternate body, AND each PDF/HTML attachment independently
             det_trades = _extract_stock_trades_from_email(subject, sender, item["received_at"], body)
             if not det_trades and alt_body:
                 det_trades = _extract_stock_trades_from_email(subject, sender, item["received_at"], alt_body)
@@ -763,7 +925,6 @@ async def fetch_and_parse_emails(
             for dlabel, dtext in extra_docs:
                 _append_stock_candidates(_extract_stock_trades_from_email(f"{subject} {dlabel}", sender, item["received_at"], dtext))
 
-            # Only invoke LLM when email looks broker/stock-related or carries PDF/HTML docs AND deterministic found 0 trades
             if include_body_ai and email_stock_count == 0 and (is_stock_hint or bool(extra_docs)):
                 ai_target = extra_docs[0][1] if (extra_docs and len(body) > 2500) else combined_body
                 if ai_target.strip():
@@ -772,7 +933,7 @@ async def fetch_and_parse_emails(
                         sender=sender,
                         received_at=item["received_at"],
                         body_text=ai_target,
-                        settings=settings,
+                        settings=item_settings,
                     )
                     _append_stock_candidates(body_res.get("stock_trades", []))
         else:
@@ -787,7 +948,7 @@ async def fetch_and_parse_emails(
                     sender=sender,
                     received_at=item["received_at"],
                     body_text=combined_body,
-                    settings=settings,
+                    settings=item_settings,
                 )
                 for tx in body_res.get("transactions", []):
                     fp_raw = f"email|{uid}|{tx.get('occurred_at') or ''}|{tx.get('card_last4') or ''}|{tx.get('amount')}|{tx.get('description')}"
@@ -796,12 +957,18 @@ async def fetch_and_parse_emails(
                     tx["already_imported"] = ext_ref in existing_refs
                     tx["email_subject"] = subject
                     tx["email_uid"] = uid
+                    if acct_id is not None:
+                        tx["email_account_id"] = acct_id
+                        tx["email_account_name"] = acct_label
                     all_txs.append(tx)
                     email_tx_count += 1
 
                 for rem in body_res.get("reminders", []):
                     rem["email_subject"] = subject
                     rem["email_uid"] = uid
+                    if acct_id is not None:
+                        rem["email_account_id"] = acct_id
+                        rem["email_account_name"] = acct_label
                     all_reminders.append(rem)
                     email_rem_count += 1
 
@@ -811,21 +978,23 @@ async def fetch_and_parse_emails(
                 for dlabel, dtext in extra_docs:
                     _append_stock_candidates(_extract_stock_trades_from_email(f"{subject} {dlabel}", sender, item["received_at"], dtext))
 
-        email_summaries.append(
-            {
-                "uid": uid,
-                "subject": subject,
-                "sender": sender,
-                "received_at": item["received_at"],
-                "attachments": att_names,
-                "already_synced": uid in synced_uids,
-                "parsed_tx_count": email_tx_count,
-                "parsed_rem_count": email_rem_count,
-                "parsed_stock_count": email_stock_count,
-                "stock_hint": is_stock_hint,
-                "body_preview": combined_body[:1500],
-            }
-        )
+        summary_row: Dict[str, Any] = {
+            "uid": uid,
+            "subject": subject,
+            "sender": sender,
+            "received_at": item["received_at"],
+            "attachments": att_names,
+            "already_synced": uid in synced_uids,
+            "parsed_tx_count": email_tx_count,
+            "parsed_rem_count": email_rem_count,
+            "parsed_stock_count": email_stock_count,
+            "stock_hint": is_stock_hint,
+            "body_preview": combined_body[:1500],
+        }
+        if acct_id is not None:
+            summary_row["email_account_id"] = acct_id
+            summary_row["email_account_name"] = acct_label
+        email_summaries.append(summary_row)
 
     return {
         "emails": email_summaries,
@@ -834,6 +1003,302 @@ async def fetch_and_parse_emails(
         "stock_trades": all_stock_trades,
         "warnings": list(dict.fromkeys(warnings)),
     }
+
+
+async def fetch_and_parse_emails(
+    settings: Dict[str, str],
+    existing_refs: Set[str],
+    synced_uids: Set[str],
+    days: int = 14,
+    limit: int = 25,
+    keyword: str = "",
+    zip_password: str = "",
+    include_body_ai: bool = True,
+    unread_only: bool = False,
+    skip_already_synced: bool = False,
+    existing_stock_refs: Optional[Set[str]] = None,
+    stock_only: bool = False,
+) -> Dict[str, Any]:
+    raw_emails = await asyncio.to_thread(
+        _call_fetch_raw_emails_compat,
+        settings,
+        days,
+        limit,
+        unread_only,
+        keyword,
+        stock_only,
+    )
+    return await _parse_raw_email_items(
+        raw_emails=raw_emails,
+        settings=settings,
+        existing_refs=existing_refs,
+        synced_uids=synced_uids,
+        keyword=keyword,
+        zip_password=zip_password,
+        include_body_ai=include_body_ai,
+        skip_already_synced=skip_already_synced,
+        existing_stock_refs=existing_stock_refs,
+        stock_only=stock_only,
+    )
+
+
+def get_email_cache_stats(conn: Any, settings: Dict[str, str]) -> Dict[str, Any]:
+    total = int((conn.execute("SELECT COUNT(*) AS c FROM email_messages").fetchone() or {"c": 0})["c"])
+    stock_hints = int((conn.execute("SELECT COUNT(*) AS c FROM email_messages WHERE stock_hint = 1").fetchone() or {"c": 0})["c"])
+    att_cnt = int((conn.execute("SELECT COUNT(*) AS c FROM email_attachments").fetchone() or {"c": 0})["c"])
+    per_acct_rows = conn.execute(
+        """SELECT email_account_id, email_account_name, COUNT(*) AS cnt, MAX(received_at) AS latest_received_at
+        FROM email_messages
+        GROUP BY email_account_id, email_account_name
+        ORDER BY cnt DESC"""
+    ).fetchall()
+    return {
+        "total_cached": total,
+        "stock_hint_count": stock_hints,
+        "attachment_count": att_cnt,
+        "last_sync_at": settings.get("email_last_sync_at") or "",
+        "last_sync_summary": settings.get("email_last_sync_summary") or "",
+        "auto_sync_enabled": settings.get("email_auto_sync_enabled", "0") == "1",
+        "sync_interval_min": int(settings.get("email_sync_interval_min") or 30),
+        "sync_days": int(settings.get("email_sync_days") or 30),
+        "per_account": [
+            {
+                "account_id": r["email_account_id"],
+                "account_name": r["email_account_name"] or "默认邮箱",
+                "count": int(r["cnt"] or 0),
+                "latest_received_at": r["latest_received_at"] or "",
+            }
+            for r in per_acct_rows
+        ],
+    }
+
+
+async def sync_emails_to_local_cache(
+    base_settings: Dict[str, str],
+    accounts: List[Dict[str, Any]],
+    days: int = 30,
+    limit: int = 100,
+    force_refresh: bool = False,
+    zip_password: str = "",
+    unread_only: bool = False,
+    keyword: str = "",
+    stock_only: bool = False,
+) -> Dict[str, Any]:
+    """Incrementally fetch unseen/new emails via IMAP and persist them locally in email_messages."""
+    if not accounts:
+        raise ValueError("尚未配置任何可用的邮箱账号，请先在「系统设置 → 邮箱 & Bark」添加至少一个邮箱。")
+
+    all_warnings: List[str] = []
+    scanned_accounts: List[str] = []
+    newly_cached_uids: List[str] = []
+    returned_uids: List[str] = []
+    total_fetched_new = 0
+    succeeded = 0
+    last_exc: Optional[Exception] = None
+
+    with get_conn() as conn:
+        known_pairs_by_acct: Dict[Optional[int], Set[Tuple[str, str]]] = {}
+        if not force_refresh:
+            for r in conn.execute("SELECT email_account_id, folder, imap_uid FROM email_messages WHERE imap_uid != ''").fetchall():
+                aid = r["email_account_id"]
+                known_pairs_by_acct.setdefault(aid, set()).add((str(r["folder"] or "INBOX"), str(r["imap_uid"])))
+
+    for acct in accounts:
+        acct_label = (acct.get("name") or acct.get("username") or "邮箱").strip()
+        raw_acct_id = acct.get("id")
+        acct_id = int(raw_acct_id) if (raw_acct_id is not None and int(raw_acct_id) > 0) else None
+        acct_settings = build_account_imap_settings(base_settings, acct)
+        effective_pwd = zip_password or acct_settings.get("email_bill_zip_password") or ""
+        skip_pairs = set() if force_refresh else known_pairs_by_acct.get(acct_id, set())
+
+        try:
+            raw_items = await asyncio.to_thread(
+                _call_fetch_raw_emails_compat,
+                acct_settings,
+                days,
+                limit,
+                unread_only,
+                keyword,
+                stock_only,
+                skip_pairs,
+            )
+            succeeded += 1
+            scanned_accounts.append(acct_label)
+            for item in raw_items:
+                if item.get("uid"):
+                    returned_uids.append(str(item["uid"]))
+            if raw_items:
+                with get_conn() as conn:
+                    saved = save_raw_emails_to_cache(
+                        conn,
+                        raw_items,
+                        account_id=acct_id,
+                        account_name=acct_label,
+                        zip_password=effective_pwd,
+                    )
+                total_fetched_new += int(saved["saved_new"])
+                newly_cached_uids.extend(saved["newly_cached_uids"])
+        except Exception as exc:
+            last_exc = exc
+            err_msg = str(exc).strip() or type(exc).__name__
+            all_warnings.append(f"邮箱「{acct_label}」增量同步失败: {err_msg}")
+
+    if succeeded == 0 and last_exc is not None:
+        if len(accounts) == 1:
+            raise last_exc
+        raise RuntimeError("；".join(all_warnings))
+
+    with get_conn() as conn:
+        total_cached = int((conn.execute("SELECT COUNT(*) AS c FROM email_messages").fetchone() or {"c": 0})["c"])
+    sync_ts = now_iso()
+    summary_text = f"同步 {len(scanned_accounts)} 个邮箱：新增缓存 {total_fetched_new} 封（本地共 {total_cached} 封）"
+    update_settings({"email_last_sync_at": sync_ts, "email_last_sync_summary": summary_text})
+
+    return {
+        "fetched_new": total_fetched_new,
+        "total_cached": total_cached,
+        "newly_cached_uids": newly_cached_uids,
+        "returned_uids": returned_uids,
+        "scanned_accounts": scanned_accounts,
+        "warnings": list(dict.fromkeys(all_warnings)),
+        "synced_at": sync_ts,
+        "summary": summary_text,
+    }
+
+
+def _load_cached_raw_items(
+    conn: Any,
+    days: int = 30,
+    limit: int = 200,
+    account_id: Optional[int] = None,
+    account_ids: Optional[List[int]] = None,
+    force_include_uids: Optional[Set[str]] = None,
+) -> List[Dict[str, Any]]:
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    where = ["1=1"]
+    params: List[Any] = []
+    if account_id is not None and account_id > 0:
+        where.append("email_account_id = ?")
+        params.append(account_id)
+    elif account_ids is not None:
+        valid_ids = [int(a) for a in account_ids if a and int(a) > 0]
+        if valid_ids:
+            ph_a = ",".join("?" for _ in valid_ids)
+            where.append(f"email_account_id IN ({ph_a})")
+            params.extend(valid_ids)
+        else:
+            where.append("email_account_id IS NULL")
+
+    include_list = [u for u in (force_include_uids or set()) if u]
+    if include_list:
+        placeholders = ",".join("?" for _ in include_list)
+        where.append(f"(received_at >= ? OR received_at = '' OR message_uid IN ({placeholders}))")
+        params.append(cutoff)
+        params.extend(include_list)
+    else:
+        where.append("(received_at >= ? OR received_at = '')")
+        params.append(cutoff)
+
+    params.append(max(limit, len(include_list), 20))
+    rows = conn.execute(
+        f"SELECT * FROM email_messages WHERE {' AND '.join(where)} ORDER BY received_at DESC, id DESC LIMIT ?",
+        params,
+    ).fetchall()
+    if not rows:
+        return []
+
+    email_ids = [int(r["id"]) for r in rows]
+    att_map: Dict[int, List[Tuple[str, bytes]]] = {}
+    ph = ",".join("?" for _ in email_ids)
+    for ar in conn.execute(
+        f"SELECT email_id, filename, content_bytes FROM email_attachments WHERE email_id IN ({ph}) ORDER BY id ASC",
+        email_ids,
+    ).fetchall():
+        att_map.setdefault(int(ar["email_id"]), []).append((str(ar["filename"]), bytes(ar["content_bytes"])))
+
+    items: List[Dict[str, Any]] = []
+    for r in rows:
+        eid = int(r["id"])
+        try:
+            att_names = json.loads(r["attachments_json"] or "[]")
+        except Exception:
+            att_names = []
+        try:
+            extra_docs = [tuple(x) for x in json.loads(r["extra_docs_json"] or "[]") if isinstance(x, (list, tuple)) and len(x) >= 2]
+        except Exception:
+            extra_docs = []
+        items.append(
+            {
+                "uid": str(r["message_uid"]),
+                "imap_uid": str(r["imap_uid"] or ""),
+                "folder": str(r["folder"] or "INBOX"),
+                "email_account_id": r["email_account_id"],
+                "email_account_name": str(r["email_account_name"] or ""),
+                "subject": str(r["subject"] or "(无主题)"),
+                "sender": str(r["sender"] or ""),
+                "received_at": str(r["received_at"] or ""),
+                "body": str(r["body_text"] or ""),
+                "alt_body": str(r["alt_body_text"] or ""),
+                "attachments": att_map.get(eid, []),
+                "att_names": att_names,
+                "preextracted_docs": extra_docs,
+            }
+        )
+    return items
+
+
+async def parse_cached_emails(
+    conn: Any,
+    base_settings: Dict[str, str],
+    accounts: List[Dict[str, Any]],
+    existing_refs: Set[str],
+    synced_uids: Set[str],
+    days: int = 30,
+    limit: int = 200,
+    keyword: str = "",
+    zip_password: str = "",
+    include_body_ai: bool = True,
+    skip_already_synced: bool = False,
+    existing_stock_refs: Optional[Set[str]] = None,
+    account_id: Optional[int] = None,
+    stock_only: bool = False,
+    force_include_uids: Optional[Set[str]] = None,
+) -> Dict[str, Any]:
+    acct_ids = [int(a["id"]) for a in accounts if a.get("id") and int(a["id"]) > 0]
+    raw_items = _load_cached_raw_items(
+        conn,
+        days=days,
+        limit=limit,
+        account_id=account_id,
+        account_ids=acct_ids,
+        force_include_uids=force_include_uids,
+    )
+    acct_settings_map: Dict[int, Dict[str, str]] = {}
+    for a in accounts:
+        if a.get("id") is not None:
+            acct_settings_map[int(a["id"])] = build_account_imap_settings(base_settings, a)
+
+    parsed = await _parse_raw_email_items(
+        raw_emails=raw_items,
+        settings=base_settings,
+        existing_refs=existing_refs,
+        synced_uids=synced_uids,
+        keyword=keyword,
+        zip_password=zip_password,
+        include_body_ai=include_body_ai,
+        skip_already_synced=skip_already_synced,
+        existing_stock_refs=existing_stock_refs,
+        stock_only=stock_only,
+        account_settings_map=acct_settings_map,
+    )
+    parsed["detected_cards"] = summarize_detected_cards(parsed.get("transactions", []))
+    parsed["scanned_accounts"] = [
+        (a.get("name") or a.get("username") or "邮箱").strip()
+        for a in accounts
+        if account_id is None or a.get("id") == account_id
+    ]
+    parsed["from_cache"] = True
+    return parsed
 
 
 def build_account_imap_settings(base_settings: Dict[str, str], account: Dict[str, Any]) -> Dict[str, str]:
@@ -934,4 +1399,110 @@ async def fetch_and_parse_multi_emails(
         "detected_cards": summarize_detected_cards(all_txs),
         "warnings": list(dict.fromkeys(all_warnings)),
         "scanned_accounts": scanned_accounts,
+        "from_cache": False,
     }
+
+
+async def smart_fetch_and_parse_emails(
+    base_settings: Dict[str, str],
+    accounts: List[Dict[str, Any]],
+    existing_refs: Set[str],
+    synced_uids: Set[str],
+    days: int = 30,
+    limit: int = 100,
+    keyword: str = "",
+    zip_password: str = "",
+    include_body_ai: bool = True,
+    unread_only: bool = False,
+    skip_already_synced: bool = False,
+    existing_stock_refs: Optional[Set[str]] = None,
+    account_id: Optional[int] = None,
+    stock_only: bool = False,
+    source: str = "auto",
+) -> Dict[str, Any]:
+    """Unified email reader:
+    - source='cache': parse 100% from local SQLite email_messages archive in milliseconds (0 IMAP calls).
+    - source='imap': live IMAP fetch (and persist fetched messages into local cache too).
+    - source='auto' (default): incremental IMAP sync of unseen UIDs only -> instant local cache parse.
+    """
+    if source == "cache":
+        with get_conn() as conn:
+            res = await parse_cached_emails(
+                conn=conn,
+                base_settings=base_settings,
+                accounts=accounts,
+                existing_refs=existing_refs,
+                synced_uids=synced_uids,
+                days=days,
+                limit=max(limit, 200),
+                keyword=keyword,
+                zip_password=zip_password,
+                include_body_ai=include_body_ai,
+                skip_already_synced=skip_already_synced,
+                existing_stock_refs=existing_stock_refs,
+                account_id=account_id,
+                stock_only=stock_only,
+            )
+            res["cache_stats"] = get_email_cache_stats(conn, get_all_settings_from_conn(conn, base_settings))
+            return res
+
+    if source == "imap":
+        res = await fetch_and_parse_multi_emails(
+            base_settings=base_settings,
+            accounts=accounts,
+            existing_refs=existing_refs,
+            synced_uids=synced_uids,
+            days=days,
+            limit=limit,
+            keyword=keyword,
+            zip_password=zip_password,
+            include_body_ai=include_body_ai,
+            unread_only=unread_only,
+            skip_already_synced=skip_already_synced,
+            existing_stock_refs=existing_stock_refs,
+            stock_only=stock_only,
+        )
+        return res
+
+    # source == "auto": incremental sync of unseen UIDs into SQLite cache, then parse from cache
+    sync_res = await sync_emails_to_local_cache(
+        base_settings=base_settings,
+        accounts=accounts,
+        days=days,
+        limit=max(limit, 100),
+        force_refresh=False,
+        zip_password=zip_password,
+        unread_only=unread_only,
+        keyword=keyword,
+        stock_only=stock_only,
+    )
+    fresh_uids = set(sync_res.get("returned_uids") or []) | set(sync_res.get("newly_cached_uids") or [])
+    with get_conn() as conn:
+        res = await parse_cached_emails(
+            conn=conn,
+            base_settings=base_settings,
+            accounts=accounts,
+            existing_refs=existing_refs,
+            synced_uids=synced_uids,
+            days=days,
+            limit=max(limit, 200),
+            keyword=keyword,
+            zip_password=zip_password,
+            include_body_ai=include_body_ai,
+            skip_already_synced=skip_already_synced,
+            existing_stock_refs=existing_stock_refs,
+            account_id=account_id,
+            stock_only=stock_only,
+            force_include_uids=fresh_uids,
+        )
+        res["warnings"] = list(dict.fromkeys((sync_res.get("warnings") or []) + (res.get("warnings") or [])))
+        res["fetched_new"] = sync_res.get("fetched_new", 0)
+        res["cache_stats"] = get_email_cache_stats(conn, get_all_settings_from_conn(conn, base_settings))
+        return res
+
+
+def get_all_settings_from_conn(conn: Any, fallback: Dict[str, str]) -> Dict[str, str]:
+    merged = dict(fallback)
+    for r in conn.execute("SELECT key, value FROM settings").fetchall():
+        merged[r["key"]] = r["value"]
+    return merged

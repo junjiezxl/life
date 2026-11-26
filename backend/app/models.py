@@ -151,12 +151,21 @@ class BillReconcileRequest(BaseModel):
 
 class EmailFetchRequest(BaseModel):
     days: int = Field(14, ge=1, le=365)
-    limit: int = Field(25, ge=1, le=100)
+    limit: int = Field(25, ge=1, le=200)
     keyword: str = ""
     zip_password: str = ""
     include_body_ai: bool = True
     unread_only: bool = False
     account_id: Optional[int] = None
+    source: Literal["auto", "cache", "imap"] = "auto"
+
+
+class EmailCacheSyncRequest(BaseModel):
+    days: int = Field(30, ge=1, le=365)
+    limit: int = Field(100, ge=1, le=300)
+    account_id: Optional[int] = None
+    force_refresh: bool = False
+    zip_password: str = ""
 
 
 class EmailAccountCreate(BaseModel):
@@ -248,6 +257,7 @@ class SettingsUpdateRequest(BaseModel):
     email_bill_zip_password: Optional[str] = None
     email_auto_sync_enabled: Optional[str] = None
     email_sync_interval_min: Optional[str] = None
+    email_sync_days: Optional[str] = None
     bark_enabled: Optional[str] = None
     bark_server_url: Optional[str] = None
     bark_device_key: Optional[str] = None
@@ -533,11 +543,12 @@ class GridIbkrSyncRequest(BaseModel):
 
 class GridEmailFetchRequest(BaseModel):
     days: int = Field(30, ge=1, le=365)
-    limit: int = Field(50, ge=1, le=150)
+    limit: int = Field(50, ge=1, le=250)
     keyword: str = ""
     pdf_password: str = ""
     account_id: Optional[int] = None
     include_body_ai: bool = True
+    source: Literal["auto", "cache", "imap"] = "auto"
 
 
 class GridEmailImportRequest(BaseModel):

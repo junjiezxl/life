@@ -16,6 +16,7 @@ import type {
   Account,
   DetectedCardSummary,
   EmailAccount,
+  EmailCacheStats,
   EmailScanSummary,
   EmailStockTradeCandidate,
   EmailSyncLog,
@@ -44,6 +45,8 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
   const [detectedCards, setDetectedCards] = useState<DetectedCardSummary[]>([]);
   const [mailboxes, setMailboxes] = useState<EmailAccount[]>([]);
   const [selectedMailboxId, setSelectedMailboxId] = useState<string>('');
+  const [cacheStats, setCacheStats] = useState<EmailCacheStats | null>(null);
+  const [syncingCache, setSyncingCache] = useState(false);
 
   const [emails, setEmails] = useState<EmailScanSummary[]>([]);
   const [expandedEmailUid, setExpandedEmailUid] = useState<string | null>(null);
@@ -66,14 +69,16 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
 
   const loadMeta = async () => {
     try {
-      const [accRes, logRes, mbRes] = await Promise.all([
+      const [accRes, logRes, mbRes, csRes] = await Promise.all([
         api.listAccounts(),
         api.listEmailLogs(),
         api.listEmailAccounts().catch(() => [] as EmailAccount[]),
+        api.getEmailCacheStats().catch(() => null),
       ]);
       setAccounts(accRes.accounts);
       setMailboxes(mbRes.filter((m) => m.enabled));
       setLogs(logRes);
+      if (csRes) setCacheStats(csRes);
     } catch {
       // ignore
     }
@@ -125,31 +130,66 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
     setRemSelected(rSel);
   };
 
-  const handleScanInbox = async () => {
+  const handleScanInbox = async (source: 'auto' | 'cache' = 'auto') => {
     setScanning(true);
     setWarnings([]);
     try {
       const res = await api.fetchParseEmails({
         days,
-        limit: 30,
+        limit: 80,
         keyword,
         zip_password: zipPassword,
         include_body_ai: includeBodyAi,
         unread_only: unreadOnly,
         account_id: selectedMailboxId ? Number(selectedMailboxId) : undefined,
+        source,
       });
       setEmails(res.emails || []);
       setWarnings(res.warnings || []);
       setDetectedCards(res.detected_cards || []);
       setStockCandidates(res.stock_trades || []);
+      if (res.cache_stats) setCacheStats(res.cache_stats);
       populateCandidates(res.transactions || [], res.reminders || [], false);
+      const modeTag = res.from_cache && source === 'cache' ? '（从本地缓存秒读）' : '';
       onNotify(
-        `已扫描 ${res.emails.length} 封邮件，识别出 ${res.transactions.length} 笔消费账目、${res.stock_trades?.length || 0} 笔股票交易与 ${res.reminders.length} 条提醒`,
+        `已解析 ${res.emails.length} 封邮件${modeTag}，识别出 ${res.transactions.length} 笔消费账目、${res.stock_trades?.length || 0} 笔股票交易与 ${res.reminders.length} 条提醒`,
       );
     } catch (err) {
       onNotify(err instanceof Error ? err.message : '扫描邮箱失败');
     } finally {
       setScanning(false);
+    }
+  };
+
+  const handleSyncCacheOnly = async () => {
+    setSyncingCache(true);
+    try {
+      const res = await api.syncEmailCache({
+        days: Math.max(days, 30),
+        limit: 120,
+        account_id: selectedMailboxId ? Number(selectedMailboxId) : undefined,
+        zip_password: zipPassword,
+      });
+      setCacheStats(res.cache_stats);
+      onNotify(res.summary || `增量同步完成：新增 ${res.fetched_new} 封，本地共 ${res.total_cached} 封`);
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : '增量同步失败');
+    } finally {
+      setSyncingCache(false);
+    }
+  };
+
+  const handleToggleAutoSync = async (enabled: boolean, intervalMin?: number) => {
+    try {
+      await api.updateSettings({
+        email_auto_sync_enabled: enabled ? '1' : '0',
+        ...(intervalMin ? { email_sync_interval_min: String(intervalMin) } : {}),
+      });
+      const cs = await api.getEmailCacheStats();
+      setCacheStats(cs);
+      onNotify(enabled ? `已开启后台定时增量拉取（每 ${intervalMin || cs.sync_interval_min} 分钟）` : '已关闭后台定时增量拉取');
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : '保存定时同步设置失败');
     }
   };
 
@@ -298,7 +338,49 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
             </div>
           </div>
 
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-4">
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-sky-100 bg-sky-50/60 px-3.5 py-2 text-xs text-slate-700">
+            <div className="flex flex-wrap items-center gap-3">
+              <span className="font-medium text-sky-900">
+                本地邮件库：{cacheStats ? `${cacheStats.total_cached} 封（含附件 ${cacheStats.attachment_count} 份）` : '加载中...'}
+              </span>
+              {cacheStats?.last_sync_at && (
+                <span className="text-[11px] text-slate-500">
+                  上次同步：{cacheStats.last_sync_at.slice(0, 16).replace('T', ' ')}
+                </span>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center gap-2.5">
+              <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={Boolean(cacheStats?.auto_sync_enabled)}
+                  onChange={(e) => handleToggleAutoSync(e.target.checked)}
+                />
+                <span>定时增量拉取</span>
+              </label>
+              <select
+                value={String(cacheStats?.sync_interval_min || 30)}
+                onChange={(e) => handleToggleAutoSync(Boolean(cacheStats?.auto_sync_enabled ?? true), Number(e.target.value))}
+                className="rounded-lg border border-slate-200 bg-white px-2 py-0.5 text-[11px]"
+              >
+                <option value="5">每 5 分钟</option>
+                <option value="15">每 15 分钟</option>
+                <option value="30">每 30 分钟</option>
+                <option value="60">每 60 分钟</option>
+              </select>
+              <button
+                type="button"
+                disabled={syncingCache}
+                onClick={handleSyncCacheOnly}
+                className="inline-flex items-center gap-1 rounded-lg border border-sky-200 bg-white px-2.5 py-1 text-[11px] font-medium text-sky-700 hover:bg-sky-100/60 disabled:opacity-50 cursor-pointer"
+              >
+                <RefreshCw className={`h-3 w-3 ${syncingCache ? 'animate-spin' : ''}`} />
+                {syncingCache ? '同步中...' : '仅增量拉取新邮件'}
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-5">
             <select
               value={days}
               onChange={(e) => setDays(Number(e.target.value))}
@@ -324,12 +406,22 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
               className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs"
             />
             <button
-              onClick={handleScanInbox}
+              type="button"
+              onClick={() => handleScanInbox('cache')}
               disabled={scanning}
-              className="inline-flex items-center justify-center gap-1.5 rounded-xl bg-sky-600 px-4 py-2 text-xs font-medium text-white hover:bg-sky-700 disabled:opacity-50 cursor-pointer"
+              className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
+            >
+              <Sparkles className="h-3.5 w-3.5 text-indigo-600" />
+              本地库秒析
+            </button>
+            <button
+              type="button"
+              onClick={() => handleScanInbox('auto')}
+              disabled={scanning}
+              className="inline-flex items-center justify-center gap-1.5 rounded-xl bg-sky-600 px-3 py-2 text-xs font-medium text-white hover:bg-sky-700 disabled:opacity-50 cursor-pointer"
             >
               <RefreshCw className={`h-3.5 w-3.5 ${scanning ? 'animate-spin' : ''}`} />
-              {scanning ? '正在拉取解析...' : '扫描邮箱并解析'}
+              {scanning ? '拉取解析中...' : '增量拉取并解析'}
             </button>
           </div>
 

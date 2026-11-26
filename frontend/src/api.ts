@@ -337,6 +337,23 @@ export const api = {
       method: 'POST',
     }),
   testEmail: () => request<{ ok: boolean; message: string; inbox_count: number }>('/api/emails/test', { method: 'POST' }),
+  getEmailCacheStats: () => request<import('./types').EmailCacheStats>('/api/emails/cache-stats'),
+  syncEmailCache: (payload?: {
+    days?: number;
+    limit?: number;
+    account_id?: number;
+    force_refresh?: boolean;
+    zip_password?: string;
+  }) =>
+    request<{
+      fetched_new: number;
+      total_cached: number;
+      scanned_accounts: string[];
+      warnings: string[];
+      synced_at: string;
+      summary: string;
+      cache_stats: import('./types').EmailCacheStats;
+    }>('/api/emails/sync', { method: 'POST', body: JSON.stringify(payload || {}) }),
   fetchParseEmails: (params: {
     days: number;
     limit: number;
@@ -345,6 +362,7 @@ export const api = {
     include_body_ai: boolean;
     unread_only: boolean;
     account_id?: number;
+    source?: 'auto' | 'cache' | 'imap';
   }) => request<EmailFetchResponse>('/api/emails/fetch-parse', { method: 'POST', body: JSON.stringify(params) }),
   parseEmailText: (params: { subject: string; sender: string; body: string }) =>
     request<{
@@ -611,6 +629,7 @@ export const api = {
     pdf_password?: string;
     account_id?: number;
     include_body_ai?: boolean;
+    source?: 'auto' | 'cache' | 'imap';
   }) =>
     request<import('./types').GridEmailFetchResponse>('/api/grids/fetch-email-trades', {
       method: 'POST',
