@@ -488,7 +488,6 @@ def init_db(seed_demo: bool = True) -> None:
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_stock_trades_strategy ON stock_trades(strategy_id, traded_at);
-            CREATE INDEX IF NOT EXISTS idx_stock_trades_ext_ref ON stock_trades(strategy_id, external_ref);
             """
         )
 

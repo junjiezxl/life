@@ -2216,6 +2216,68 @@ class TestLifeHubAPI(unittest.TestCase):
         self.assertEqual(self.client.delete(f"/api/grids/{sid}").status_code, 200)
         update_settings({"ibkr_flex_token": "", "ibkr_flex_query_id": ""})
 
+    def test_28_init_db_migrates_legacy_grid_tables_without_new_columns(self):
+        import sqlite3
+        from contextlib import closing
+        from app.db import DB_PATH, init_db
+
+        # Simulate a database created before external_ref / ibkr_auto_sync were added
+        with closing(sqlite3.connect(DB_PATH)) as raw_conn:
+            with raw_conn:
+                raw_conn.executescript(
+                    """
+                    DROP INDEX IF EXISTS idx_stock_trades_ext_ref;
+                    DROP TABLE IF EXISTS stock_trades;
+                    DROP TABLE IF EXISTS grid_strategies;
+                    CREATE TABLE grid_strategies (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL DEFAULT '',
+                        symbol TEXT NOT NULL,
+                        market TEXT NOT NULL DEFAULT 'CN',
+                        currency TEXT NOT NULL DEFAULT 'CNY',
+                        grid_type TEXT NOT NULL DEFAULT 'arithmetic',
+                        lower_price REAL NOT NULL DEFAULT 0,
+                        upper_price REAL NOT NULL DEFAULT 0,
+                        step_value REAL NOT NULL DEFAULT 0,
+                        shares_per_grid REAL NOT NULL DEFAULT 100,
+                        base_price REAL NOT NULL DEFAULT 0,
+                        fee_rate REAL NOT NULL DEFAULT 0.00025,
+                        min_fee REAL NOT NULL DEFAULT 5,
+                        stamp_tax_rate REAL NOT NULL DEFAULT 0,
+                        stamp_tax_side TEXT NOT NULL DEFAULT 'sell',
+                        current_price REAL NOT NULL DEFAULT 0,
+                        prev_close REAL NOT NULL DEFAULT 0,
+                        quote_name TEXT DEFAULT '',
+                        price_updated_at TEXT DEFAULT '',
+                        status TEXT NOT NULL DEFAULT 'active',
+                        notes TEXT DEFAULT '',
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE stock_trades (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        strategy_id INTEGER NOT NULL REFERENCES grid_strategies(id) ON DELETE CASCADE,
+                        side TEXT NOT NULL,
+                        price REAL NOT NULL,
+                        quantity REAL NOT NULL,
+                        fee REAL NOT NULL DEFAULT 0,
+                        tax REAL NOT NULL DEFAULT 0,
+                        grid_level INTEGER,
+                        traded_at TEXT NOT NULL,
+                        note TEXT DEFAULT '',
+                        created_at TEXT NOT NULL
+                    );
+                    """
+                )
+        # Must migrate cleanly without OperationalError: no such column: external_ref
+        init_db(seed_demo=False)
+        with closing(sqlite3.connect(DB_PATH)) as raw_conn:
+            cols_g = {r[1] for r in raw_conn.execute("PRAGMA table_info(grid_strategies)").fetchall()}
+            cols_t = {r[1] for r in raw_conn.execute("PRAGMA table_info(stock_trades)").fetchall()}
+            self.assertIn("ibkr_auto_sync", cols_g)
+            self.assertIn("external_ref", cols_t)
+            self.assertIn("source_type", cols_t)
+
 
 if __name__ == "__main__":
     unittest.main()
