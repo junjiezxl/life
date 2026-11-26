@@ -23,6 +23,7 @@ import type {
   EmailAccount,
   EmailStockTradeCandidate,
   GridDetailResponse,
+  GridEmailScannedItem,
   GridIbkrCandidate,
   GridListItem,
   GridListResponse,
@@ -114,6 +115,7 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
   const [emailScanning, setEmailScanning] = useState(false);
   const [emailImporting, setEmailImporting] = useState(false);
   const [emailScannedCount, setEmailScannedCount] = useState<number | null>(null);
+  const [emailScannedList, setEmailScannedList] = useState<GridEmailScannedItem[]>([]);
   const [emailWarnings, setEmailWarnings] = useState<string[]>([]);
   const [emailCandidates, setEmailCandidates] = useState<EmailStockTradeCandidate[]>([]);
   const [emailSelected, setEmailSelected] = useState<Record<number, boolean>>({});
@@ -253,13 +255,14 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
     try {
       const res = await api.fetchGridEmailTrades({
         days: emailDays,
-        limit: 60,
+        limit: 100,
         keyword: emailKeyword.trim(),
         pdf_password: emailPdfPwd.trim(),
         account_id: emailMailboxId ? Number(emailMailboxId) : undefined,
         include_body_ai: true,
       });
       setEmailScannedCount(res.emails_scanned);
+      setEmailScannedList(res.scanned_emails || []);
       setEmailWarnings(res.warnings || []);
       populateEmailTrades(res.trades || [], false);
       onNotify(`已扫描 ${res.emails_scanned} 封邮件，识别到 ${res.trades.length} 笔股票成交`);
@@ -2018,6 +2021,66 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
                   <div key={i}>• {w}</div>
                 ))}
               </div>
+            )}
+
+            {emailScannedList.length > 0 && (
+              <details
+                open={emailCandidates.length === 0}
+                className="rounded-xl border border-slate-200/80 bg-slate-50/60 px-3.5 py-2 text-xs"
+              >
+                <summary className="cursor-pointer font-medium text-slate-700 flex items-center justify-between">
+                  <span>
+                    已扫描邮件列表（共 {emailScannedList.length} 封
+                    {emailScannedList.some((e) => e.stock_hint)
+                      ? ` · 其中 ${emailScannedList.filter((e) => e.stock_hint).length} 封含汇丰/证券关键词`
+                      : ''}
+                    ）
+                  </span>
+                  <span className="text-[11px] font-normal text-slate-400">可展开查看原文或填入正文框排查</span>
+                </summary>
+                <div className="mt-2 max-h-44 overflow-y-auto space-y-1.5 pr-1">
+                  {emailScannedList.map((em) => (
+                    <div
+                      key={`${em.uid}-${em.received_at}`}
+                      className={`rounded-lg border px-2.5 py-1.5 ${
+                        em.stock_hint ? 'border-rose-200 bg-rose-50/40' : 'border-slate-200 bg-white'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="min-w-0 truncate font-medium text-slate-800">
+                          {em.stock_hint && (
+                            <span className="mr-1 rounded bg-rose-100 px-1 py-0.5 text-[10px] text-rose-700">券商线索</span>
+                          )}
+                          {em.subject}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEmailPasteSubj(em.subject || '汇丰股票交易通知');
+                            setEmailPasteText(em.body_preview || '');
+                            onNotify('已将该邮件内容填入下方粘贴框，可直接核对或点击解析正文');
+                          }}
+                          className="shrink-0 rounded bg-slate-100 px-2 py-0.5 text-[10px] text-slate-700 hover:bg-slate-200 cursor-pointer"
+                        >
+                          填入正文排查
+                        </button>
+                      </div>
+                      <div className="mt-0.5 flex flex-wrap items-center gap-2 text-[11px] text-slate-400">
+                        <span>{em.received_at}</span>
+                        <span className="truncate max-w-[200px]">{em.sender}</span>
+                        {em.attachments && em.attachments.length > 0 && (
+                          <span className="text-indigo-600">附件: {em.attachments.join(', ')}</span>
+                        )}
+                      </div>
+                      {em.stock_hint && em.body_preview && (
+                        <div className="mt-1 line-clamp-2 text-[11px] text-slate-500">
+                          {em.body_preview}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </details>
             )}
 
             {/* Options */}

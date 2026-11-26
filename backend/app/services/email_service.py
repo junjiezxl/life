@@ -167,15 +167,20 @@ def _extract_body_and_attachments(msg: Message) -> Tuple[str, List[Tuple[str, by
     attachments: List[Tuple[str, bytes]] = []
 
     if msg.is_multipart():
+        att_idx = 0
         for part in msg.walk():
             cdisp = str(part.get("Content-Disposition") or "").lower()
             ctype = (part.get_content_type() or "").lower()
             raw_fname = part.get_filename()
             filename = _decode_mime_str(raw_fname) if raw_fname else ""
 
-            if filename or "attachment" in cdisp:
+            if filename or "attachment" in cdisp or ctype == "application/pdf":
                 payload = part.get_payload(decode=True)
-                if payload and filename:
+                if payload:
+                    if not filename:
+                        att_idx += 1
+                        ext = ".pdf" if ctype == "application/pdf" else (".html" if ctype == "text/html" else ".bin")
+                        filename = f"attachment_{att_idx}{ext}"
                     attachments.append((filename, payload))
                 continue
 
@@ -304,6 +309,7 @@ def _fetch_raw_emails_sync(
     days: int = 14,
     limit: int = 25,
     unread_only: bool = False,
+    keyword: str = "",
 ) -> List[Dict[str, Any]]:
     client = _connect_imap(settings)
     fetched: List[Dict[str, Any]] = []
@@ -320,7 +326,36 @@ def _fetch_raw_emails_sync(
 
         uids = data[0].split()
         # Most recent first
-        selected_uids = list(reversed(uids))[:limit]
+        reversed_uids = list(reversed(uids))
+        kw_lower = (keyword or "").strip().lower()
+        if kw_lower and len(reversed_uids) > limit:
+            # Batch-fetch headers across a wider pool so newer promos don't hide matching broker emails
+            pool_uids = reversed_uids[: max(limit * 4, 240)]
+            matched_uids: List[bytes] = []
+            try:
+                uid_list = b",".join(pool_uids)
+                typ_h, hdr_data = client.uid("fetch", uid_list, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])")
+                if typ_h == "OK" and hdr_data:
+                    for part in hdr_data:
+                        if not (isinstance(part, tuple) and len(part) >= 2 and isinstance(part[1], (bytes, bytearray))):
+                            continue
+                        meta_line = part[0].decode("utf-8", errors="ignore") if isinstance(part[0], (bytes, bytearray)) else str(part[0])
+                        m_u = re.search(r"UID\s+(\d+)", meta_line, re.IGNORECASE)
+                        if not m_u:
+                            continue
+                        hmsg = email.message_from_bytes(bytes(part[1]))
+                        subj_s = _decode_mime_str(hmsg.get("Subject")).lower()
+                        from_s = _decode_mime_str(hmsg.get("From")).lower()
+                        if kw_lower in subj_s or kw_lower in from_s:
+                            matched_uids.append(m_u.group(1).encode("ascii"))
+            except Exception:
+                matched_uids = []
+            if matched_uids:
+                selected_uids = matched_uids[:limit]
+            else:
+                selected_uids = reversed_uids[:limit]
+        else:
+            selected_uids = reversed_uids[:limit]
 
         for uid_bytes in selected_uids:
             uid_str = uid_bytes.decode("utf-8", errors="ignore")
@@ -404,12 +439,18 @@ async def fetch_and_parse_emails(
     existing_stock_refs: Optional[Set[str]] = None,
 ) -> Dict[str, Any]:
     effective_zip_pwd = zip_password or settings.get("email_bill_zip_password") or ""
+    import inspect
+    fetch_kwargs: Dict[str, Any] = {
+        "days": days,
+        "limit": limit,
+        "unread_only": unread_only,
+    }
+    if keyword and "keyword" in inspect.signature(_fetch_raw_emails_sync).parameters:
+        fetch_kwargs["keyword"] = keyword
     raw_emails = await asyncio.to_thread(
         _fetch_raw_emails_sync,
         settings,
-        days=days,
-        limit=limit,
-        unread_only=unread_only,
+        **fetch_kwargs,
     )
 
     kw_lower = keyword.strip().lower()
@@ -441,7 +482,7 @@ async def fetch_and_parse_emails(
         email_stock_count = 0
         pdf_texts: List[str] = []
 
-        # 1. Parse bill attachments (.zip / .csv / .xlsx / .pdf)
+        # 1. Parse bill/advice attachments (.zip / .csv / .xlsx / .pdf / .html)
         for fname, raw_bytes in attachments:
             lower_fn = fname.lower()
             if lower_fn.endswith(".pdf"):
@@ -450,6 +491,14 @@ async def fetch_and_parse_emails(
                     warnings.append(f"{fname}: {perr}")
                 elif ptxt.strip():
                     pdf_texts.append(f"[PDF附件: {fname}]\n{ptxt.strip()}")
+                continue
+            if lower_fn.endswith((".htm", ".html")):
+                try:
+                    htxt = _html_to_text(raw_bytes.decode("utf-8", errors="ignore"))
+                except Exception:
+                    htxt = ""
+                if htxt.strip():
+                    pdf_texts.append(f"[HTML附件: {fname}]\n{htxt.strip()}")
                 continue
             if not lower_fn.endswith((".zip", ".csv", ".xlsx")):
                 continue
@@ -511,6 +560,29 @@ async def fetch_and_parse_emails(
                 all_stock_trades.append(st)
                 email_stock_count += 1
 
+        hint_haystack = f"{subject} {sender} {' '.join(att_names)} {combined_body[:800]}".lower()
+        is_stock_hint = any(
+            h in hint_haystack
+            for h in (
+                "hsbc",
+                "汇丰",
+                "滙豐",
+                "investdirect",
+                "股票",
+                "證券",
+                "证券",
+                "股份",
+                "contract note",
+                "trade confirmation",
+                "trade advice",
+                "eadvice",
+                "e-advice",
+                "futu",
+                "ibkr",
+                "成交",
+            )
+        )
+
         email_summaries.append(
             {
                 "uid": uid,
@@ -522,7 +594,8 @@ async def fetch_and_parse_emails(
                 "parsed_tx_count": email_tx_count,
                 "parsed_rem_count": email_rem_count,
                 "parsed_stock_count": email_stock_count,
-                "body_preview": combined_body[:600],
+                "stock_hint": is_stock_hint,
+                "body_preview": combined_body[:1500],
             }
         )
 

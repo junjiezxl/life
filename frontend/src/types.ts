@@ -848,10 +848,15 @@ export interface EmailStockTradeCandidate {
   matched_strategy_name?: string;
 }
 
+export interface GridEmailScannedItem extends EmailScanSummary {
+  stock_hint?: boolean;
+}
+
 export interface GridEmailFetchResponse {
   emails_scanned: number;
   scanned_accounts: string[];
   trades: EmailStockTradeCandidate[];
+  scanned_emails?: GridEmailScannedItem[];
   warnings: string[];
 }
 

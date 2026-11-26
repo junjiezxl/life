@@ -2390,6 +2390,45 @@ class TestLifeHubAPI(unittest.TestCase):
             self.assertEqual(imp2.status_code, 200)
             self.assertEqual(imp2.json()["imported_trades"], 0)
             self.assertEqual(imp2.json()["skipped_duplicates"], 2)
+            self.assertIn("scanned_emails", f_res.json())
+
+        # 5. HSBC HK Traditional Chinese notification + legal disclaimer ("buy or sell") + space-aligned PDF row
+        hsbc_tc_body = """
+        滙豐：證券交易執行通知
+        指示類別：買入
+        股份名稱 / 編號：A博時港元 (03152)
+        成交股數 (股)：11 股
+        平均成交價 (港元)：1,085.50
+        交易日期：2026年11月25日
+        重要提示 / Disclaimer: This is not advice to buy or sell any securities.
+        """
+        r_tc = self.client.post(
+            "/api/grids/parse-email-trade-text",
+            json={"subject": "滙豐：證券交易執行通知", "sender": "HSBC <hsbc@hsbc.com.hk>", "body": hsbc_tc_body},
+        )
+        self.assertEqual(r_tc.status_code, 200, r_tc.text)
+        tc_tr = r_tc.json()["trades"]
+        self.assertEqual(len(tc_tr), 1, r_tc.text)
+        self.assertEqual(tc_tr[0]["symbol"], "03152")
+        self.assertEqual(tc_tr[0]["side"], "buy")
+        self.assertAlmostEqual(tc_tr[0]["price"], 1085.5, places=2)
+        self.assertAlmostEqual(tc_tr[0]["quantity"], 11.0, places=2)
+
+        pdf_space_body = """
+        HSBC Contract Note
+        Trade Date     Side   Code    Security       Qty   Price      Consideration
+        26 Nov 2026    SELL   03152   CSOP HKD MMF   11    1,086.00   11,946.00
+        """
+        r_sp = self.client.post(
+            "/api/grids/parse-email-trade-text",
+            json={"subject": "HSBC Contract Note", "sender": "HSBC <no-reply@hsbc.com.hk>", "body": pdf_space_body},
+        )
+        self.assertEqual(r_sp.status_code, 200, r_sp.text)
+        sp_tr = r_sp.json()["trades"]
+        self.assertEqual(len(sp_tr), 1, r_sp.text)
+        self.assertEqual(sp_tr[0]["side"], "sell")
+        self.assertEqual(sp_tr[0]["symbol"], "03152")
+        self.assertAlmostEqual(sp_tr[0]["price"], 1086.0, places=2)
 
         # Cleanup
         self.assertEqual(self.client.delete(f"/api/grids/{sid}").status_code, 200)

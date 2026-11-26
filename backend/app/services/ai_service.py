@@ -1146,9 +1146,9 @@ def _extract_credit_bill_statement_lines(
 
 
 def _detect_email_broker(subject: str, sender: str, body_text: str) -> str:
-    combined = f"{sender}\n{subject}\n{body_text[:1000]}".lower()
+    combined = f"{sender}\n{subject}\n{body_text[:4000]}".lower()
     for cues, label in (
-        (("hsbc", "汇丰", "滙豐", "investdirect"), "汇丰 (HSBC)"),
+        (("hsbc", "汇丰", "滙豐", "investdirect", "wayfoong"), "汇丰 (HSBC)"),
         (("bochk", "中银香港", "中銀香港"), "中银香港"),
         (("hang seng", "恒生", "恆生"), "恒生银行"),
         (("futu", "富途", "moomoo"), "富途证券"),
@@ -1251,6 +1251,44 @@ def _normalize_stock_trade_dict(raw: Dict[str, Any], default_broker: str, defaul
     }
 
 
+_MONTH_NAME_MAP = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def _parse_flexible_trade_date(raw: str) -> Optional[str]:
+    s = (raw or "").strip()
+    if not s:
+        return None
+    m_ymd = re.search(r"(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})日?(?:[T\s]+(\d{1,2}):(\d{2}))?", s)
+    if m_ymd:
+        y, mo, d = int(m_ymd.group(1)), int(m_ymd.group(2)), int(m_ymd.group(3))
+        hh = int(m_ymd.group(4)) if m_ymd.group(4) else 15
+        mm = int(m_ymd.group(5)) if m_ymd.group(5) else 0
+        if 1 <= mo <= 12 and 1 <= d <= 31:
+            return f"{y:04d}-{mo:02d}-{d:02d} {hh:02d}:{mm:02d}"
+    m_dmy_txt = re.search(r"\b(\d{1,2})[\s-]+([A-Za-z]{3,4})[\s-]+(\d{4})(?:\s+(\d{1,2}):(\d{2}))?", s)
+    if m_dmy_txt:
+        d = int(m_dmy_txt.group(1))
+        mo = _MONTH_NAME_MAP.get(m_dmy_txt.group(2).lower())
+        y = int(m_dmy_txt.group(3))
+        hh = int(m_dmy_txt.group(4)) if m_dmy_txt.group(4) else 15
+        mm = int(m_dmy_txt.group(5)) if m_dmy_txt.group(5) else 0
+        if mo and 1 <= d <= 31:
+            return f"{y:04d}-{mo:02d}-{d:02d} {hh:02d}:{mm:02d}"
+    m_dmy = re.search(r"\b(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})(?:\s+(\d{1,2}):(\d{2}))?", s)
+    if m_dmy:
+        d, mo, y = int(m_dmy.group(1)), int(m_dmy.group(2)), int(m_dmy.group(3))
+        if mo > 12 and d <= 12:
+            d, mo = mo, d
+        hh = int(m_dmy.group(4)) if m_dmy.group(4) else 15
+        mm = int(m_dmy.group(5)) if m_dmy.group(5) else 0
+        if 1 <= mo <= 12 and 1 <= d <= 31:
+            return f"{y:04d}-{mo:02d}-{d:02d} {hh:02d}:{mm:02d}"
+    return None
+
+
 def _extract_stock_trades_from_email(
     subject: str,
     sender: str,
@@ -1267,22 +1305,35 @@ def _extract_stock_trades_from_email(
         for k in (
             "contract note",
             "trade confirmation",
+            "trade advice",
+            "e-advice",
+            "eadvice",
+            "order confirmation",
+            "order executed",
+            "execution",
             "stock trading",
             "securities",
-            "order executed",
+            "equity",
+            "hkex",
+            "nasdaq",
+            "nyse",
+            "etf",
             "bought",
             "sold",
             "股票",
             "證券",
             "证券",
             "股份",
-            "成交确认",
-            "成交確認",
-            "成交通知",
-            "买卖通知",
-            "買賣通知",
+            "股數",
+            "股数",
+            "成交",
+            "买卖",
+            "買賣",
+            "交易指示",
             "交易确认",
             "交易確認",
+            "執行通知",
+            "执行通知",
             "沽出",
             "買入",
             "买入",
@@ -1293,15 +1344,23 @@ def _extract_stock_trades_from_email(
     )
     if not has_stock_cue:
         return []
-    # Require explicit stock share/price cues or ticker cues so promo newsletters don't trigger false positives
+    # Require explicit stock share/price/code cues so generic marketing emails don't trigger false positives
     has_trade_detail = bool(
-        re.search(r"(?:股|shares|@|成交价|成交價|execution\s*price|trade\s*price|stock\s*code|股票代号|證券代號|股份代號)", combined, re.IGNORECASE)
+        re.search(
+            r"(?:股|shares?|units?|qty|quantity|@|成交|單價|单价|價格|价格|均價|均价|price|代號|代号|代碼|代码|編號|编号|號碼|号码|stock\s*no|stock\s*code|symbol|ticker|hk\$|hkd|us\$|usd|cny|rmb)",
+            combined,
+            re.IGNORECASE,
+        )
     )
     if not has_trade_detail:
         return []
 
     broker = _detect_email_broker(subject, sender, body_text)
-    default_dt = _extract_email_exact_datetime(combined) or (received_at or datetime.now().astimezone().strftime("%Y-%m-%d %H:%M"))[:16]
+    default_dt = (
+        _extract_email_exact_datetime(combined)
+        or _parse_flexible_trade_date(combined)
+        or (received_at or datetime.now().astimezone().strftime("%Y-%m-%d %H:%M"))[:16]
+    )
     results: List[Dict[str, Any]] = []
     seen_sigs: set = set()
 
@@ -1314,46 +1373,104 @@ def _extract_stock_trades_from_email(
         seen_sigs.add(sig)
         results.append(c)
 
-    # Pattern 1: Structured key-value confirmation block (common in HSBC email alerts & Chinese broker advices)
+    # Optional parenthetical unit/currency suffix before colon/separator, e.g. "Price (HKD): 388.50"
+    opt_unit = r"(?:\s*[（(][^）)\r\n]{1,24}[）)])?"
+    sep = rf"{opt_unit}[：:\s\t]+"
+
+    # Pattern 1: Structured key-value confirmation block (HSBC HK / CN email alerts & Contract Notes)
     kv_side = ""
     m_side = re.search(
-        r"(?:买卖方向|交易方向|交易类型|交易類型|指示类别|指示類別|Action|Order\s*Type|Side|Transaction\s*Type)[：:\s\t]+([^\r\n]+)",
+        rf"(?:买卖方向|交易方向|交易类型|交易類型|交易類別|交易类别|買賣類別|买卖类别|指示类别|指示類別|買賣|买卖|Action|Order\s*Type|Transaction\s*Type|Buy\s*/\s*Sell|Direction|Side|Instruction|Type){sep}([^\r\n]+)",
         combined,
         re.IGNORECASE,
     )
     if m_side:
         sv = m_side.group(1).strip().lower()
-        if any(k in sv for k in ("买入", "買入", "buy", "bought", "认购")):
+        if any(k in sv for k in ("买入", "買入", "购入", "購入", "buy", "bought", "认购", "認購")):
             kv_side = "buy"
-        elif any(k in sv for k in ("卖出", "賣出", "沽出", "sell", "sold")):
+        elif any(k in sv for k in ("卖出", "賣出", "沽出", "出售", "sell", "sold")):
+            kv_side = "sell"
+        elif sv in ("b", "bot"):
+            kv_side = "buy"
+        elif sv in ("s", "sld"):
             kv_side = "sell"
     if not kv_side:
-        if re.search(r"(?:^|[\s:：])(买入|買入|Bought|Buy)\b", combined, re.IGNORECASE) and not re.search(r"(?:卖出|賣出|沽出|Sold|Sell)", combined, re.IGNORECASE):
+        # Strip legal disclaimer lines ("not a recommendation to buy or sell...") before scanning standalone words
+        clean_for_side = "\n".join(
+            ln for ln in combined.splitlines()
+            if not any(
+                d in ln.lower()
+                for d in ("disclaimer", "not a recommendation", "buy or sell", "買入或賣出", "买入或卖出", "免責聲明", "免责声明", "重要提示", "risk warning")
+            )
+        )
+        has_b = bool(re.search(r"(?:买入|買入|購入|购入|\bBought\b|\bBuy\b)", clean_for_side, re.IGNORECASE))
+        has_s = bool(re.search(r"(?:卖出|賣出|沽出|\bSold\b|\bSell\b)", clean_for_side, re.IGNORECASE))
+        if has_b and not has_s:
             kv_side = "buy"
-        elif re.search(r"(?:^|[\s:：])(卖出|賣出|沽出|Sold|Sell)\b", combined, re.IGNORECASE) and not re.search(r"(?:买入|買入|Bought|Buy)", combined, re.IGNORECASE):
+        elif has_s and not has_b:
             kv_side = "sell"
 
     kv_sym = ""
     kv_name = ""
+    # Code first: e.g. "股份編號：03152 (A博時港元)" or "Stock Code: 00700.HK" (must NOT match leading 'A' of 'A博時港元')
+    sym_label = r"(?:股票代号|股票代码|股份代号|股份代號|證券代號|证券代码|股份編號|股票編號|證券編號|股份编号|股票编号|证券编号|代號|代号|代碼|代码|編號|编号|Stock\s*Code|Stock\s*No\.?|Stock\s*Number|Security\s*Code|Ticker|Symbol|Instrument)(?:\s*/\s*(?:名稱|名称|Name|Code|No\.?))?"
     m_sym = re.search(
-        r"(?:股票代号|股票代码|股份代号|股份代號|證券代號|证券代码|Stock\s*Code|Ticker|Symbol|Instrument)[：:\s\t]+([A-Za-z0-9]{1,6}(?:\.[A-Za-z]{2})?)(?:[\s（(]+([^\r\n）)]+)[）)]?)?",
+        rf"{sym_label}{sep}(?:HKEX\s*:?\s*|HK\s*:?\s*)?([A-Za-z0-9]{{1,6}}(?:\.[A-Za-z]{{2}})?)(?=$|[\s,.;:()（）])(?:\s*HK)?(?:[\s（(]+([^\r\n）)]+)[）)]?)?",
         combined,
         re.IGNORECASE,
     )
     if m_sym:
-        kv_sym = m_sym.group(1).strip().upper()
-        kv_name = (m_sym.group(2) or "").strip()
+        cand_sym = m_sym.group(1).strip().upper()
+        # Reject years accidentally captured on date lines
+        if not (cand_sym.isdigit() and len(cand_sym) == 4 and 2020 <= int(cand_sym) <= 2035):
+            kv_sym = cand_sym
+            kv_name = (m_sym.group(2) or "").strip()
+
+    name_label = r"(?:股票名称|股份名称|股份名稱|證券名稱|证券名称|股票名稱|證券/股票名稱|股份名稱\s*/\s*編號|股份名称\s*/\s*编号|Stock\s*Name(?:\s*/\s*Code)?|Security\s*Name|Stock|Security)"
     m_name = re.search(
-        r"(?:股票名称|股份名称|股份名稱|證券名稱|证券名称|Stock\s*Name|Security\s*Name)[：:\s\t]+([^\r\n\t]+)",
+        rf"{name_label}{sep}([^\r\n\t]+)",
         combined,
         re.IGNORECASE,
     )
-    if m_name and not kv_name:
-        kv_name = m_name.group(1).strip()
+    if m_name:
+        raw_nm = m_name.group(1).strip()
+        # Check if field embeds code like "A博時港元 (03152)" or "騰訊控股 (00700)" or "03152 A博時港元"
+        m_emb = re.search(r"[（(]\s*([0-9]{4,5}(?:\.HK)?|[0-9]{6}(?:\.(?:SS|SH|SZ))?|[A-Z]{1,5})\s*[）)]", raw_nm, re.IGNORECASE)
+        if m_emb and not kv_sym:
+            kv_sym = m_emb.group(1).upper()
+            kv_name = raw_nm[: m_emb.start()].strip() or raw_nm
+        else:
+            m_lead = re.match(r"^([0-9]{4,5}(?:\.HK)?|[A-Z]{1,5})\s+(.+)$", raw_nm)
+            if m_lead and not kv_sym:
+                kv_sym = m_lead.group(1).upper()
+                kv_name = m_lead.group(2).strip()
+            elif not kv_name:
+                kv_name = raw_nm
+    if not kv_sym:
+        # Also inspect value right after sym_label when formatted as "編號：A博時港元 (03152)"
+        m_sym_line = re.search(rf"{sym_label}{sep}([^\r\n\t]+)", combined, re.IGNORECASE)
+        if m_sym_line:
+            line_val = m_sym_line.group(1).strip()
+            m_emb2 = re.search(r"[（(]\s*([0-9]{4,5}(?:\.HK)?|[0-9]{6}(?:\.(?:SS|SH|SZ))?|[A-Z]{1,5})\s*[）)]", line_val, re.IGNORECASE)
+            if m_emb2:
+                kv_sym = m_emb2.group(1).upper()
+                if not kv_name:
+                    kv_name = line_val[: m_emb2.start()].strip() or line_val
+    if not kv_sym:
+        # Fallback: look for explicit code format like "00700.HK" or "(03152)" or "03152 (xxx)"
+        m_hk = re.search(r"\b([0-9]{4,5}\.HK|[0-9]{6}\.(?:SS|SH|SZ))\b", combined, re.IGNORECASE)
+        if m_hk:
+            kv_sym = m_hk.group(1).upper()
+        else:
+            m_paren = re.search(r"([^\r\n\t()（）]{2,24})\s*[（(]\s*(0\d{3,4}|[1-9]\d{3,4}(?:\.HK)?|[A-Z]{1,5})\s*[）)]", combined)
+            if m_paren and not (m_paren.group(2).isdigit() and 2020 <= int(m_paren.group(2)) <= 2035):
+                kv_sym = m_paren.group(2).upper()
+                if not kv_name:
+                    kv_name = m_paren.group(1).strip()
 
     kv_qty = 0.0
     m_qty = re.search(
-        r"(?:成交股数|成交股數|成交数量|成交數量|数量|數量|股数|股數|Executed\s*(?:Qty|Quantity)|Quantity|Shares)[：:\s\t]+([0-9][0-9,]*(?:\.\d+)?)",
+        rf"(?:成交股数|成交股數|成交数量|成交數量|已成交股數|已成交數量|買賣股數|买卖股数|買入股數|賣出股數|沽出股數|總股數|總數量|数量|數量|股数|股數|Executed\s*(?:Qty|Quantity)|Filled\s*(?:Qty|Quantity)|Order\s*(?:Qty|Quantity)|Exec\.?\s*Qty|Quantity|Qty|Shares|Units){sep}([0-9][0-9,]*(?:\.\d+)?)\s*(?:股|shares?|units?)?",
         combined,
         re.IGNORECASE,
     )
@@ -1363,21 +1480,25 @@ def _extract_stock_trades_from_email(
     kv_price = 0.0
     kv_ccy = ""
     m_px = re.search(
-        r"(?:成交价格|成交價格|成交价|成交價|平均成交价|每股价格|每股價格|Execution\s*Price|Trade\s*Price|Unit\s*Price|Price)[：:\s\t]+(HKD|HK\$|USD|US\$|CNY|RMB|¥|￥|港币|港元|美元)?\s*([0-9][0-9,]*(?:\.\d+)?)",
+        rf"(?:成交价格|成交價格|成交单价|成交單價|成交价|成交價|平均成交价|平均成交價|平均價|平均价|均價|均价|買入價|买入价|賣出價|卖出价|沽出價|沽出价|每股价格|每股價格|單價|单价|價格|价格|Avg\.?\s*Price|Average\s*(?:Execution\s*)?Price|Filled\s*Price|Exec(?:uted)?\s*Price|Trade\s*Price|Unit\s*Price|Price){sep}(HKD|HK\$|USD|US\$|CNY|RMB|¥|￥|港币|港元|美元)?\s*([0-9][0-9,]*(?:\.\d+)?)\s*(HKD|HK\$|USD|US\$|CNY|RMB|港元|美元)?",
         combined,
         re.IGNORECASE,
     )
     if m_px:
-        kv_ccy = (m_px.group(1) or "").strip().upper()
+        kv_ccy = (m_px.group(1) or m_px.group(3) or "").strip().upper()
         kv_price = float(m_px.group(2).replace(",", ""))
     if not kv_ccy:
-        m_ccy = re.search(r"(?:结算货币|交易货币|货币|貨幣|Currency)[：:\s\t]+(HKD|USD|CNY|RMB|港币|港元|美元)", combined, re.IGNORECASE)
+        m_ccy = re.search(rf"(?:结算货币|結算貨幣|交易货币|交易貨幣|货币|貨幣|幣種|币种|Currency|Ccy){sep}(HKD|USD|CNY|RMB|港币|港元|美元)", combined, re.IGNORECASE)
         if m_ccy:
             kv_ccy = m_ccy.group(1).upper()
+        elif re.search(r"(?:HKD|HK\$|港元|港幣)", combined):
+            kv_ccy = "HKD"
+        elif re.search(r"(?:USD|US\$|美元)", combined):
+            kv_ccy = "USD"
 
     kv_fee = 0.0
     m_fee = re.search(
-        r"(?:经纪佣金|經紀佣金|交易佣金|佣金|Commission|Brokerage)[：:\s\t]+(?:HKD|HK\$|USD|US\$|CNY|RMB|¥|￥)?\s*([0-9][0-9,]*(?:\.\d+)?)",
+        rf"(?:经纪佣金|經紀佣金|交易佣金|佣金|手續費|手续费|Commission|Brokerage(?:\s*Fee)?){sep}(?:HKD|HK\$|USD|US\$|CNY|RMB|¥|￥)?\s*([0-9][0-9,]*(?:\.\d+)?)",
         combined,
         re.IGNORECASE,
     )
@@ -1386,21 +1507,23 @@ def _extract_stock_trades_from_email(
 
     kv_tax = 0.0
     for tax_pat in (
-        r"(?:政府印花税|政府印花稅|印花税|印花稅|Stamp\s*Duty)[：:\s\t]+(?:HKD|HK\$|USD|US\$|CNY|RMB|¥|￥)?\s*([0-9][0-9,]*(?:\.\d+)?)",
-        r"(?:证监会交易征费|證監會交易徵費|交易征费|交易徵費|SFC\s*Levy|AFRC\s*Levy)[：:\s\t]+(?:HKD|HK\$|USD|US\$|CNY|RMB|¥|￥)?\s*([0-9][0-9,]*(?:\.\d+)?)",
-        r"(?:交易所交易费|聯交所交易費|联交所交易费|Trading\s*Fee|Settlement\s*Fee|交收费|交收費)[：:\s\t]+(?:HKD|HK\$|USD|US\$|CNY|RMB|¥|￥)?\s*([0-9][0-9,]*(?:\.\d+)?)",
+        rf"(?:政府印花税|政府印花稅|印花税|印花稅|Stamp\s*Duty){sep}(?:HKD|HK\$|USD|US\$|CNY|RMB|¥|￥)?\s*([0-9][0-9,]*(?:\.\d+)?)",
+        rf"(?:证监会交易征费|證監會交易徵費|交易征费|交易徵費|SFC\s*Levy|AFRC\s*Levy){sep}(?:HKD|HK\$|USD|US\$|CNY|RMB|¥|￥)?\s*([0-9][0-9,]*(?:\.\d+)?)",
+        rf"(?:交易所交易费|聯交所交易費|联交所交易费|Trading\s*Fee|Settlement\s*Fee|交收费|交收費){sep}(?:HKD|HK\$|USD|US\$|CNY|RMB|¥|￥)?\s*([0-9][0-9,]*(?:\.\d+)?)",
     ):
         for mt in re.finditer(tax_pat, combined, re.IGNORECASE):
             kv_tax += float(mt.group(1).replace(",", ""))
 
     kv_dt = default_dt
     m_tdt = re.search(
-        r"(?:成交时间|成交時間|交易时间|交易時間|成交日期|交易日期|Trade\s*Date|Execution\s*Date|Execution\s*Time)[：:\s\t]+(\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)",
+        rf"(?:成交时间|成交時間|交易时间|交易時間|成交日期|交易日期|Trade\s*Date|Execution\s*Date|Execution\s*Time|Order\s*Date){sep}([^\r\n]+)",
         combined,
         re.IGNORECASE,
     )
     if m_tdt:
-        kv_dt = m_tdt.group(1).replace("/", "-")[:16]
+        parsed_dt = _parse_flexible_trade_date(m_tdt.group(1))
+        if parsed_dt:
+            kv_dt = parsed_dt
 
     if kv_side and kv_sym and kv_qty > 0 and kv_price > 0:
         _add_candidate(
@@ -1422,16 +1545,26 @@ def _extract_stock_trades_from_email(
             )
         )
 
-    # Pattern 2: Inline sentence & Contract Note / multi-row table lines
+    # Pattern 2: Inline sentence & Contract Note / multi-row table lines (tab or multi-space delimited)
     line_patterns = (
-        # Chinese inline: 卖出 03152(A博时港元) 11 股 ... @ HKD 1085.50
+        # Chinese inline code-first: 卖出 03152(A博时港元) 11 股 ... @ HKD 1085.50
         re.compile(
-            r"(买入|買入|卖出|賣出|沽出)\s+([A-Za-z0-9]{1,6}(?:\.[A-Za-z]{2})?)\s*(?:[（(]([^）)\r\n]{1,30})[）)])?\s+([0-9][0-9,]*(?:\.\d+)?)\s*股[^0-9\r\n]{0,30}?(?:成交价|价格|單價|单价|@|每股)\s*(HKD|HK\$|USD|US\$|CNY|RMB|¥|￥)?\s*([0-9][0-9,]*(?:\.\d+)?)",
+            r"(买入|買入|卖出|賣出|沽出|購入|购入)\s*(?:股票|股份)?\s*([A-Za-z0-9]{1,6}(?:\.[A-Za-z]{2})?)\s*(?:[（(]([^）)\r\n]{1,30})[）)])?\s+([0-9][0-9,]*(?:\.\d+)?)\s*股[^0-9\r\n]{0,40}?(?:成交价|成交價|价格|價格|單價|单价|@|每股)\s*(HKD|HK\$|USD|US\$|CNY|RMB|¥|￥|港元|美元)?\s*([0-9][0-9,]*(?:\.\d+)?)",
             re.IGNORECASE,
         ),
-        # English inline: Bought/Sold 100 [shares of] 00700 [(Tencent)] @ HKD 388.50
+        # Chinese inline name-first: 买入 腾讯控股 (00700) 100 股 ... @ HKD 388.50
         re.compile(
-            r"\b(Bought|Buy|Sold|Sell)\s+([0-9][0-9,]*(?:\.\d+)?)\s*(?:shares?\s*(?:of)?\s*)?([A-Za-z0-9]{1,6}(?:\.[A-Za-z]{2})?)\s*(?:[（(]([^）)\r\n]{1,30})[）)])?\s*(?:@|at)\s*(HKD|HK\$|USD|US\$|CNY|RMB|¥|￥)?\s*([0-9][0-9,]*(?:\.\d+)?)",
+            r"(买入|買入|卖出|賣出|沽出|購入|购入)\s*(?:[0-9,]+\s*股\s*)?([^\s（()）]{2,20})\s*[（(]\s*([A-Za-z0-9]{1,6}(?:\.[A-Za-z]{2})?)\s*[）)]\s*([0-9][0-9,]*(?:\.\d+)?)\s*股[^0-9\r\n]{0,40}?(?:成交价|成交價|价格|價格|單價|单价|@|每股)\s*(HKD|HK\$|USD|US\$|CNY|RMB|¥|￥|港元|美元)?\s*([0-9][0-9,]*(?:\.\d+)?)",
+            re.IGNORECASE,
+        ),
+        # English inline code-first: Bought/Sold 100 [shares of] 00700 [(Tencent)] @ HKD 388.50
+        re.compile(
+            r"\b(Bought|Buy|Sold|Sell)\s+([0-9][0-9,]*(?:\.\d+)?)\s*(?:shares?\s*(?:of)?\s*)?([A-Za-z0-9]{1,6}(?:\.[A-Za-z]{2})?)\s*(?:[（(]([^）)\r\n]{1,30})[）)])?\s*(?:@|at|price:?)\s*(HKD|HK\$|USD|US\$|CNY|RMB|¥|￥)?\s*([0-9][0-9,]*(?:\.\d+)?)",
+            re.IGNORECASE,
+        ),
+        # English inline name-first: Bought/Sold 100 shares of TENCENT (00700) @ HKD 388.50
+        re.compile(
+            r"\b(Bought|Buy|Sold|Sell)\s+([0-9][0-9,]*(?:\.\d+)?)\s*(?:shares?\s*(?:of)?\s*)?([A-Za-z][A-Za-z0-9\s.&-]{1,35}?)\s*[（(]\s*([A-Za-z0-9]{1,6}(?:\.[A-Za-z]{2})?)\s*[）)]\s*(?:@|at|price:?)\s*(HKD|HK\$|USD|US\$|CNY|RMB|¥|￥)?\s*([0-9][0-9,]*(?:\.\d+)?)",
             re.IGNORECASE,
         ),
     )
@@ -1440,10 +1573,9 @@ def _extract_stock_trades_from_email(
         clean_ln = re.sub(r"\s+", " ", ln).strip()
         if not clean_ln:
             continue
-        m_dt_ln = re.search(r"(\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:\s+\d{1,2}:\d{2})?)", clean_ln)
-        ln_dt = m_dt_ln.group(1).replace("/", "-")[:16] if m_dt_ln else kv_dt
+        ln_dt = _parse_flexible_trade_date(clean_ln) or kv_dt
 
-        # Try Chinese inline pattern
+        # Try Chinese inline code-first
         for m in line_patterns[0].finditer(clean_ln):
             _add_candidate(
                 _normalize_stock_trade_dict(
@@ -1464,8 +1596,29 @@ def _extract_stock_trades_from_email(
                 )
             )
 
-        # Try English inline pattern
+        # Try Chinese inline name-first
         for m in line_patterns[1].finditer(clean_ln):
+            _add_candidate(
+                _normalize_stock_trade_dict(
+                    {
+                        "side": m.group(1),
+                        "name": m.group(2).strip(),
+                        "symbol": m.group(3),
+                        "quantity": m.group(4),
+                        "currency": m.group(5) or kv_ccy,
+                        "price": m.group(6),
+                        "fee": kv_fee if len(results) == 0 else 0.0,
+                        "tax": kv_tax if len(results) == 0 else 0.0,
+                        "broker": broker,
+                        "traded_at": ln_dt,
+                    },
+                    broker,
+                    default_dt,
+                )
+            )
+
+        # Try English inline code-first
+        for m in line_patterns[2].finditer(clean_ln):
             _add_candidate(
                 _normalize_stock_trade_dict(
                     {
@@ -1485,53 +1638,80 @@ def _extract_stock_trades_from_email(
                 )
             )
 
-        # Try tab-separated table rows from HTML/PDF statements: [Date] \t Buy/Sell \t Symbol \t [Name] \t Qty \t Price
+        # Try English inline name-first
+        for m in line_patterns[3].finditer(clean_ln):
+            _add_candidate(
+                _normalize_stock_trade_dict(
+                    {
+                        "side": m.group(1),
+                        "quantity": m.group(2),
+                        "name": m.group(3).strip(),
+                        "symbol": m.group(4),
+                        "currency": m.group(5) or kv_ccy,
+                        "price": m.group(6),
+                        "fee": kv_fee if len(results) == 0 else 0.0,
+                        "tax": kv_tax if len(results) == 0 else 0.0,
+                        "broker": broker,
+                        "traded_at": ln_dt,
+                    },
+                    broker,
+                    default_dt,
+                )
+            )
+
+        # Try tab-separated (HTML) OR multi-space-separated (PDF Contract Note) table rows
+        cells: List[str] = []
         if "\t" in ln:
             cells = [c.strip() for c in ln.split("\t") if c.strip()]
-            if len(cells) >= 4:
-                row_side = ""
-                row_sym = ""
-                row_name = ""
-                nums: List[Tuple[float, str]] = []
-                for c in cells:
-                    cl = c.lower()
-                    if not row_side and cl in ("buy", "bought", "b", "买入", "買入"):
-                        row_side = "buy"
-                        continue
-                    if not row_side and cl in ("sell", "sold", "s", "卖出", "賣出", "沽出"):
-                        row_side = "sell"
-                        continue
-                    if re.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}", c):
-                        ln_dt = c.replace("/", "-")[:16]
-                        continue
-                    if not row_sym and re.fullmatch(r"(?:[0-9]{4,5}(?:\.HK)?|[0-9]{6}(?:\.(?:SS|SH|SZ))?|[A-Z]{1,5})", c.upper()):
+        elif "  " in ln.strip():
+            cells = [c.strip() for c in re.split(r"\s{2,}", ln.strip()) if c.strip()]
+        if len(cells) >= 4:
+            row_side = ""
+            row_sym = ""
+            row_name = ""
+            nums: List[Tuple[float, str]] = []
+            for c in cells:
+                cl = c.lower()
+                if not row_side and cl in ("buy", "bought", "bot", "b", "买入", "買入", "購入", "购入"):
+                    row_side = "buy"
+                    continue
+                if not row_side and cl in ("sell", "sold", "sld", "s", "卖出", "賣出", "沽出", "出售"):
+                    row_side = "sell"
+                    continue
+                dt_cell = _parse_flexible_trade_date(c)
+                if dt_cell:
+                    ln_dt = dt_cell
+                    continue
+                if not row_sym and re.fullmatch(r"(?:[0-9]{4,5}(?:\.HK)?|[0-9]{6}(?:\.(?:SS|SH|SZ))?|[A-Z]{1,5})", c.upper()):
+                    # Do not mistake a 4-digit year for ticker unless it looks like HK code with leading 0
+                    if not (c.isdigit() and len(c) == 4 and 2020 <= int(c) <= 2035):
                         row_sym = c.upper()
                         continue
-                    m_num = re.match(r"^(HKD|HK\$|USD|US\$|CNY|RMB|¥|￥)?\s*([0-9][0-9,]*(?:\.\d+)?)\s*(?:股|shares)?$", c, re.IGNORECASE)
-                    if m_num:
-                        nums.append((float(m_num.group(2).replace(",", "")), (m_num.group(1) or "").upper()))
-                        continue
-                    if not row_name and len(c) >= 2 and not re.match(r"^[\d.,]+$", c):
-                        row_name = c
-                if row_side and row_sym and len(nums) >= 2:
-                    q_val, _ = nums[0]
-                    p_val, p_ccy = nums[1]
-                    _add_candidate(
-                        _normalize_stock_trade_dict(
-                            {
-                                "side": row_side,
-                                "symbol": row_sym,
-                                "name": row_name,
-                                "quantity": q_val,
-                                "price": p_val,
-                                "currency": p_ccy or kv_ccy,
-                                "broker": broker,
-                                "traded_at": ln_dt,
-                            },
-                            broker,
-                            default_dt,
-                        )
+                m_num = re.match(r"^(HKD|HK\$|USD|US\$|CNY|RMB|¥|￥)?\s*([0-9][0-9,]*(?:\.\d+)?)\s*(?:股|shares?|units?)?$", c, re.IGNORECASE)
+                if m_num:
+                    nums.append((float(m_num.group(2).replace(",", "")), (m_num.group(1) or "").upper()))
+                    continue
+                if not row_name and len(c) >= 2 and not re.match(r"^[\d.,]+$", c):
+                    row_name = c
+            if row_side and row_sym and len(nums) >= 2:
+                q_val, _ = nums[0]
+                p_val, p_ccy = nums[1]
+                _add_candidate(
+                    _normalize_stock_trade_dict(
+                        {
+                            "side": row_side,
+                            "symbol": row_sym,
+                            "name": row_name,
+                            "quantity": q_val,
+                            "price": p_val,
+                            "currency": p_ccy or kv_ccy,
+                            "broker": broker,
+                            "traded_at": ln_dt,
+                        },
+                        broker,
+                        default_dt,
                     )
+                )
 
     return results
 
@@ -1798,7 +1978,7 @@ async def extract_from_email_content(
   ]
 }}"""
     user_prompt = (
-        f"主题: {subject}\n发件人: {sender}\n时间: {received_at}\n正文:\n{body_text[:4000]}"
+        f"主题: {subject}\n发件人: {sender}\n时间: {received_at}\n正文:\n{body_text[:8000]}"
     )
 
     default_broker = _detect_email_broker(subject, sender, body_text)

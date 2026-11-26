@@ -3835,10 +3835,17 @@ async def fetch_grid_email_trades(payload: GridEmailFetchRequest) -> Dict[str, A
         st["matched_strategy_id"] = matched[0]["id"] if matched else None
         st["matched_strategy_name"] = matched[0]["name"] if matched else ""
 
+    raw_emails = res.get("emails", [])
+    scanned_emails = sorted(
+        raw_emails,
+        key=lambda em: (0 if em.get("stock_hint") else 1, -int(em.get("parsed_stock_count") or 0)),
+    )[:40]
+
     return {
-        "emails_scanned": len(res.get("emails", [])),
+        "emails_scanned": len(raw_emails),
         "scanned_accounts": res.get("scanned_accounts", []),
         "trades": trades,
+        "scanned_emails": scanned_emails,
         "warnings": res.get("warnings", []),
     }
 
