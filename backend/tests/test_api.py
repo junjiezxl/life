@@ -2278,6 +2278,124 @@ class TestLifeHubAPI(unittest.TestCase):
             self.assertIn("external_ref", cols_t)
             self.assertIn("source_type", cols_t)
 
+    def test_29_hsbc_email_stock_trades_and_grid_import(self):
+        from unittest.mock import patch
+        from app.services import email_service
+        from app.db import update_settings
+
+        # 1. Paste HSBC HK Chinese stock confirmation email (should extract stock_trades, NOT daily消费 transactions)
+        hsbc_cn_body = (
+            "尊敬的客户：\n"
+            "阁下透过汇丰网上理财证券户口完成以下交易：\n"
+            "买卖方向：买入\n"
+            "股票代号：00700 (腾讯控股)\n"
+            "成交股数：100\n"
+            "成交价格：HKD 380.00\n"
+            "经纪佣金：HKD 50.00\n"
+            "政府印花税：HKD 38.00\n"
+            "交易日期：2026-11-24 10:15\n"
+        )
+        r_cn = self.client.post(
+            "/api/grids/parse-email-trade-text",
+            json={"subject": "汇丰银行证券交易成交通知", "sender": "HSBC <hsbc@hsbc.com.hk>", "body": hsbc_cn_body},
+        )
+        self.assertEqual(r_cn.status_code, 200, r_cn.text)
+        tr_cn = r_cn.json()["trades"]
+        self.assertEqual(len(tr_cn), 1)
+        self.assertEqual(tr_cn[0]["side"], "buy")
+        self.assertEqual(tr_cn[0]["symbol"], "00700")
+        self.assertEqual(tr_cn[0]["market"], "HK")
+        self.assertAlmostEqual(tr_cn[0]["price"], 380.0, places=2)
+        self.assertEqual(tr_cn[0]["quantity"], 100.0)
+        self.assertAlmostEqual(tr_cn[0]["fee"], 50.0, places=2)
+        self.assertAlmostEqual(tr_cn[0]["tax"], 38.0, places=2)
+        self.assertEqual(tr_cn[0]["broker"], "汇丰 (HSBC)")
+
+        # Ensure /api/emails/parse-text also separates stock_trades from household expense transactions
+        r_em = self.client.post(
+            "/api/emails/parse-text",
+            json={"subject": "汇丰银行证券交易成交通知", "sender": "HSBC <hsbc@hsbc.com.hk>", "body": hsbc_cn_body},
+        )
+        self.assertEqual(r_em.status_code, 200)
+        self.assertEqual(len(r_em.json()["transactions"]), 0)
+        self.assertEqual(len(r_em.json()["stock_trades"]), 1)
+
+        # 2. Inline HSBC sell notification & English Contract Note format in mailbox fetch
+        mb_res = self.client.post(
+            "/api/email-accounts",
+            json={
+                "name": "汇丰收件箱",
+                "imap_host": "imap.qq.com",
+                "imap_port": 993,
+                "username": "hsbc_test@qq.com",
+                "password": "pwd",
+            },
+        )
+        self.assertEqual(mb_res.status_code, 200)
+        mb_id = mb_res.json()["id"]
+
+        fake_raw = [
+            {
+                "uid": "<hsbc-buy-00700@hsbc.com.hk>",
+                "imap_uid": "101",
+                "subject": "HSBC Stock Trading Advice",
+                "sender": "HSBC <no-reply@hsbc.com.hk>",
+                "received_at": "2026-11-24 10:15",
+                "body": "Bought 100 00700.HK (TENCENT) @ HKD 380.00 Commission: HKD 50.00 Stamp Duty: HKD 38.00",
+                "attachments": [],
+            },
+            {
+                "uid": "<hsbc-sell-00700@hsbc.com.hk>",
+                "imap_uid": "102",
+                "subject": "汇丰证券卖出成交通知",
+                "sender": "HSBC <no-reply@hsbc.com.hk>",
+                "received_at": "2026-11-25 14:20",
+                "body": "阁下于汇丰卖出 00700(腾讯控股) 100 股，成交价 HKD 400.00，佣金：HKD 50.00，印花税：HKD 40.00",
+                "attachments": [],
+            },
+        ]
+
+        with patch.object(email_service, "_fetch_raw_emails_sync", return_value=fake_raw):
+            f_res = self.client.post(
+                "/api/grids/fetch-email-trades",
+                json={"days": 30, "account_id": mb_id, "keyword": "HSBC"},
+            )
+            self.assertEqual(f_res.status_code, 200, f_res.text)
+            fetched_trades = f_res.json()["trades"]
+            self.assertEqual(len(fetched_trades), 2)
+
+            # 3. Import both HSBC trades -> auto-creates grid tagged 汇丰 (HSBC) and pairs buy 380 -> sell 400!
+            imp1 = self.client.post(
+                "/api/grids/import-email-trades",
+                json={"trades": fetched_trades, "auto_create_missing": True, "default_step_pct": 3.0},
+            )
+            self.assertEqual(imp1.status_code, 200, imp1.text)
+            ib1 = imp1.json()
+            self.assertEqual(len(ib1["created_strategies"]), 1)
+            self.assertEqual(ib1["imported_trades"], 2)
+            sid = ib1["created_strategies"][0]["id"]
+            self.assertIn("HSBC", ib1["created_strategies"][0]["broker"])
+
+            # Verify net grid profit: (400*100 - 50 - 40) - (380*100 + 50 + 38) = 39910 - 38088 = 1822.00
+            d1 = self.client.get(f"/api/grids/{sid}").json()
+            self.assertEqual(d1["summary"]["completed_grids"], 1)
+            self.assertEqual(d1["summary"]["holding_qty"], 0.0)
+            self.assertAlmostEqual(d1["summary"]["realized_pnl"], 1822.0, places=2)
+
+            # 4. Re-importing same trades must be deduplicated cleanly
+            imp2 = self.client.post(
+                "/api/grids/import-email-trades",
+                json={"trades": fetched_trades, "auto_create_missing": True},
+            )
+            self.assertEqual(imp2.status_code, 200)
+            self.assertEqual(imp2.json()["imported_trades"], 0)
+            self.assertEqual(imp2.json()["skipped_duplicates"], 2)
+
+        # Cleanup
+        self.assertEqual(self.client.delete(f"/api/grids/{sid}").status_code, 200)
+        self.assertEqual(self.client.delete(f"/api/email-accounts/{mb_id}").status_code, 200)
+        update_settings({"ibkr_flex_token": "", "ibkr_flex_query_id": ""})
+
 
 if __name__ == "__main__":
     unittest.main()

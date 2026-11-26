@@ -350,6 +350,7 @@ export const api = {
     request<{
       transactions: ParsedBillTransaction[];
       reminders: NoteCandidate[];
+      stock_trades?: import('./types').EmailStockTradeCandidate[];
       detected_cards?: DetectedCardSummary[];
       engine: string;
       warning?: string;
@@ -357,10 +358,12 @@ export const api = {
   importEmailItems: (params: {
     transactions: ParsedBillTransaction[];
     reminders: NoteCandidate[];
+    stock_trades?: import('./types').EmailStockTradeCandidate[];
     account_id: number | null;
     skip_duplicates: boolean;
     auto_create_accounts?: boolean;
     auto_reconcile?: boolean;
+    auto_create_grid_strategies?: boolean;
     email_logs: Array<{
       message_uid: string;
       subject: string;
@@ -377,6 +380,7 @@ export const api = {
       auto_created_accounts?: Account[];
       auto_created_cards?: CreditCard[];
       reconciliation?: ReconcileRunResult;
+      stock_sync?: { imported_trades: number; skipped_duplicates: number; created_strategies: import('./types').GridStrategy[] };
     }>('/api/emails/import', { method: 'POST', body: JSON.stringify(params) }),
   listEmailLogs: () => request<EmailSyncLog[]>('/api/emails/logs'),
 
@@ -599,6 +603,58 @@ export const api = {
     request<import('./types').GridIbkrSyncResponse>('/api/grids/sync-ibkr', {
       method: 'POST',
       body: JSON.stringify(payload || {}),
+    }),
+  fetchGridEmailTrades: (payload?: {
+    days?: number;
+    limit?: number;
+    keyword?: string;
+    pdf_password?: string;
+    account_id?: number;
+    include_body_ai?: boolean;
+  }) =>
+    request<import('./types').GridEmailFetchResponse>('/api/grids/fetch-email-trades', {
+      method: 'POST',
+      body: JSON.stringify(payload || {}),
+    }),
+  parseGridEmailTradeText: (params: { subject?: string; sender?: string; body: string }) =>
+    request<{ trades: import('./types').EmailStockTradeCandidate[]; engine?: string; warning?: string }>(
+      '/api/grids/parse-email-trade-text',
+      { method: 'POST', body: JSON.stringify(params) },
+    ),
+  parseGridEmailTradePdf: async (file: File, pdfPassword = '') => {
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('pdf_password', pdfPassword);
+    const resp = await fetch('/api/grids/parse-email-trade-pdf', {
+      method: 'POST',
+      credentials: 'same-origin',
+      body: fd,
+    });
+    if (!resp.ok) {
+      if (resp.status === 401) {
+        unauthorizedHandler?.();
+      }
+      let msg = `PDF 解析失败 (${resp.status})`;
+      try {
+        const d = await resp.json();
+        msg = d.detail || msg;
+      } catch {
+        // ignore
+      }
+      throw new Error(msg);
+    }
+    return resp.json() as Promise<{ trades: import('./types').EmailStockTradeCandidate[]; extracted_preview: string }>;
+  },
+  importGridEmailTrades: (payload: {
+    trades: import('./types').EmailStockTradeCandidate[];
+    strategy_id?: number;
+    auto_create_missing?: boolean;
+    default_step_pct?: number;
+    broker_tag?: string;
+  }) =>
+    request<import('./types').GridEmailImportResponse>('/api/grids/import-email-trades', {
+      method: 'POST',
+      body: JSON.stringify(payload),
     }),
 
   resetData: (reseed = false) =>

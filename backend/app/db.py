@@ -466,6 +466,7 @@ def init_db(seed_demo: bool = True) -> None:
                 quote_name TEXT DEFAULT '',
                 price_updated_at TEXT DEFAULT '',
                 ibkr_auto_sync INTEGER NOT NULL DEFAULT 1,
+                broker TEXT DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'active',
                 notes TEXT DEFAULT '',
                 created_at TEXT NOT NULL,
@@ -562,6 +563,8 @@ def init_db(seed_demo: bool = True) -> None:
         grid_cols = {r["name"] for r in conn.execute("PRAGMA table_info(grid_strategies)").fetchall()}
         if "ibkr_auto_sync" not in grid_cols:
             conn.execute("ALTER TABLE grid_strategies ADD COLUMN ibkr_auto_sync INTEGER NOT NULL DEFAULT 1")
+        if "broker" not in grid_cols:
+            conn.execute("ALTER TABLE grid_strategies ADD COLUMN broker TEXT DEFAULT ''")
         st_cols = {r["name"] for r in conn.execute("PRAGMA table_info(stock_trades)").fetchall()}
         if "source_type" not in st_cols:
             conn.execute("ALTER TABLE stock_trades ADD COLUMN source_type TEXT NOT NULL DEFAULT 'manual'")

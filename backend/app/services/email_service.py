@@ -4,6 +4,7 @@ import hashlib
 import html
 from html.parser import HTMLParser
 import imaplib
+import io
 import re
 from datetime import datetime, timedelta
 from email.header import decode_header
@@ -360,6 +361,35 @@ def _fetch_raw_emails_sync(
     return fetched
 
 
+def _extract_pdf_text(raw_bytes: bytes, passwords: Optional[List[str]] = None) -> Tuple[str, str]:
+    """Extract text from a PDF attachment (supporting optional password decryption)."""
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return "", ""
+    try:
+        reader = PdfReader(io.BytesIO(raw_bytes))
+        if reader.is_encrypted:
+            unlocked = False
+            for pwd in [p for p in (passwords or []) if p] + [""]:
+                try:
+                    if reader.decrypt(pwd) != 0:
+                        unlocked = True
+                        break
+                except Exception:
+                    continue
+            if not unlocked:
+                return "", "PDF 附件已加密，请在密码框填写解压/打开密码"
+        pages = []
+        for page in reader.pages[:20]:
+            txt = (page.extract_text() or "").strip()
+            if txt:
+                pages.append(txt)
+        return "\n".join(pages), ""
+    except Exception as exc:
+        return "", f"PDF 附件解析失败: {exc}"
+
+
 async def fetch_and_parse_emails(
     settings: Dict[str, str],
     existing_refs: Set[str],
@@ -371,6 +401,7 @@ async def fetch_and_parse_emails(
     include_body_ai: bool = True,
     unread_only: bool = False,
     skip_already_synced: bool = False,
+    existing_stock_refs: Optional[Set[str]] = None,
 ) -> Dict[str, Any]:
     effective_zip_pwd = zip_password or settings.get("email_bill_zip_password") or ""
     raw_emails = await asyncio.to_thread(
@@ -385,7 +416,9 @@ async def fetch_and_parse_emails(
     email_summaries: List[Dict[str, Any]] = []
     all_txs: List[Dict[str, Any]] = []
     all_reminders: List[Dict[str, Any]] = []
+    all_stock_trades: List[Dict[str, Any]] = []
     warnings: List[str] = []
+    stock_refs = existing_stock_refs or set()
 
     for item in raw_emails:
         uid = item["uid"]
@@ -405,10 +438,19 @@ async def fetch_and_parse_emails(
 
         email_tx_count = 0
         email_rem_count = 0
+        email_stock_count = 0
+        pdf_texts: List[str] = []
 
-        # 1. Parse bill attachments (.zip / .csv / .xlsx)
+        # 1. Parse bill attachments (.zip / .csv / .xlsx / .pdf)
         for fname, raw_bytes in attachments:
             lower_fn = fname.lower()
+            if lower_fn.endswith(".pdf"):
+                ptxt, perr = _extract_pdf_text(raw_bytes, [effective_zip_pwd])
+                if perr:
+                    warnings.append(f"{fname}: {perr}")
+                elif ptxt.strip():
+                    pdf_texts.append(f"[PDF附件: {fname}]\n{ptxt.strip()}")
+                continue
             if not lower_fn.endswith((".zip", ".csv", ".xlsx")):
                 continue
             parsed = parse_bill_file(
@@ -425,17 +467,22 @@ async def fetch_and_parse_emails(
                 all_txs.append(tx)
                 email_tx_count += 1
 
-        # 2. Parse email body for bills / itineraries / reminders
-        should_parse_body = include_body_ai and bool(body.strip()) and (
+        combined_body = body
+        if pdf_texts:
+            combined_body = (body + "\n\n" + "\n\n".join(pdf_texts)).strip()
+
+        # 2. Parse email body (and extracted PDF text) for bills / itineraries / reminders / stock trades
+        should_parse_body = include_body_ai and bool(combined_body.strip()) and (
             email_tx_count == 0
-            or any(k in subject for k in ("账单", "还款", "行程", "机票", "火车", "缴费", "提醒", "发票", "工资"))
+            or bool(pdf_texts)
+            or any(k in subject for k in ("账单", "还款", "行程", "机票", "火车", "缴费", "提醒", "发票", "工资", "股票", "证券", "證券", "成交", "HSBC", "汇丰", "滙豐"))
         )
         if should_parse_body:
             body_res = await extract_from_email_content(
                 subject=subject,
                 sender=sender,
                 received_at=item["received_at"],
-                body_text=body,
+                body_text=combined_body,
                 settings=settings,
             )
             for tx in body_res.get("transactions", []):
@@ -454,6 +501,16 @@ async def fetch_and_parse_emails(
                 all_reminders.append(rem)
                 email_rem_count += 1
 
+            for st in body_res.get("stock_trades", []):
+                fp_stk = f"email_stk|{uid}|{st.get('side')}|{st.get('symbol')}|{st.get('price')}|{st.get('quantity')}|{st.get('traded_at')}"
+                stk_ref = "email_stk:" + hashlib.sha256(fp_stk.encode("utf-8")).hexdigest()[:16]
+                st["external_ref"] = stk_ref
+                st["already_imported"] = stk_ref in stock_refs
+                st["email_subject"] = subject
+                st["email_uid"] = uid
+                all_stock_trades.append(st)
+                email_stock_count += 1
+
         email_summaries.append(
             {
                 "uid": uid,
@@ -464,7 +521,8 @@ async def fetch_and_parse_emails(
                 "already_synced": uid in synced_uids,
                 "parsed_tx_count": email_tx_count,
                 "parsed_rem_count": email_rem_count,
-                "body_preview": body[:600],
+                "parsed_stock_count": email_stock_count,
+                "body_preview": combined_body[:600],
             }
         )
 
@@ -472,6 +530,7 @@ async def fetch_and_parse_emails(
         "emails": email_summaries,
         "transactions": all_txs,
         "reminders": all_reminders,
+        "stock_trades": all_stock_trades,
         "warnings": list(dict.fromkeys(warnings)),
     }
 
@@ -501,6 +560,7 @@ async def fetch_and_parse_multi_emails(
     include_body_ai: bool = True,
     unread_only: bool = False,
     skip_already_synced: bool = False,
+    existing_stock_refs: Optional[Set[str]] = None,
 ) -> Dict[str, Any]:
     if not accounts:
         raise ValueError("尚未配置任何可用的邮箱账号，请先在「系统设置 → 邮箱 & Bark」添加至少一个邮箱。")
@@ -508,6 +568,7 @@ async def fetch_and_parse_multi_emails(
     all_emails: List[Dict[str, Any]] = []
     all_txs: List[Dict[str, Any]] = []
     all_rems: List[Dict[str, Any]] = []
+    all_stock_trades: List[Dict[str, Any]] = []
     all_warnings: List[str] = []
     scanned_accounts: List[str] = []
     succeeded = 0
@@ -529,6 +590,7 @@ async def fetch_and_parse_multi_emails(
                 include_body_ai=include_body_ai,
                 unread_only=unread_only,
                 skip_already_synced=skip_already_synced,
+                existing_stock_refs=existing_stock_refs,
             )
             succeeded += 1
             scanned_accounts.append(acct_label)
@@ -544,6 +606,10 @@ async def fetch_and_parse_multi_emails(
                 rm["email_account_id"] = acct_id
                 rm["email_account_name"] = acct_label
                 all_rems.append(rm)
+            for st in res.get("stock_trades", []):
+                st["email_account_id"] = acct_id
+                st["email_account_name"] = acct_label
+                all_stock_trades.append(st)
             for w in res.get("warnings", []):
                 all_warnings.append(f"[{acct_label}] {w}")
         except Exception as exc:
@@ -561,6 +627,7 @@ async def fetch_and_parse_multi_emails(
         "emails": all_emails,
         "transactions": all_txs,
         "reminders": all_rems,
+        "stock_trades": all_stock_trades,
         "detected_cards": summarize_detected_cards(all_txs),
         "warnings": list(dict.fromkeys(all_warnings)),
         "scanned_accounts": scanned_accounts,

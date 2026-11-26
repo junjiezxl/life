@@ -199,13 +199,31 @@ class EmailSyncLogInput(BaseModel):
     rem_imported: int = 0
 
 
+class EmailStockTradeItem(BaseModel):
+    symbol: str = Field(..., min_length=1, max_length=24)
+    name: str = ""
+    market: str = ""  # CN | HK | US (auto-inferred if blank)
+    currency: str = ""
+    side: Literal["buy", "sell"]
+    price: float = Field(..., gt=0)
+    quantity: float = Field(..., gt=0)
+    fee: float = Field(0.0, ge=0)
+    tax: float = Field(0.0, ge=0)
+    broker: str = "HSBC"
+    traded_at: str = ""
+    external_ref: str = ""
+    note: str = ""
+
+
 class EmailImportRequest(BaseModel):
     transactions: List[TransactionCreate] = Field(default_factory=list)
     reminders: List[ReminderCreate] = Field(default_factory=list)
+    stock_trades: List[EmailStockTradeItem] = Field(default_factory=list)
     account_id: Optional[int] = None
     skip_duplicates: bool = True
     auto_create_accounts: bool = True
     auto_reconcile: bool = True
+    auto_create_grid_strategies: bool = False
     email_logs: List[EmailSyncLogInput] = Field(default_factory=list)
 
 
@@ -479,6 +497,7 @@ class GridStrategyCreate(BaseModel):
     stamp_tax_side: Literal["sell", "both"] = "sell"
     current_price: float = Field(0.0, ge=0)
     ibkr_auto_sync: bool = True
+    broker: str = Field("", max_length=40)
     status: Literal["active", "paused", "closed"] = "active"
     notes: str = ""
 
@@ -500,6 +519,7 @@ class GridStrategyUpdate(BaseModel):
     stamp_tax_side: Optional[Literal["sell", "both"]] = None
     current_price: Optional[float] = Field(None, ge=0)
     ibkr_auto_sync: Optional[bool] = None
+    broker: Optional[str] = Field(None, max_length=40)
     status: Optional[Literal["active", "paused", "closed"]] = None
     notes: Optional[str] = None
 
@@ -509,6 +529,23 @@ class GridIbkrSyncRequest(BaseModel):
     create_symbols: List[str] = Field(default_factory=list)
     refresh_flex_first: bool = False
     default_step_pct: float = Field(3.0, gt=0.1, le=50.0)
+
+
+class GridEmailFetchRequest(BaseModel):
+    days: int = Field(30, ge=1, le=365)
+    limit: int = Field(50, ge=1, le=150)
+    keyword: str = ""
+    pdf_password: str = ""
+    account_id: Optional[int] = None
+    include_body_ai: bool = True
+
+
+class GridEmailImportRequest(BaseModel):
+    trades: List[EmailStockTradeItem] = Field(default_factory=list)
+    strategy_id: Optional[int] = None
+    auto_create_missing: bool = True
+    default_step_pct: float = Field(3.0, gt=0.1, le=50.0)
+    broker_tag: str = ""
 
 
 class StockTradeCreate(BaseModel):

@@ -565,8 +565,8 @@ def sync_ibkr_to_grids(
                 """INSERT INTO grid_strategies
                 (name, symbol, market, currency, grid_type, lower_price, upper_price, step_value, shares_per_grid,
                  base_price, fee_rate, min_fee, stamp_tax_rate, stamp_tax_side, current_price, price_updated_at,
-                 ibkr_auto_sync, status, notes, created_at, updated_at)
-                VALUES (?, ?, ?, ?, 'geometric', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'active', ?, ?, ?)""",
+                 ibkr_auto_sync, broker, status, notes, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'geometric', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'IBKR', 'active', ?, ?, ?)""",
                 (
                     name,
                     c["symbol"],
@@ -721,4 +721,174 @@ def sync_ibkr_to_grids(
         "skipped_duplicates": skipped_duplicates,
         "updated_prices": updated_prices,
         "matched_strategies": matched_strategies,
+    }
+
+
+def _find_matching_grid_for_email_trade(
+    strategies: List[Dict[str, Any]],
+    symbol: str,
+    market: str,
+    broker: str = "",
+) -> Optional[Dict[str, Any]]:
+    target_key = canonical_symbol_key(symbol, market)
+    matches = [
+        s
+        for s in strategies
+        if canonical_symbol_key(s["symbol"], s["market"]) == target_key and s.get("status", "active") != "closed"
+    ]
+    if not matches:
+        return None
+    b_low = (broker or "").strip().lower()
+    if b_low:
+        for s in matches:
+            sb = (s.get("broker") or "").strip().lower()
+            if sb and (sb in b_low or b_low in sb or ("hsbc" in sb and "hsbc" in b_low) or ("汇丰" in sb and ("汇丰" in b_low or "hsbc" in b_low))):
+                return s
+    # Prefer non-IBKR or unbranded grid over IBKR-specific grid when importing HSBC/broker email trades
+    for s in matches:
+        sb = (s.get("broker") or "").strip().lower()
+        if "ibkr" not in sb and "盈透" not in sb:
+            return s
+    return matches[0]
+
+
+def sync_email_stock_trades_to_grids(
+    conn: Any,
+    trades: List[Dict[str, Any]],
+    strategy_id: Optional[int] = None,
+    auto_create_missing: bool = True,
+    default_step_pct: float = 3.0,
+    broker_tag: str = "",
+) -> Dict[str, Any]:
+    """Import stock/ETF trades parsed from HSBC / broker emails into grid strategies, deduplicated by external_ref."""
+    import hashlib
+    from ..db import now_iso
+
+    ts = now_iso()
+    created_strategies: List[Dict[str, Any]] = []
+    imported_trades = 0
+    skipped_duplicates = 0
+    unmatched_count = 0
+
+    strat_rows = conn.execute("SELECT * FROM grid_strategies ORDER BY id ASC").fetchall()
+    strategies = [dict(r) for r in strat_rows]
+    target_fixed = next((s for s in strategies if int(s["id"]) == strategy_id), None) if strategy_id is not None else None
+
+    for tr in trades:
+        raw_sym = str(tr.get("symbol") or "").strip().upper()
+        side = str(tr.get("side") or "").strip().lower()
+        try:
+            price = round(float(tr.get("price") or 0), 4)
+            qty = round(abs(float(tr.get("quantity") or 0)), 4)
+        except (TypeError, ValueError):
+            continue
+        if not raw_sym or side not in ("buy", "sell") or price <= 0 or qty <= 0:
+            continue
+
+        market = str(tr.get("market") or "").strip().upper()
+        currency = str(tr.get("currency") or "").strip().upper()
+        if market not in ("CN", "HK", "US"):
+            if currency == "HKD" or (raw_sym.isdigit() and len(raw_sym) <= 5):
+                market = "HK"
+            elif currency in ("CNY", "RMB", "CNH") or (raw_sym.isdigit() and len(raw_sym) == 6):
+                market = "CN"
+            else:
+                market = "US"
+        if not currency:
+            currency = MARKET_CURRENCY.get(market, "HKD")
+
+        disp_sym = format_display_symbol(raw_sym, market)
+        broker = (broker_tag or str(tr.get("broker") or "") or "汇丰 (HSBC)").strip()
+
+        strat = target_fixed or _find_matching_grid_for_email_trade(strategies, disp_sym, market, broker=broker)
+        if strat is None:
+            if not auto_create_missing:
+                unmatched_count += 1
+                continue
+            low_p = round(price * 0.80, 4)
+            high_p = round(price * 1.25, 4)
+            fee_rate, min_fee, tax_rate, tax_side = _ibkr_fee_defaults(market)
+            strat_name = (str(tr.get("name") or "").strip() or disp_sym)[:40]
+            cur = conn.execute(
+                """INSERT INTO grid_strategies
+                (name, symbol, market, currency, grid_type, lower_price, upper_price, step_value, shares_per_grid,
+                 base_price, fee_rate, min_fee, stamp_tax_rate, stamp_tax_side, current_price, price_updated_at,
+                 ibkr_auto_sync, broker, status, notes, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'geometric', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 'active', ?, ?, ?)""",
+                (
+                    strat_name,
+                    disp_sym,
+                    market,
+                    currency,
+                    low_p,
+                    high_p,
+                    round(float(default_step_pct or 3.0), 2),
+                    qty,
+                    price,
+                    fee_rate,
+                    min_fee,
+                    tax_rate,
+                    tax_side,
+                    price,
+                    ts,
+                    broker[:40],
+                    f"由 {broker} 邮件自动创建，可按需调整网格区间与步长",
+                    ts,
+                    ts,
+                ),
+            )
+            strat = dict(conn.execute("SELECT * FROM grid_strategies WHERE id = ?", (cur.lastrowid,)).fetchone())
+            strategies.append(strat)
+            created_strategies.append(strat)
+
+        sid = int(strat["id"])
+        traded_at = str(tr.get("traded_at") or "").strip().replace("/", "-")[:16] or ts[:16].replace("T", " ")
+        ext_ref = str(tr.get("external_ref") or "").strip()
+        if not ext_ref:
+            fp = f"email_stk|manual|{sid}|{side}|{disp_sym}|{price:.4f}|{qty:.4f}|{traded_at[:10]}"
+            ext_ref = "email_stk:" + hashlib.sha256(fp.encode("utf-8")).hexdigest()[:16]
+
+        dup = conn.execute(
+            "SELECT 1 FROM stock_trades WHERE strategy_id = ? AND external_ref = ?",
+            (sid, ext_ref),
+        ).fetchone()
+        if dup:
+            skipped_duplicates += 1
+            continue
+
+        raw_fee = tr.get("fee")
+        raw_tax = tr.get("tax")
+        auto_fee, auto_tax = calc_trade_fees(strat, side, price, qty)
+        fee = round(abs(float(raw_fee)), 2) if (raw_fee is not None and float(raw_fee) > 0) else auto_fee
+        tax = round(abs(float(raw_tax)), 2) if (raw_tax is not None and float(raw_tax) > 0) else auto_tax
+
+        levels = build_grid_levels(
+            strat.get("lower_price") or 0,
+            strat.get("upper_price") or 0,
+            strat.get("grid_type") or "arithmetic",
+            strat.get("step_value") or 0,
+        )
+        lvl = nearest_level(levels, price)
+        note = str(tr.get("note") or f"{broker} 邮件导入").strip()[:120]
+
+        conn.execute(
+            """INSERT INTO stock_trades
+            (strategy_id, side, price, quantity, fee, tax, grid_level, traded_at, source_type, external_ref, note, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'email', ?, ?, ?)""",
+            (sid, side, price, qty, fee, tax, lvl, traded_at, ext_ref, note, ts),
+        )
+        imported_trades += 1
+
+        if float(strat.get("current_price") or 0) <= 0:
+            conn.execute(
+                "UPDATE grid_strategies SET current_price = ?, price_updated_at = ?, updated_at = ? WHERE id = ?",
+                (price, ts, ts, sid),
+            )
+            strat["current_price"] = price
+
+    return {
+        "created_strategies": created_strategies,
+        "imported_trades": imported_trades,
+        "skipped_duplicates": skipped_duplicates,
+        "unmatched_count": unmatched_count,
     }

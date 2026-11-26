@@ -500,6 +500,7 @@ export interface EmailFetchResponse {
   emails: EmailScanSummary[];
   transactions: ParsedBillTransaction[];
   reminders: NoteCandidate[];
+  stock_trades?: EmailStockTradeCandidate[];
   detected_cards?: DetectedCardSummary[];
   warnings: string[];
 }
@@ -666,6 +667,7 @@ export interface GridStrategy {
   quote_name: string;
   price_updated_at: string;
   ibkr_auto_sync?: number | boolean;
+  broker?: string;
   status: 'active' | 'paused' | 'closed';
   notes: string;
   created_at: string;
@@ -821,6 +823,43 @@ export interface GridIbkrSyncResponse {
   updated_prices: number;
   matched_strategies: number;
   flex_refreshed: boolean;
+  detail: GridDetailResponse | null;
+}
+
+export interface EmailStockTradeCandidate {
+  symbol: string;
+  name: string;
+  market: 'CN' | 'HK' | 'US';
+  currency: string;
+  side: 'buy' | 'sell';
+  price: number;
+  quantity: number;
+  fee: number;
+  tax: number;
+  broker: string;
+  traded_at: string;
+  external_ref: string;
+  note: string;
+  already_imported?: boolean;
+  email_subject?: string;
+  email_uid?: string;
+  email_account_name?: string;
+  matched_strategy_id?: number | null;
+  matched_strategy_name?: string;
+}
+
+export interface GridEmailFetchResponse {
+  emails_scanned: number;
+  scanned_accounts: string[];
+  trades: EmailStockTradeCandidate[];
+  warnings: string[];
+}
+
+export interface GridEmailImportResponse {
+  created_strategies: GridStrategy[];
+  imported_trades: number;
+  skipped_duplicates: number;
+  unmatched_count: number;
   detail: GridDetailResponse | null;
 }
 

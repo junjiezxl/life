@@ -36,6 +36,8 @@ from .models import (
     EmailFetchRequest,
     EmailImportRequest,
     EmailParseTextRequest,
+    GridEmailFetchRequest,
+    GridEmailImportRequest,
     GridIbkrSyncRequest,
     GridStrategyCreate,
     GridStrategyUpdate,
@@ -107,6 +109,7 @@ from .services.debt_planner_service import (
     plan_optimal_repayment_paths,
 )
 from .services.email_service import (
+    _extract_pdf_text,
     build_account_imap_settings,
     fetch_and_parse_emails,
     fetch_and_parse_multi_emails,
@@ -122,6 +125,7 @@ from .services.grid_service import (
     infer_market_from_ibkr,
     list_ibkr_grid_candidates,
     nearest_level,
+    sync_email_stock_trades_to_grids,
     sync_ibkr_to_grids,
     to_tencent_code,
 )
@@ -280,6 +284,7 @@ async def _email_auto_sync_loop() -> None:
                     with get_conn() as conn:
                         existing_refs = _get_existing_external_refs(conn)
                         synced_uids = _get_synced_email_uids(conn)
+                        existing_stk_refs = _get_existing_stock_external_refs(conn)
                     res = await fetch_and_parse_multi_emails(
                         base_settings=settings,
                         accounts=accounts,
@@ -289,8 +294,9 @@ async def _email_auto_sync_loop() -> None:
                         limit=20,
                         include_body_ai=True,
                         skip_already_synced=True,
+                        existing_stock_refs=existing_stk_refs,
                     )
-                    if res["emails"] or res["transactions"] or res["reminders"]:
+                    if res["emails"] or res["transactions"] or res["reminders"] or res.get("stock_trades"):
                         tx_fields = (
                             "type",
                             "amount",
@@ -326,6 +332,12 @@ async def _email_auto_sync_loop() -> None:
                                     for e in res["emails"]
                                 ],
                             )
+                            if res.get("stock_trades"):
+                                sync_email_stock_trades_to_grids(
+                                    conn,
+                                    res["stock_trades"],
+                                    auto_create_missing=False,
+                                )
         except Exception:
             pass
         await asyncio.sleep(interval_min * 60)
@@ -1444,6 +1456,7 @@ async def chat_endpoint(payload: ChatRequest) -> Dict[str, Any]:
                 with get_conn() as conn:
                     existing_refs = _get_existing_external_refs(conn)
                     synced_uids = _get_synced_email_uids(conn)
+                    existing_stk_refs = _get_existing_stock_external_refs(conn)
                 res = await fetch_and_parse_multi_emails(
                     base_settings=settings,
                     accounts=target_mailboxes,
@@ -1453,10 +1466,12 @@ async def chat_endpoint(payload: ChatRequest) -> Dict[str, Any]:
                     limit=30,
                     include_body_ai=True,
                     skip_already_synced=False,
+                    existing_stock_refs=existing_stk_refs,
                 )
                 emails = res.get("emails") or []
                 txs = res.get("transactions") or []
                 rems = res.get("reminders") or []
+                stk_trades = res.get("stock_trades") or []
                 scanned_names = res.get("scanned_accounts") or []
                 acct_prefix = f"（邮箱：{'、'.join(scanned_names)}）" if scanned_names else ""
 
@@ -1519,6 +1534,15 @@ async def chat_endpoint(payload: ChatRequest) -> Dict[str, Any]:
                             skip_duplicates=True,
                             logs=logs,
                         )
+                        stock_sync_res = (
+                            sync_email_stock_trades_to_grids(
+                                conn,
+                                stk_trades,
+                                auto_create_missing=any(k in msg_low for k in ("汇丰", "hsbc", "股票", "网格")),
+                            )
+                            if stk_trades
+                            else {}
+                        )
                     created_transactions = batch_res["transactions"]
                     created_reminders = batch_res["reminders"]
                     for tx in created_transactions:
@@ -1571,7 +1595,9 @@ async def chat_endpoint(payload: ChatRequest) -> Dict[str, Any]:
                         lines.append(f"• 已与支付宝/微信账单多方核对匹配 {rec['newly_matched_count']} 笔（自动去重不重复计入总支出）。")
                     if created_reminders:
                         lines.append(f"• 同步生成提醒 {len(created_reminders)} 条。")
-                    if not txs and emails:
+                    if stock_sync_res.get("imported_trades", 0) > 0:
+                        lines.append(f"• 已同步证券/汇丰股票交易 {stock_sync_res['imported_trades']} 笔至「股票网格记账」。")
+                    if not txs and not stk_trades and emails:
                         sample_subjs = "、".join(f"《{e['subject'][:26]}》" for e in emails[:5])
                         lines.append(f"• 最近扫描到的邮件主题：{sample_subjs}")
                     if res.get("warnings"):
@@ -1593,6 +1619,8 @@ async def chat_endpoint(payload: ChatRequest) -> Dict[str, Any]:
                         lines.append(f"• 暂未识别到明确消费/入账流水。最近邮件主题：{sample_subjs}")
                     if rems:
                         lines.append(f"• 另发现 {len(rems)} 条待办/账单提醒线索。")
+                    if stk_trades:
+                        lines.append(f"• 识别出 {len(stk_trades)} 笔证券/汇丰股票成交（可回复「计入个人财务与股票网格」或在「股票网格记账 → 汇丰/邮件导入」写入）。")
                     if res.get("warnings"):
                         lines.append(f"• 部分提示：{'；'.join(res['warnings'][:3])}")
                     reply_text = "\n".join(lines)
@@ -2375,6 +2403,11 @@ def _get_existing_external_refs(conn: Any) -> Set[str]:
     return {r["external_ref"] for r in rows}
 
 
+def _get_existing_stock_external_refs(conn: Any) -> Set[str]:
+    rows = conn.execute("SELECT external_ref FROM stock_trades WHERE external_ref IS NOT NULL AND external_ref != ''").fetchall()
+    return {r["external_ref"] for r in rows}
+
+
 def _get_synced_email_uids(conn: Any) -> Set[str]:
     rows = conn.execute("SELECT message_uid FROM email_sync_logs WHERE message_uid IS NOT NULL").fetchall()
     return {r["message_uid"] for r in rows}
@@ -2743,6 +2776,7 @@ async def fetch_parse_emails_endpoint(payload: EmailFetchRequest) -> Dict[str, A
     with get_conn() as conn:
         existing_refs = _get_existing_external_refs(conn)
         synced_uids = _get_synced_email_uids(conn)
+        existing_stk_refs = _get_existing_stock_external_refs(conn)
     try:
         return await fetch_and_parse_multi_emails(
             base_settings=settings,
@@ -2756,6 +2790,7 @@ async def fetch_parse_emails_endpoint(payload: EmailFetchRequest) -> Dict[str, A
             include_body_ai=payload.include_body_ai,
             unread_only=payload.unread_only,
             skip_already_synced=False,
+            existing_stock_refs=existing_stk_refs,
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -2774,6 +2809,7 @@ async def parse_email_text_endpoint(payload: EmailParseTextRequest) -> Dict[str,
     )
     with get_conn() as conn:
         existing_refs = _get_existing_external_refs(conn)
+        existing_stk_refs = _get_existing_stock_external_refs(conn)
     for tx in res.get("transactions", []):
         fp = hashlib.sha256(
             f"{payload.subject}|{tx.get('occurred_at') or ''}|{tx.get('card_last4') or ''}|{tx.get('amount')}|{tx.get('description') or ''}".encode("utf-8")
@@ -2781,6 +2817,13 @@ async def parse_email_text_endpoint(payload: EmailParseTextRequest) -> Dict[str,
         ext_ref = tx.get("external_ref") or f"email_text:{fp}"
         tx["external_ref"] = ext_ref
         tx["already_imported"] = ext_ref in existing_refs
+    for st in res.get("stock_trades", []):
+        fp_stk = hashlib.sha256(
+            f"email_stk|{payload.subject}|{st.get('side')}|{st.get('symbol')}|{st.get('price')}|{st.get('quantity')}|{st.get('traded_at')}".encode("utf-8")
+        ).hexdigest()[:16]
+        stk_ref = st.get("external_ref") or f"email_stk:{fp_stk}"
+        st["external_ref"] = stk_ref
+        st["already_imported"] = stk_ref in existing_stk_refs
     res["detected_cards"] = summarize_detected_cards(res.get("transactions", []))
     return res
 
@@ -2798,6 +2841,14 @@ async def import_email_items_endpoint(payload: EmailImportRequest) -> Dict[str, 
             auto_create_accounts=payload.auto_create_accounts,
             auto_reconcile=payload.auto_reconcile,
         )
+        stock_sync: Dict[str, Any] = {}
+        if payload.stock_trades:
+            stock_sync = sync_email_stock_trades_to_grids(
+                conn,
+                [s.model_dump() for s in payload.stock_trades],
+                auto_create_missing=payload.auto_create_grid_strategies,
+            )
+    res["stock_sync"] = stock_sync
     await _push_new_reminders_bark(res.get("reminders", []), prefix="📧 邮件提醒：")
     return res
 
@@ -3720,8 +3771,8 @@ def create_grid_strategy(payload: GridStrategyCreate) -> Dict[str, Any]:
         cur = conn.execute(
             """INSERT INTO grid_strategies
             (name, symbol, market, currency, grid_type, lower_price, upper_price, step_value, shares_per_grid,
-             base_price, fee_rate, min_fee, stamp_tax_rate, stamp_tax_side, current_price, ibkr_auto_sync, status, notes, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             base_price, fee_rate, min_fee, stamp_tax_rate, stamp_tax_side, current_price, ibkr_auto_sync, broker, status, notes, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 name,
                 sym,
@@ -3739,6 +3790,7 @@ def create_grid_strategy(payload: GridStrategyCreate) -> Dict[str, Any]:
                 payload.stamp_tax_side,
                 payload.current_price,
                 1 if payload.ibkr_auto_sync else 0,
+                payload.broker.strip(),
                 payload.status,
                 payload.notes.strip(),
                 ts,
@@ -3746,6 +3798,130 @@ def create_grid_strategy(payload: GridStrategyCreate) -> Dict[str, Any]:
             ),
         )
         return _load_grid_detail(conn, int(cur.lastrowid))
+
+
+@app.post("/api/grids/fetch-email-trades")
+async def fetch_grid_email_trades(payload: GridEmailFetchRequest) -> Dict[str, Any]:
+    settings = get_all_settings()
+    accounts = _get_active_email_accounts(settings, account_id=payload.account_id)
+    with get_conn() as conn:
+        existing_refs = _get_existing_external_refs(conn)
+        synced_uids = _get_synced_email_uids(conn)
+        existing_stk_refs = _get_existing_stock_external_refs(conn)
+        strats = [_row_to_dict(r) for r in conn.execute("SELECT id, name, symbol, market, broker FROM grid_strategies").fetchall()]
+
+    try:
+        res = await fetch_and_parse_multi_emails(
+            base_settings=settings,
+            accounts=accounts,
+            existing_refs=existing_refs,
+            synced_uids=synced_uids,
+            days=payload.days,
+            limit=payload.limit,
+            keyword=payload.keyword,
+            zip_password=payload.pdf_password,
+            include_body_ai=payload.include_body_ai,
+            unread_only=False,
+            skip_already_synced=False,
+            existing_stock_refs=existing_stk_refs,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    trades = res.get("stock_trades", [])
+    for st in trades:
+        key = canonical_symbol_key(st.get("symbol", ""), st.get("market", "HK"))
+        matched = [s for s in strats if canonical_symbol_key(s["symbol"], s["market"]) == key]
+        st["matched_strategy_id"] = matched[0]["id"] if matched else None
+        st["matched_strategy_name"] = matched[0]["name"] if matched else ""
+
+    return {
+        "emails_scanned": len(res.get("emails", [])),
+        "scanned_accounts": res.get("scanned_accounts", []),
+        "trades": trades,
+        "warnings": res.get("warnings", []),
+    }
+
+
+@app.post("/api/grids/parse-email-trade-text")
+async def parse_grid_email_trade_text(payload: EmailParseTextRequest) -> Dict[str, Any]:
+    settings = get_all_settings()
+    received_at = payload.received_at or datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
+    res = await extract_from_email_content(
+        subject=payload.subject,
+        sender=payload.sender,
+        received_at=received_at,
+        body_text=payload.body,
+        settings=settings,
+    )
+    with get_conn() as conn:
+        existing_stk_refs = _get_existing_stock_external_refs(conn)
+        strats = [_row_to_dict(r) for r in conn.execute("SELECT id, name, symbol, market, broker FROM grid_strategies").fetchall()]
+    trades = res.get("stock_trades", [])
+    for st in trades:
+        fp_stk = hashlib.sha256(
+            f"email_stk|{payload.subject}|{st.get('side')}|{st.get('symbol')}|{st.get('price')}|{st.get('quantity')}|{st.get('traded_at')}".encode("utf-8")
+        ).hexdigest()[:16]
+        stk_ref = st.get("external_ref") or f"email_stk:{fp_stk}"
+        st["external_ref"] = stk_ref
+        st["already_imported"] = stk_ref in existing_stk_refs
+        key = canonical_symbol_key(st.get("symbol", ""), st.get("market", "HK"))
+        matched = [s for s in strats if canonical_symbol_key(s["symbol"], s["market"]) == key]
+        st["matched_strategy_id"] = matched[0]["id"] if matched else None
+        st["matched_strategy_name"] = matched[0]["name"] if matched else ""
+    return {"trades": trades, "engine": res.get("engine"), "warning": res.get("warning")}
+
+
+@app.post("/api/grids/parse-email-trade-pdf")
+async def parse_grid_email_trade_pdf(
+    file: UploadFile = File(...),
+    pdf_password: str = Form(""),
+) -> Dict[str, Any]:
+    raw = await file.read()
+    settings = get_all_settings()
+    text, err = _extract_pdf_text(raw, [pdf_password.strip(), settings.get("email_bill_zip_password") or ""])
+    if err:
+        raise HTTPException(status_code=400, detail=err)
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="未能从 PDF 中提取到文本（可能是纯图片扫描件）")
+    res = await extract_from_email_content(
+        subject=file.filename or "券商成交单PDF",
+        sender="PDF上传",
+        received_at=datetime.now().astimezone().strftime("%Y-%m-%d %H:%M"),
+        body_text=text,
+        settings=settings,
+    )
+    with get_conn() as conn:
+        existing_stk_refs = _get_existing_stock_external_refs(conn)
+        strats = [_row_to_dict(r) for r in conn.execute("SELECT id, name, symbol, market, broker FROM grid_strategies").fetchall()]
+    trades = res.get("stock_trades", [])
+    for st in trades:
+        fp_stk = hashlib.sha256(
+            f"email_stk|{file.filename}|{st.get('side')}|{st.get('symbol')}|{st.get('price')}|{st.get('quantity')}|{st.get('traded_at')}".encode("utf-8")
+        ).hexdigest()[:16]
+        stk_ref = st.get("external_ref") or f"email_stk:{fp_stk}"
+        st["external_ref"] = stk_ref
+        st["already_imported"] = stk_ref in existing_stk_refs
+        key = canonical_symbol_key(st.get("symbol", ""), st.get("market", "HK"))
+        matched = [s for s in strats if canonical_symbol_key(s["symbol"], s["market"]) == key]
+        st["matched_strategy_id"] = matched[0]["id"] if matched else None
+        st["matched_strategy_name"] = matched[0]["name"] if matched else ""
+    return {"trades": trades, "extracted_preview": text[:500]}
+
+
+@app.post("/api/grids/import-email-trades")
+def import_grid_email_trades(payload: GridEmailImportRequest) -> Dict[str, Any]:
+    with get_conn() as conn:
+        res = sync_email_stock_trades_to_grids(
+            conn,
+            [t.model_dump() for t in payload.trades],
+            strategy_id=payload.strategy_id,
+            auto_create_missing=payload.auto_create_missing,
+            default_step_pct=payload.default_step_pct,
+            broker_tag=payload.broker_tag,
+        )
+        detail = _load_grid_detail(conn, payload.strategy_id) if payload.strategy_id is not None else None
+    return {**res, "detail": detail}
 
 
 @app.get("/api/grids/ibkr-candidates")
