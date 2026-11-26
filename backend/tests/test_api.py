@@ -2098,6 +2098,18 @@ class TestLifeHubAPI(unittest.TestCase):
         self.assertAlmostEqual(d4["strategy"]["current_price"], 3.85, places=4)
         self.assertTrue(d4["signals"]["buy_triggered"])  # remaining lot at 4.00 -> next buy 3.90 >= 3.85
 
+        # 4.1 Updating step_value (0.10 -> 0.05) recalculates levels AND re-maps existing buy trade grid_levels!
+        r_patch = self.client.patch(f"/api/grids/{sid}", json={"step_value": 0.05})
+        self.assertEqual(r_patch.status_code, 200, r_patch.text)
+        dp = r_patch.json()
+        self.assertAlmostEqual(dp["strategy"]["step_value"], 0.05, places=4)
+        self.assertEqual(dp["summary"]["grid_count"], 12)  # 3.60..4.20 at 0.05 step
+        # Remaining buy lot at 4.00 moves from old level 4 -> new level 8 (4.00), so next_buy=3.95, next_sell=4.05!
+        self.assertAlmostEqual(dp["signals"]["next_buy"]["price"], 3.95, places=4)
+        self.assertAlmostEqual(dp["signals"]["next_sell"]["price"], 4.05, places=4)
+        # Restore step_value to 0.10 before cleanup assertions
+        self.assertEqual(self.client.patch(f"/api/grids/{sid}", json={"step_value": 0.10}).status_code, 200)
+
         # 5. List portfolio overview + delete trade + delete strategy
         r_list = self.client.get("/api/grids")
         self.assertEqual(r_list.status_code, 200)

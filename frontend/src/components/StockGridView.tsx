@@ -465,7 +465,21 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
 
   const handleSaveStrategy = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!formSymbol.trim()) return;
+    if (!formSymbol.trim()) {
+      onNotify('请填写股票/ETF代码');
+      return;
+    }
+    const lowNum = Number(formLower || 0);
+    const highNum = Number(formUpper || 0);
+    const stepNum = Number(formStep || 0);
+    if (!Number.isFinite(lowNum) || !Number.isFinite(highNum) || !Number.isFinite(stepNum) || stepNum < 0) {
+      onNotify('请输入有效的区间价格与网格步长');
+      return;
+    }
+    if (highNum > 0 && lowNum > 0 && highNum <= lowNum) {
+      onNotify('网格上沿价必须大于下沿价');
+      return;
+    }
     setSavingStrat(true);
     try {
       const payload: Partial<GridStrategy> = {
@@ -473,9 +487,9 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
         symbol: formSymbol.trim().toUpperCase(),
         market: formMarket,
         grid_type: formGridType,
-        lower_price: Number(formLower || 0),
-        upper_price: Number(formUpper || 0),
-        step_value: Number(formStep || 0),
+        lower_price: lowNum,
+        upper_price: highNum,
+        step_value: stepNum,
         shares_per_grid: Number(formShares || 100),
         fee_rate: Number(formFeeRate || 0),
         min_fee: Number(formMinFee || 0),
@@ -1511,6 +1525,7 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
       {showModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4 backdrop-blur-[1px]">
           <form
+            noValidate
             onSubmit={handleSaveStrategy}
             className="w-full max-w-xl rounded-2xl bg-white p-6 shadow-xl space-y-4 max-h-[90vh] overflow-y-auto"
           >
@@ -1596,7 +1611,7 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
                 <label className="text-[11px] text-slate-500">区间下沿价</label>
                 <input
                   type="number"
-                  step="0.0001"
+                  step="any"
                   value={formLower}
                   onChange={(e) => setFormLower(e.target.value)}
                   placeholder="如 3.50"
@@ -1607,7 +1622,7 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
                 <label className="text-[11px] text-slate-500">区间上沿价</label>
                 <input
                   type="number"
-                  step="0.0001"
+                  step="any"
                   value={formUpper}
                   onChange={(e) => setFormUpper(e.target.value)}
                   placeholder="如 4.50"
@@ -1620,7 +1635,7 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
                 </label>
                 <input
                   type="number"
-                  step="0.0001"
+                  step="any"
                   value={formStep}
                   onChange={(e) => setFormStep(e.target.value)}
                   placeholder={formGridType === 'geometric' ? '如 3 (即3%)' : '如 0.10'}
@@ -1634,7 +1649,7 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
                 <label className="text-[11px] text-slate-500">每格股数</label>
                 <input
                   type="number"
-                  step="0.01"
+                  step="any"
                   value={formShares}
                   onChange={(e) => setFormShares(e.target.value)}
                   className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-xs font-mono"
@@ -1644,7 +1659,7 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
                 <label className="text-[11px] text-slate-500">佣金率（如 0.0001=万1）</label>
                 <input
                   type="number"
-                  step="0.00001"
+                  step="any"
                   value={formFeeRate}
                   onChange={(e) => setFormFeeRate(e.target.value)}
                   className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-xs font-mono"
@@ -1654,7 +1669,7 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
                 <label className="text-[11px] text-slate-500">最低佣金</label>
                 <input
                   type="number"
-                  step="0.01"
+                  step="any"
                   value={formMinFee}
                   onChange={(e) => setFormMinFee(e.target.value)}
                   className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-xs font-mono"
@@ -1664,7 +1679,7 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
                 <label className="text-[11px] text-slate-500">印花税率（0.0005=万5）</label>
                 <input
                   type="number"
-                  step="0.00001"
+                  step="any"
                   value={formTaxRate}
                   onChange={(e) => setFormTaxRate(e.target.value)}
                   className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-xs font-mono"
@@ -1688,7 +1703,7 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
                 <label className="text-[11px] text-slate-500">当前参考价（可选）</label>
                 <input
                   type="number"
-                  step="0.0001"
+                  step="any"
                   value={formCurPrice}
                   onChange={(e) => setFormCurPrice(e.target.value)}
                   placeholder="留空可稍后一键刷新"
@@ -1726,7 +1741,7 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
               <span>每次 IBKR Flex 同步时，自动将同代码的新成交记录写入该网格（自动去重）</span>
             </label>
 
-            {modalPreview && (
+            {modalPreview ? (
               <div className="rounded-xl bg-indigo-50/70 border border-indigo-200 p-3 text-xs text-indigo-900 flex flex-wrap gap-x-5 gap-y-1">
                 <span>
                   网格档位：<b>{modalPreview.levelCount}</b> 档（<b>{modalPreview.gridCount}</b> 格）
@@ -1738,7 +1753,11 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
                   满格最大需资金：<b>{formatCurrency(modalPreview.fullCap, (MARKET_META[formMarket] || MARKET_META.CN).currency)}</b>
                 </span>
               </div>
-            )}
+            ) : Number(formStep || 0) > 0 && (Number(formLower || 0) <= 0 || Number(formUpper || 0) <= Number(formLower || 0)) ? (
+              <div className="rounded-xl bg-amber-50 border border-amber-200 px-3 py-2 text-xs text-amber-800">
+                请填写有效的区间下沿价与上沿价（上沿价需大于下沿价），网格步长才能生成对应买卖档位。
+              </div>
+            ) : null}
 
             <div className="flex justify-end gap-2 pt-2">
               <button

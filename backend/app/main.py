@@ -4104,12 +4104,24 @@ def update_grid_strategy(strategy_id: int, payload: GridStrategyUpdate) -> Dict[
         existing = conn.execute("SELECT * FROM grid_strategies WHERE id = ?", (strategy_id,)).fetchone()
         if not existing:
             raise HTTPException(status_code=404, detail="网格策略不存在")
-        low = updates.get("lower_price", existing["lower_price"])
-        high = updates.get("upper_price", existing["upper_price"])
+        low = float(updates.get("lower_price", existing["lower_price"]) or 0)
+        high = float(updates.get("upper_price", existing["upper_price"]) or 0)
+        gtype = str(updates.get("grid_type", existing["grid_type"]) or "arithmetic")
+        step = float(updates.get("step_value", existing["step_value"]) or 0)
         if high > 0 and low > 0 and high <= low:
             raise HTTPException(status_code=400, detail="网格上沿价格必须大于下沿价格")
         sets = ", ".join(f"{k} = ?" for k in updates.keys())
         conn.execute(f"UPDATE grid_strategies SET {sets} WHERE id = ?", list(updates.values()) + [strategy_id])
+        # Re-map held/existing buy trade grid_level indices whenever grid step or bounds change
+        if any(k in updates for k in ("lower_price", "upper_price", "step_value", "grid_type")):
+            new_levels = build_grid_levels(low, high, gtype, step)
+            buy_rows = conn.execute(
+                "SELECT id, price FROM stock_trades WHERE strategy_id = ? AND side = 'buy'",
+                (strategy_id,),
+            ).fetchall()
+            for br in buy_rows:
+                new_lvl = nearest_level(new_levels, float(br["price"])) if new_levels else None
+                conn.execute("UPDATE stock_trades SET grid_level = ? WHERE id = ?", (new_lvl, br["id"]))
         return _load_grid_detail(conn, strategy_id)
 
 
