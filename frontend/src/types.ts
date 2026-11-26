@@ -513,6 +513,28 @@ export interface EmailCacheStats {
   }[];
 }
 
+export interface EmailSyncStatus {
+  running: boolean;
+  phase: 'idle' | 'connecting' | 'searching' | 'fetching' | 'done' | 'error' | string;
+  account_index: number;
+  account_total: number;
+  current_account: string;
+  current_folder: string;
+  total_in_range: number;
+  skipped_existing: number;
+  target_fetch: number;
+  fetched_done: number;
+  saved_new: number;
+  total_cached: number;
+  last_subject: string;
+  message: string;
+  error: string;
+  started_at: string;
+  updated_at: string;
+  finished_at: string;
+  cache_stats?: EmailCacheStats;
+}
+
 export interface EmailFetchResponse {
   emails: EmailScanSummary[];
   transactions: ParsedBillTransaction[];

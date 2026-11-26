@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Activity, BellRing, Bot, CheckCircle2, Copy, Database, ExternalLink, Globe, KeyRound, LogOut, Mail, Pencil, PlugZap, Plus, RefreshCw, Save, ShieldCheck, Trash2, TrendingUp, XCircle } from 'lucide-react';
 import { api } from '../api';
-import type { AppSettings, EmailAccount } from '../types';
+import type { AppSettings, EmailAccount, EmailSyncStatus } from '../types';
 
 export type SettingsTabKey = 'proxy' | 'ai' | 'mail' | 'ctrader' | 'ibkr' | 'security';
 
@@ -44,6 +44,7 @@ export const SettingsView: React.FC<Props> = ({
   const [emailSaving, setEmailSaving] = useState(false);
   const [testingEmailId, setTestingEmailId] = useState<number | null>(null);
   const [emailAccountTestResults, setEmailAccountTestResults] = useState<Record<number, { ok: boolean; message: string }>>({});
+  const [emailSyncStatus, setEmailSyncStatus] = useState<EmailSyncStatus | null>(null);
   const [emailForm, setEmailForm] = useState({
     name: '',
     imap_host: 'imap.gmail.com',
@@ -100,8 +101,34 @@ export const SettingsView: React.FC<Props> = ({
       })
       .catch(() => {});
     api.getAuthStatus().then((st) => setActiveSessions(st.active_sessions || 1)).catch(() => {});
+    api.getEmailSyncStatus().then((st) => setEmailSyncStatus(st)).catch(() => {});
     loadEmailAccounts();
   }, []);
+
+  useEffect(() => {
+    if (!emailSyncStatus?.running) return;
+    const timer = window.setInterval(async () => {
+      try {
+        const st = await api.getEmailSyncStatus();
+        setEmailSyncStatus(st);
+        if (!st.running) {
+          window.clearInterval(timer);
+          if (st.phase === 'error' && st.error) {
+            onNotify(`拉取失败：${st.error}`);
+          } else if (st.message) {
+            onNotify(st.message);
+            setSettings((prev) => ({
+              ...prev,
+              email_last_sync_summary: st.message,
+            }));
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }, 1200);
+    return () => window.clearInterval(timer);
+  }, [emailSyncStatus?.running]);
 
   useEffect(() => {
     setNewUsername(currentUsername);
@@ -909,18 +936,19 @@ export const SettingsView: React.FC<Props> = ({
             </select>
             <button
               type="button"
+              disabled={Boolean(emailSyncStatus?.running)}
               onClick={async () => {
                 try {
-                  onNotify('正在增量拉取最近 2 年历史邮件到本地库，请稍候...');
-                  const res = await api.syncEmailCache({ days: 730, limit: 2500 });
-                  onNotify(res.summary || `2年历史回补完成：新增 ${res.fetched_new} 封，本地共 ${res.total_cached} 封`);
+                  const res = await api.syncEmailCache({ days: 730, limit: 2500, background: true });
+                  if (res.status) setEmailSyncStatus(res.status);
+                  onNotify(res.already_running ? '后台正在拉取中，请查看实时进度条' : '已启动最近 2 年历史邮件后台拉取');
                 } catch (err) {
-                  onNotify(err instanceof Error ? err.message : '拉取最近2年历史邮件失败');
+                  onNotify(err instanceof Error ? err.message : '启动最近2年历史邮件拉取失败');
                 }
               }}
-              className="rounded-lg border border-indigo-200 bg-indigo-50 px-2.5 py-1 text-[11px] font-medium text-indigo-700 hover:bg-indigo-100 cursor-pointer"
+              className="rounded-lg border border-indigo-200 bg-indigo-50 px-2.5 py-1 text-[11px] font-medium text-indigo-700 hover:bg-indigo-100 disabled:opacity-50 cursor-pointer"
             >
-              立即拉取最近2年历史
+              {emailSyncStatus?.running ? '后台拉取中...' : '立即拉取最近2年历史'}
             </button>
           </div>
           {settings.email_last_sync_summary && (
@@ -929,6 +957,44 @@ export const SettingsView: React.FC<Props> = ({
             </span>
           )}
         </div>
+
+        {emailSyncStatus && (emailSyncStatus.running || emailSyncStatus.phase === 'done' || emailSyncStatus.phase === 'error') && (
+          <div
+            className={`rounded-xl border px-3.5 py-2.5 text-xs space-y-1.5 ${
+              emailSyncStatus.phase === 'error'
+                ? 'border-rose-200 bg-rose-50/70 text-rose-800'
+                : emailSyncStatus.running
+                  ? 'border-indigo-200 bg-indigo-50/70 text-indigo-900'
+                  : 'border-emerald-200 bg-emerald-50/70 text-emerald-900'
+            }`}
+          >
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="font-medium inline-flex items-center gap-1.5">
+                <RefreshCw className={`h-3.5 w-3.5 ${emailSyncStatus.running ? 'animate-spin text-indigo-600' : ''}`} />
+                {emailSyncStatus.message}
+              </span>
+              <span className="font-mono text-[11px] opacity-80">
+                {emailSyncStatus.target_fetch > 0
+                  ? `${emailSyncStatus.fetched_done}/${emailSyncStatus.target_fetch} (${Math.min(100, Math.round((emailSyncStatus.fetched_done / emailSyncStatus.target_fetch) * 100))}%)`
+                  : `本地共 ${emailSyncStatus.total_cached} 封`}
+              </span>
+            </div>
+            {emailSyncStatus.running && (
+              <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/80">
+                <div
+                  className={`h-full rounded-full bg-indigo-600 transition-all duration-300 ${
+                    emailSyncStatus.target_fetch <= 0 ? 'w-1/3 animate-pulse' : ''
+                  }`}
+                  style={
+                    emailSyncStatus.target_fetch > 0
+                      ? { width: `${Math.max(4, Math.min(100, Math.round((emailSyncStatus.fetched_done / emailSyncStatus.target_fetch) * 100)))}%` }
+                      : undefined
+                  }
+                />
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Configured mailboxes list */}
         {emailAccounts.length > 0 && (

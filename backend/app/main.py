@@ -115,6 +115,7 @@ from .services.email_service import (
     fetch_and_parse_emails,
     fetch_and_parse_multi_emails,
     get_email_cache_stats,
+    get_email_sync_status,
     parse_cached_emails,
     smart_fetch_and_parse_emails,
     sync_emails_to_local_cache,
@@ -2802,6 +2803,9 @@ def test_email_endpoint() -> Dict[str, Any]:
     return test_imap_connection(get_all_settings())
 
 
+_EMAIL_SYNC_BG_TASK: Optional[asyncio.Task[Any]] = None
+
+
 @app.get("/api/emails/cache-stats")
 def email_cache_stats_endpoint() -> Dict[str, Any]:
     settings = get_all_settings()
@@ -2809,11 +2813,45 @@ def email_cache_stats_endpoint() -> Dict[str, Any]:
         return get_email_cache_stats(conn, settings)
 
 
+@app.get("/api/emails/sync-status")
+def email_sync_status_endpoint() -> Dict[str, Any]:
+    settings = get_all_settings()
+    with get_conn() as conn:
+        stats = get_email_cache_stats(conn, settings)
+    return {**get_email_sync_status(), "cache_stats": stats}
+
+
 @app.post("/api/emails/sync")
 async def sync_email_cache_endpoint(payload: Optional[EmailCacheSyncRequest] = None) -> Dict[str, Any]:
+    global _EMAIL_SYNC_BG_TASK
     req = payload or EmailCacheSyncRequest()
     settings = get_all_settings()
     accounts = _get_active_email_accounts(settings, account_id=req.account_id)
+
+    if req.background:
+        cur_status = get_email_sync_status()
+        if cur_status.get("running") and _EMAIL_SYNC_BG_TASK and not _EMAIL_SYNC_BG_TASK.done():
+            return {"started": False, "already_running": True, "status": cur_status}
+
+        async def _bg_job() -> None:
+            try:
+                await sync_emails_to_local_cache(
+                    base_settings=settings,
+                    accounts=accounts,
+                    days=req.days,
+                    limit=req.limit,
+                    force_refresh=req.force_refresh,
+                    zip_password=req.zip_password,
+                )
+                if req.days >= 730:
+                    update_settings({"email_backfill_730d_done": "1"})
+            except Exception:
+                pass
+
+        _EMAIL_SYNC_BG_TASK = asyncio.create_task(_bg_job())
+        await asyncio.sleep(0.05)
+        return {"started": True, "already_running": False, "status": get_email_sync_status()}
+
     try:
         res = await sync_emails_to_local_cache(
             base_settings=settings,
@@ -2829,7 +2867,7 @@ async def sync_email_cache_endpoint(payload: Optional[EmailCacheSyncRequest] = N
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     with get_conn() as conn:
         stats = get_email_cache_stats(conn, get_all_settings())
-    return {**res, "cache_stats": stats}
+    return {**res, "cache_stats": stats, "status": get_email_sync_status()}
 
 
 @app.post("/api/emails/fetch-parse")

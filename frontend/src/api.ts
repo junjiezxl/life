@@ -338,21 +338,26 @@ export const api = {
     }),
   testEmail: () => request<{ ok: boolean; message: string; inbox_count: number }>('/api/emails/test', { method: 'POST' }),
   getEmailCacheStats: () => request<import('./types').EmailCacheStats>('/api/emails/cache-stats'),
+  getEmailSyncStatus: () => request<import('./types').EmailSyncStatus>('/api/emails/sync-status'),
   syncEmailCache: (payload?: {
     days?: number;
     limit?: number;
     account_id?: number;
     force_refresh?: boolean;
     zip_password?: string;
+    background?: boolean;
   }) =>
     request<{
-      fetched_new: number;
-      total_cached: number;
-      scanned_accounts: string[];
-      warnings: string[];
-      synced_at: string;
-      summary: string;
-      cache_stats: import('./types').EmailCacheStats;
+      started?: boolean;
+      already_running?: boolean;
+      status?: import('./types').EmailSyncStatus;
+      fetched_new?: number;
+      total_cached?: number;
+      scanned_accounts?: string[];
+      warnings?: string[];
+      synced_at?: string;
+      summary?: string;
+      cache_stats?: import('./types').EmailCacheStats;
     }>('/api/emails/sync', { method: 'POST', body: JSON.stringify(payload || {}) }),
   fetchParseEmails: (params: {
     days: number;

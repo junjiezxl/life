@@ -166,6 +166,7 @@ class EmailCacheSyncRequest(BaseModel):
     account_id: Optional[int] = None
     force_refresh: bool = False
     zip_password: str = ""
+    background: bool = False
 
 
 class EmailAccountCreate(BaseModel):

@@ -2614,11 +2614,17 @@ class TestLifeHubAPI(unittest.TestCase):
             self.assertIn(("INBOX", "501"), seen_skip_sets[1])
             self.assertIn(("INBOX", "502"), seen_skip_sets[1])
 
-            # 2.1 Verify 2-year (730d) backfill sync accepts days=730 & limit=2000
+            # 2.1 Verify 2-year (730d) backfill sync accepts days=730 & limit=2000 + progress status endpoint
             s3 = self.client.post("/api/emails/sync", json={"days": 730, "limit": 2000, "account_id": mb_id})
             self.assertEqual(s3.status_code, 200, s3.text)
             self.assertEqual(s3.json()["fetched_new"], 0)
             self.assertEqual(s3.json()["total_cached"], 3)
+
+            st_res = self.client.get("/api/emails/sync-status")
+            self.assertEqual(st_res.status_code, 200, st_res.text)
+            self.assertFalse(st_res.json()["running"])
+            self.assertEqual(st_res.json()["phase"], "done")
+            self.assertEqual(st_res.json()["total_cached"], 3)
 
         # 3. Verify cache-stats reflects 3 cached emails (2 with stock_hint)
         cs = self.client.get("/api/emails/cache-stats")

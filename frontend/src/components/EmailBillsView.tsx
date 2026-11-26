@@ -20,6 +20,7 @@ import type {
   EmailScanSummary,
   EmailStockTradeCandidate,
   EmailSyncLog,
+  EmailSyncStatus,
   NoteCandidate,
   ParsedBillTransaction,
 } from '../types';
@@ -47,6 +48,7 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
   const [selectedMailboxId, setSelectedMailboxId] = useState<string>('');
   const [cacheStats, setCacheStats] = useState<EmailCacheStats | null>(null);
   const [syncingCache, setSyncingCache] = useState(false);
+  const [syncStatus, setSyncStatus] = useState<EmailSyncStatus | null>(null);
 
   const [emails, setEmails] = useState<EmailScanSummary[]>([]);
   const [expandedEmailUid, setExpandedEmailUid] = useState<string | null>(null);
@@ -69,16 +71,21 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
 
   const loadMeta = async () => {
     try {
-      const [accRes, logRes, mbRes, csRes] = await Promise.all([
+      const [accRes, logRes, mbRes, csRes, stRes] = await Promise.all([
         api.listAccounts(),
         api.listEmailLogs(),
         api.listEmailAccounts().catch(() => [] as EmailAccount[]),
         api.getEmailCacheStats().catch(() => null),
+        api.getEmailSyncStatus().catch(() => null),
       ]);
       setAccounts(accRes.accounts);
       setMailboxes(mbRes.filter((m) => m.enabled));
       setLogs(logRes);
       if (csRes) setCacheStats(csRes);
+      if (stRes) {
+        setSyncStatus(stRes);
+        setSyncingCache(Boolean(stRes.running));
+      }
     } catch {
       // ignore
     }
@@ -87,6 +94,29 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
   useEffect(() => {
     loadMeta();
   }, []);
+
+  useEffect(() => {
+    if (!syncStatus?.running) return;
+    const timer = window.setInterval(async () => {
+      try {
+        const st = await api.getEmailSyncStatus();
+        setSyncStatus(st);
+        if (st.cache_stats) setCacheStats(st.cache_stats);
+        if (!st.running) {
+          setSyncingCache(false);
+          window.clearInterval(timer);
+          if (st.phase === 'error' && st.error) {
+            onNotify(`同步失败：${st.error}`);
+          } else if (st.message) {
+            onNotify(st.message);
+          }
+        }
+      } catch {
+        // ignore transient polling failure
+      }
+    }, 1200);
+    return () => window.clearInterval(timer);
+  }, [syncStatus?.running]);
 
   const populateCandidates = (
     txs: ParsedBillTransaction[],
@@ -171,13 +201,24 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
         limit: targetLimit,
         account_id: selectedMailboxId ? Number(selectedMailboxId) : undefined,
         zip_password: zipPassword,
+        background: true,
       });
-      setCacheStats(res.cache_stats);
-      onNotify(res.summary || `增量同步完成：新增 ${res.fetched_new} 封，本地共 ${res.total_cached} 封`);
+      if (res.status) {
+        setSyncStatus(res.status);
+        setSyncingCache(Boolean(res.status.running));
+      } else {
+        const st = await api.getEmailSyncStatus();
+        setSyncStatus(st);
+        setSyncingCache(Boolean(st.running));
+      }
+      if (res.already_running) {
+        onNotify('后台已有同步任务正在运行，已为你实时展示同步进度');
+      } else {
+        onNotify(targetDays >= 365 ? '已启动最近 2 年历史邮件后台拉取，上方将实时显示进度' : '已启动后台增量同步，请查看实时进度');
+      }
     } catch (err) {
-      onNotify(err instanceof Error ? err.message : '增量同步失败');
-    } finally {
       setSyncingCache(false);
+      onNotify(err instanceof Error ? err.message : '启动增量同步失败');
     }
   };
 
@@ -387,10 +428,59 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
                 title="一次性拉取最近 2 年（730天）的历史邮件到本地邮件库，之后增量同步即可"
               >
                 <Download className="h-3 w-3" />
-                拉取最近 2 年历史
+                {syncingCache ? '后台拉取中...' : '拉取最近 2 年历史'}
               </button>
             </div>
           </div>
+
+          {syncStatus && (syncStatus.running || syncStatus.phase === 'done' || syncStatus.phase === 'error') && (
+            <div
+              className={`rounded-xl border px-3.5 py-2.5 text-xs space-y-1.5 ${
+                syncStatus.phase === 'error'
+                  ? 'border-rose-200 bg-rose-50/70 text-rose-800'
+                  : syncStatus.running
+                    ? 'border-indigo-200 bg-indigo-50/70 text-indigo-900'
+                    : 'border-emerald-200 bg-emerald-50/70 text-emerald-900'
+              }`}
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5 font-medium">
+                  <RefreshCw className={`h-3.5 w-3.5 ${syncStatus.running ? 'animate-spin text-indigo-600' : ''}`} />
+                  <span>{syncStatus.message || (syncStatus.running ? '正在同步邮件...' : '同步完成')}</span>
+                </div>
+                <span className="font-mono text-[11px] opacity-80">
+                  {syncStatus.target_fetch > 0
+                    ? `${syncStatus.fetched_done}/${syncStatus.target_fetch} (${Math.min(100, Math.round((syncStatus.fetched_done / syncStatus.target_fetch) * 100))}%)`
+                    : syncStatus.running
+                      ? '连接检索中...'
+                      : `共 ${syncStatus.total_cached} 封`}
+                </span>
+              </div>
+              {syncStatus.running && (
+                <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/80">
+                  <div
+                    className={`h-full rounded-full bg-indigo-600 transition-all duration-300 ${
+                      syncStatus.target_fetch <= 0 ? 'w-1/3 animate-pulse' : ''
+                    }`}
+                    style={
+                      syncStatus.target_fetch > 0
+                        ? { width: `${Math.max(4, Math.min(100, Math.round((syncStatus.fetched_done / syncStatus.target_fetch) * 100)))}%` }
+                        : undefined
+                    }
+                  />
+                </div>
+              )}
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] opacity-80">
+                {syncStatus.total_in_range > 0 && <span>时间窗口共 {syncStatus.total_in_range} 封</span>}
+                {syncStatus.skipped_existing > 0 && <span>跳过已缓存 {syncStatus.skipped_existing} 封</span>}
+                <span>本次新入库 {syncStatus.saved_new} 封</span>
+                <span>本地邮件库总计 {syncStatus.total_cached} 封</span>
+                {syncStatus.last_subject && (
+                  <span className="truncate max-w-[260px]">最新：《{syncStatus.last_subject}》</span>
+                )}
+              </div>
+            </div>
+          )}
 
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-5">
             <select

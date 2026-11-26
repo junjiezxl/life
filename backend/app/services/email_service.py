@@ -403,6 +403,37 @@ def _discover_imap_folders(client: imaplib.IMAP4) -> List[str]:
     return ["INBOX"]
 
 
+_SYNC_PROGRESS: Dict[str, Any] = {
+    "running": False,
+    "phase": "idle",
+    "account_index": 0,
+    "account_total": 0,
+    "current_account": "",
+    "current_folder": "",
+    "total_in_range": 0,
+    "skipped_existing": 0,
+    "target_fetch": 0,
+    "fetched_done": 0,
+    "saved_new": 0,
+    "total_cached": 0,
+    "last_subject": "",
+    "message": "",
+    "error": "",
+    "started_at": "",
+    "updated_at": "",
+    "finished_at": "",
+}
+
+
+def get_email_sync_status() -> Dict[str, Any]:
+    return dict(_SYNC_PROGRESS)
+
+
+def _update_sync_progress(**kwargs: Any) -> None:
+    _SYNC_PROGRESS.update(kwargs)
+    _SYNC_PROGRESS["updated_at"] = now_iso()
+
+
 def _fetch_raw_emails_sync(
     settings: Dict[str, str],
     days: int = 14,
@@ -412,6 +443,7 @@ def _fetch_raw_emails_sync(
     stock_only: bool = False,
     skip_imap_uids: Optional[Set[Tuple[str, str]]] = None,
     on_batch: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
+    on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> List[Dict[str, Any]]:
     client = _connect_imap(settings)
     fetched: List[Dict[str, Any]] = []
@@ -446,6 +478,19 @@ def _fetch_raw_emails_sync(
                 if (folder, u.decode("utf-8", errors="ignore")) not in skip_pairs
             ]
             if not reversed_uids:
+                if on_progress:
+                    try:
+                        on_progress(
+                            {
+                                "phase": "searching",
+                                "folder": folder,
+                                "total_in_range": len(uids),
+                                "skipped_existing": len(uids),
+                                "target_fetch": 0,
+                            }
+                        )
+                    except Exception:
+                        pass
                 if "\\all" in folder.lower() or "all mail" in folder.lower():
                     break
                 continue
@@ -487,6 +532,20 @@ def _fetch_raw_emails_sync(
                     selected_uids = reversed_uids[: min(remaining, 15 if stock_only else remaining)]
             else:
                 selected_uids = reversed_uids[:remaining]
+
+            if on_progress:
+                try:
+                    on_progress(
+                        {
+                            "phase": "fetching",
+                            "folder": folder,
+                            "total_in_range": len(uids),
+                            "skipped_existing": max(0, len(uids) - len(reversed_uids)),
+                            "target_fetch": len(selected_uids),
+                        }
+                    )
+                except Exception:
+                    pass
 
             # Fetch RFC822 in chunks of 15 UIDs (20x fewer round-trips on 2-year backfills, with single-UID fallback)
             def _parse_fetched_parts(msg_data_list: Any, fallback_uid: str) -> List[Dict[str, Any]]:
@@ -836,6 +895,7 @@ def _call_fetch_raw_emails_compat(
     stock_only: bool,
     skip_imap_uids: Optional[Set[Tuple[str, str]]] = None,
     on_batch: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
+    on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> List[Dict[str, Any]]:
     target_fn = getattr(_fetch_raw_emails_sync, "side_effect", None)
     sig_target = target_fn if callable(target_fn) else _fetch_raw_emails_sync
@@ -854,6 +914,8 @@ def _call_fetch_raw_emails_compat(
         fetch_kwargs["skip_imap_uids"] = skip_imap_uids
     if on_batch is not None and (accepts_var_kw or "on_batch" in sync_params):
         fetch_kwargs["on_batch"] = on_batch
+    if on_progress is not None and (accepts_var_kw or "on_progress" in sync_params):
+        fetch_kwargs["on_progress"] = on_progress
     return _fetch_raw_emails_sync(settings, **fetch_kwargs)
 
 
@@ -1130,6 +1192,7 @@ async def sync_emails_to_local_cache(
     newly_cached_uids: List[str] = []
     returned_uids: List[str] = []
     total_fetched_new = 0
+    total_downloaded = 0
     succeeded = 0
     last_exc: Optional[Exception] = None
 
@@ -1139,88 +1202,180 @@ async def sync_emails_to_local_cache(
             for r in conn.execute("SELECT email_account_id, folder, imap_uid FROM email_messages WHERE imap_uid != ''").fetchall():
                 aid = r["email_account_id"]
                 known_pairs_by_acct.setdefault(aid, set()).add((str(r["folder"] or "INBOX"), str(r["imap_uid"])))
+        base_cached_count = int((conn.execute("SELECT COUNT(*) AS c FROM email_messages").fetchone() or {"c": 0})["c"])
 
-    for acct in accounts:
-        acct_label = (acct.get("name") or acct.get("username") or "邮箱").strip()
-        raw_acct_id = acct.get("id")
-        acct_id = int(raw_acct_id) if (raw_acct_id is not None and int(raw_acct_id) > 0) else None
-        acct_settings = build_account_imap_settings(base_settings, acct)
-        effective_pwd = zip_password or acct_settings.get("email_bill_zip_password") or ""
-        skip_pairs = set() if force_refresh else known_pairs_by_acct.get(acct_id, set())
+    start_ts = now_iso()
+    _update_sync_progress(
+        running=True,
+        phase="connecting",
+        account_index=0,
+        account_total=len(accounts),
+        current_account="",
+        current_folder="",
+        total_in_range=0,
+        skipped_existing=0,
+        target_fetch=0,
+        fetched_done=0,
+        saved_new=0,
+        total_cached=base_cached_count,
+        last_subject="",
+        message=f"准备增量同步最近 {days} 天邮件（共 {len(accounts)} 个邮箱）...",
+        error="",
+        started_at=start_ts,
+        finished_at="",
+    )
 
-        try:
-            streamed_uids: Set[str] = set()
+    try:
+        for idx, acct in enumerate(accounts, start=1):
+            acct_label = (acct.get("name") or acct.get("username") or "邮箱").strip()
+            raw_acct_id = acct.get("id")
+            acct_id = int(raw_acct_id) if (raw_acct_id is not None and int(raw_acct_id) > 0) else None
+            acct_settings = build_account_imap_settings(base_settings, acct)
+            effective_pwd = zip_password or acct_settings.get("email_bill_zip_password") or ""
+            skip_pairs = set() if force_refresh else known_pairs_by_acct.get(acct_id, set())
 
-            def _save_batch_cb(batch: List[Dict[str, Any]]) -> None:
-                nonlocal total_fetched_new
-                with get_conn() as bconn:
-                    saved = save_raw_emails_to_cache(
-                        bconn,
-                        batch,
-                        account_id=acct_id,
-                        account_name=acct_label,
-                        zip_password=effective_pwd,
-                    )
-                total_fetched_new += int(saved["saved_new"])
-                newly_cached_uids.extend(saved["newly_cached_uids"])
-                for bi in batch:
-                    if bi.get("uid"):
-                        streamed_uids.add(str(bi["uid"]))
-
-            raw_items = await asyncio.to_thread(
-                _call_fetch_raw_emails_compat,
-                acct_settings,
-                days,
-                limit,
-                unread_only,
-                keyword,
-                stock_only,
-                skip_pairs,
-                _save_batch_cb,
+            _update_sync_progress(
+                phase="connecting",
+                account_index=idx,
+                current_account=acct_label,
+                current_folder="",
+                message=f"[{idx}/{len(accounts)}] 正在连接邮箱「{acct_label}」并检索最近 {days} 天邮件...",
             )
-            succeeded += 1
-            scanned_accounts.append(acct_label)
-            for item in raw_items:
-                if item.get("uid"):
-                    returned_uids.append(str(item["uid"]))
-            remaining_items = [it for it in raw_items if str(it.get("uid") or "") not in streamed_uids]
-            if remaining_items:
-                with get_conn() as conn:
-                    saved = save_raw_emails_to_cache(
-                        conn,
-                        remaining_items,
-                        account_id=acct_id,
-                        account_name=acct_label,
-                        zip_password=effective_pwd,
+
+            try:
+                streamed_uids: Set[str] = set()
+                acct_target_base = int(_SYNC_PROGRESS.get("target_fetch") or 0)
+
+                def _progress_cb(info: Dict[str, Any]) -> None:
+                    t_range = int(info.get("total_in_range") or 0)
+                    sk_cnt = int(info.get("skipped_existing") or 0)
+                    t_fetch = acct_target_base + int(info.get("target_fetch") or 0)
+                    fld = str(info.get("folder") or "INBOX")
+                    _update_sync_progress(
+                        phase=str(info.get("phase") or "fetching"),
+                        current_folder=fld,
+                        total_in_range=int(_SYNC_PROGRESS.get("total_in_range") or 0) + t_range,
+                        skipped_existing=int(_SYNC_PROGRESS.get("skipped_existing") or 0) + sk_cnt,
+                        target_fetch=t_fetch,
+                        message=(
+                            f"[{idx}/{len(accounts)}]「{acct_label}」({fld})：范围内 {t_range} 封，"
+                            f"跳过已缓存 {sk_cnt} 封，待拉取 {info.get('target_fetch', 0)} 封..."
+                        ),
                     )
-                total_fetched_new += int(saved["saved_new"])
-                newly_cached_uids.extend(saved["newly_cached_uids"])
-        except Exception as exc:
-            last_exc = exc
-            err_msg = str(exc).strip() or type(exc).__name__
-            all_warnings.append(f"邮箱「{acct_label}」增量同步失败: {err_msg}")
 
-    if succeeded == 0 and last_exc is not None:
-        if len(accounts) == 1:
-            raise last_exc
-        raise RuntimeError("；".join(all_warnings))
+                def _save_batch_cb(batch: List[Dict[str, Any]]) -> None:
+                    nonlocal total_fetched_new, total_downloaded
+                    with get_conn() as bconn:
+                        saved = save_raw_emails_to_cache(
+                            bconn,
+                            batch,
+                            account_id=acct_id,
+                            account_name=acct_label,
+                            zip_password=effective_pwd,
+                        )
+                        cur_total = int((bconn.execute("SELECT COUNT(*) AS c FROM email_messages").fetchone() or {"c": 0})["c"])
+                    total_fetched_new += int(saved["saved_new"])
+                    total_downloaded += len(batch)
+                    newly_cached_uids.extend(saved["newly_cached_uids"])
+                    for bi in batch:
+                        if bi.get("uid"):
+                            streamed_uids.add(str(bi["uid"]))
+                    last_subj = str(batch[-1].get("subject") or "")[:48]
+                    t_fetch = max(int(_SYNC_PROGRESS.get("target_fetch") or 0), total_downloaded)
+                    _update_sync_progress(
+                        phase="fetching",
+                        fetched_done=total_downloaded,
+                        saved_new=total_fetched_new,
+                        total_cached=cur_total,
+                        target_fetch=t_fetch,
+                        last_subject=last_subj,
+                        message=(
+                            f"[{idx}/{len(accounts)}]「{acct_label}」已拉取 {total_downloaded}/{t_fetch} 封"
+                            f"（新入库 {total_fetched_new} 封 · 本地共 {cur_total} 封）"
+                        ),
+                    )
 
-    with get_conn() as conn:
-        total_cached = int((conn.execute("SELECT COUNT(*) AS c FROM email_messages").fetchone() or {"c": 0})["c"])
-    sync_ts = now_iso()
-    summary_text = f"同步 {len(scanned_accounts)} 个邮箱：新增缓存 {total_fetched_new} 封（本地共 {total_cached} 封）"
-    update_settings({"email_last_sync_at": sync_ts, "email_last_sync_summary": summary_text})
+                raw_items = await asyncio.to_thread(
+                    _call_fetch_raw_emails_compat,
+                    acct_settings,
+                    days,
+                    limit,
+                    unread_only,
+                    keyword,
+                    stock_only,
+                    skip_pairs,
+                    _save_batch_cb,
+                    _progress_cb,
+                )
+                succeeded += 1
+                scanned_accounts.append(acct_label)
+                for item in raw_items:
+                    if item.get("uid"):
+                        returned_uids.append(str(item["uid"]))
+                remaining_items = [it for it in raw_items if str(it.get("uid") or "") not in streamed_uids]
+                if remaining_items:
+                    with get_conn() as conn:
+                        saved = save_raw_emails_to_cache(
+                            conn,
+                            remaining_items,
+                            account_id=acct_id,
+                            account_name=acct_label,
+                            zip_password=effective_pwd,
+                        )
+                        cur_total = int((conn.execute("SELECT COUNT(*) AS c FROM email_messages").fetchone() or {"c": 0})["c"])
+                    total_fetched_new += int(saved["saved_new"])
+                    total_downloaded += len(remaining_items)
+                    newly_cached_uids.extend(saved["newly_cached_uids"])
+                    _update_sync_progress(
+                        fetched_done=total_downloaded,
+                        saved_new=total_fetched_new,
+                        total_cached=cur_total,
+                    )
+            except Exception as exc:
+                last_exc = exc
+                err_msg = str(exc).strip() or type(exc).__name__
+                all_warnings.append(f"邮箱「{acct_label}」增量同步失败: {err_msg}")
+                _update_sync_progress(
+                    error=err_msg,
+                    message=f"邮箱「{acct_label}」同步出现异常：{err_msg}",
+                )
 
-    return {
-        "fetched_new": total_fetched_new,
-        "total_cached": total_cached,
-        "newly_cached_uids": newly_cached_uids,
-        "returned_uids": returned_uids,
-        "scanned_accounts": scanned_accounts,
-        "warnings": list(dict.fromkeys(all_warnings)),
-        "synced_at": sync_ts,
-        "summary": summary_text,
-    }
+        if succeeded == 0 and last_exc is not None:
+            raise (last_exc if len(accounts) == 1 else RuntimeError("；".join(all_warnings)))
+
+        with get_conn() as conn:
+            total_cached = int((conn.execute("SELECT COUNT(*) AS c FROM email_messages").fetchone() or {"c": 0})["c"])
+        sync_ts = now_iso()
+        summary_text = f"同步 {len(scanned_accounts)} 个邮箱：新增缓存 {total_fetched_new} 封（本地共 {total_cached} 封）"
+        update_settings({"email_last_sync_at": sync_ts, "email_last_sync_summary": summary_text})
+        _update_sync_progress(
+            running=False,
+            phase="done",
+            saved_new=total_fetched_new,
+            total_cached=total_cached,
+            message=summary_text,
+            finished_at=sync_ts,
+        )
+
+        return {
+            "fetched_new": total_fetched_new,
+            "total_cached": total_cached,
+            "newly_cached_uids": newly_cached_uids,
+            "returned_uids": returned_uids,
+            "scanned_accounts": scanned_accounts,
+            "warnings": list(dict.fromkeys(all_warnings)),
+            "synced_at": sync_ts,
+            "summary": summary_text,
+        }
+    except Exception as exc:
+        _update_sync_progress(
+            running=False,
+            phase="error",
+            error=str(exc),
+            message=f"同步失败：{exc}",
+            finished_at=now_iso(),
+        )
+        raise
 
 
 def _load_cached_raw_items(
