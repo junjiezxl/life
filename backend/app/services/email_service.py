@@ -328,49 +328,76 @@ def _keyword_matches(kw_lower: str, haystack_lower: str) -> bool:
     return kw_lower in haystack_lower
 
 
+_STOCK_HEADER_CUES = (
+    "hsbc",
+    "汇丰",
+    "滙豐",
+    "investdirect",
+    "stock",
+    "securit",
+    "equity",
+    "etf",
+    "contract",
+    "advice",
+    "eadvice",
+    "e-advice",
+    "order",
+    "execut",
+    "trade",
+    "futu",
+    "moomoo",
+    "tiger",
+    "ibkr",
+    "interactive",
+    "schwab",
+    "bochk",
+    "hang seng",
+    "恒生",
+    "恆生",
+    "中銀",
+    "中银",
+    "股票",
+    "證券",
+    "证券",
+    "股份",
+    "成交",
+    "交易",
+    "買入",
+    "买入",
+    "賣出",
+    "卖出",
+    "沽出",
+    "執行",
+    "执行",
+    "結單",
+    "结单",
+    "通知",
+)
+
+
 def _discover_imap_folders(client: imaplib.IMAP4) -> List[str]:
-    """Return INBOX plus Gmail All Mail / Archive / custom folders (excluding Trash/Drafts/Sent/Junk)."""
-    folders: List[str] = ["INBOX"]
-    seen: Set[str] = {"inbox"}
+    """Return Gmail All Mail (superset of Inbox+Archive) if present, else INBOX."""
     try:
         typ, lines = client.list()
-        if typ != "OK" or not lines:
-            return folders
-        all_mail_folder: Optional[str] = None
-        extra_folders: List[str] = []
-        for raw_ln in lines:
-            if not raw_ln:
-                continue
-            line = raw_ln.decode("utf-8", errors="ignore") if isinstance(raw_ln, (bytes, bytearray)) else str(raw_ln)
-            # Standard IMAP LIST response: (\Flags) "delim" "Folder Name"
-            m = re.match(r'^\(([^)]*)\)\s+"?[^"\s]*"?\s+(.+)$', line.strip())
-            if not m:
-                continue
-            flags_low = m.group(1).lower()
-            name = m.group(2).strip()
-            if name.startswith('"') and name.endswith('"') and len(name) >= 2:
-                name = name[1:-1].replace('\\"', '"')
-            name_low = name.lower()
-            if "\\noselect" in flags_low or name_low in seen:
-                continue
-            if any(skip in flags_low for skip in ("\\trash", "\\drafts", "\\sent", "\\junk")):
-                continue
-            if any(skip in name_low for skip in ("trash", "deleted", "draft", "sent", "spam", "junk", "已发送", "草稿", "已删除", "垃圾")):
-                continue
-            if "\\all" in flags_low or "all mail" in name_low:
-                all_mail_folder = name
-            else:
-                extra_folders.append(name)
-        if all_mail_folder:
-            # All Mail on Gmail includes Inbox + Archive + labeled folders
-            return [all_mail_folder, "INBOX"]
-        for ef in extra_folders[:4]:
-            if ef.lower() not in seen:
-                seen.add(ef.lower())
-                folders.append(ef)
+        if typ == "OK" and lines:
+            for raw_ln in lines:
+                if not raw_ln:
+                    continue
+                line = raw_ln.decode("utf-8", errors="ignore") if isinstance(raw_ln, (bytes, bytearray)) else str(raw_ln)
+                m = re.match(r'^\(([^)]*)\)\s+"?[^"\s]*"?\s+(.+)$', line.strip())
+                if not m:
+                    continue
+                flags_low = m.group(1).lower()
+                name = m.group(2).strip()
+                if name.startswith('"') and name.endswith('"') and len(name) >= 2:
+                    name = name[1:-1].replace('\\"', '"')
+                if "\\noselect" in flags_low:
+                    continue
+                if "\\all" in flags_low or "all mail" in name.lower():
+                    return [name, "INBOX"]
     except Exception:
         pass
-    return folders
+    return ["INBOX"]
 
 
 def _fetch_raw_emails_sync(
@@ -379,6 +406,7 @@ def _fetch_raw_emails_sync(
     limit: int = 25,
     unread_only: bool = False,
     keyword: str = "",
+    stock_only: bool = False,
 ) -> List[Dict[str, Any]]:
     client = _connect_imap(settings)
     fetched: List[Dict[str, Any]] = []
@@ -409,28 +437,41 @@ def _fetch_raw_emails_sync(
             uids = data[0].split()
             reversed_uids = list(reversed(uids))
             remaining = max(1, limit - len(fetched))
-            if kw_lower and len(reversed_uids) > remaining:
-                pool_uids = reversed_uids[: max(remaining * 4, 240)]
+
+            # For keyword or stock_only scan: batch-fetch lightweight headers in 80-UID chunks first
+            # so we only download full RFC822 bodies for matching broker/stock emails (~2-4s instead of 200s!)
+            if (kw_lower and len(reversed_uids) > remaining) or stock_only:
+                pool_uids = reversed_uids[: max(remaining * 3, 240)]
                 matched_uids: List[bytes] = []
-                try:
-                    uid_list = b",".join(pool_uids)
-                    typ_h, hdr_data = client.uid("fetch", uid_list, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])")
-                    if typ_h == "OK" and hdr_data:
-                        for part in hdr_data:
-                            if not (isinstance(part, tuple) and len(part) >= 2 and isinstance(part[1], (bytes, bytearray))):
-                                continue
-                            meta_line = part[0].decode("utf-8", errors="ignore") if isinstance(part[0], (bytes, bytearray)) else str(part[0])
-                            m_u = re.search(r"UID\s+(\d+)", meta_line, re.IGNORECASE)
-                            if not m_u:
-                                continue
-                            hmsg = email.message_from_bytes(bytes(part[1]))
-                            subj_s = _decode_mime_str(hmsg.get("Subject")).lower()
-                            from_s = _decode_mime_str(hmsg.get("From")).lower()
-                            if _keyword_matches(kw_lower, f"{subj_s} {from_s}"):
-                                matched_uids.append(m_u.group(1).encode("ascii"))
-                except Exception:
-                    matched_uids = []
-                selected_uids = matched_uids[:remaining] if matched_uids else reversed_uids[:remaining]
+                for start in range(0, len(pool_uids), 80):
+                    chunk = pool_uids[start : start + 80]
+                    try:
+                        uid_list = b",".join(chunk)
+                        typ_h, hdr_data = client.uid("fetch", uid_list, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])")
+                        if typ_h == "OK" and hdr_data:
+                            for part in hdr_data:
+                                if not (isinstance(part, tuple) and len(part) >= 2 and isinstance(part[1], (bytes, bytearray))):
+                                    continue
+                                meta_line = part[0].decode("utf-8", errors="ignore") if isinstance(part[0], (bytes, bytearray)) else str(part[0])
+                                m_u = re.search(r"UID\s+(\d+)", meta_line, re.IGNORECASE)
+                                if not m_u:
+                                    continue
+                                hmsg = email.message_from_bytes(bytes(part[1]))
+                                subj_s = _decode_mime_str(hmsg.get("Subject")).lower()
+                                from_s = _decode_mime_str(hmsg.get("From")).lower()
+                                hdr_hay = f"{subj_s} {from_s}"
+                                if kw_lower:
+                                    if _keyword_matches(kw_lower, hdr_hay):
+                                        matched_uids.append(m_u.group(1).encode("ascii"))
+                                elif any(cue in hdr_hay for cue in _STOCK_HEADER_CUES):
+                                    matched_uids.append(m_u.group(1).encode("ascii"))
+                    except Exception:
+                        continue
+                if matched_uids:
+                    selected_uids = matched_uids[:remaining]
+                else:
+                    # Fallback cap so an empty match downloads at most 15 recent emails for preview instead of hanging
+                    selected_uids = reversed_uids[: min(remaining, 15 if stock_only else remaining)]
             else:
                 selected_uids = reversed_uids[:remaining]
 
@@ -585,13 +626,16 @@ async def fetch_and_parse_emails(
 ) -> Dict[str, Any]:
     effective_zip_pwd = zip_password or settings.get("email_bill_zip_password") or ""
     import inspect
+    sync_params = inspect.signature(_fetch_raw_emails_sync).parameters
     fetch_kwargs: Dict[str, Any] = {
         "days": days,
         "limit": limit,
         "unread_only": unread_only,
     }
-    if keyword and "keyword" in inspect.signature(_fetch_raw_emails_sync).parameters:
+    if keyword and "keyword" in sync_params:
         fetch_kwargs["keyword"] = keyword
+    if stock_only and "stock_only" in sync_params:
+        fetch_kwargs["stock_only"] = True
     raw_emails = await asyncio.to_thread(
         _fetch_raw_emails_sync,
         settings,

@@ -2392,19 +2392,51 @@ class TestLifeHubAPI(unittest.TestCase):
             self.assertEqual(imp2.json()["skipped_duplicates"], 2)
             self.assertIn("scanned_emails", f_res.json())
 
-        # 5. HSBC HK Traditional Chinese notification + legal disclaimer ("buy or sell") + space-aligned PDF row
-        hsbc_tc_body = """
+        # 5. HSBC HK real execution email format ("股票名稱/ 股票編號: ... (IAUM)" / "蘋果 (AAPL)" / "已成交數量(股/單位)")
+        hsbc_real_iaum = """香港上海滙豐銀行有限公司，香港皇后大道中1號。
+全部執行: 買入IAUM: ISHARES GOLD TRUST MICRO的股/單位(交易編號: P353813)
+親愛的客戶
+我們想通知您交易訂單的執行結果，詳情如下:
+• 交易編號: P353813
+• 交易狀況: 全部執行
+• 指示類別: 買入
+• 股票名稱/ 股票編號: ISHARES GOLD TRUST MICRO (IAUM)
+• 已成交數量(股/單位): 1
+• 成交價: USD34.49
+• 共成交數量(股/單位): 1
+• 餘下數量(股/單位): 0
+滙豐私人銀行客戶：(852) 2233 3033"""
+        r_iaum = self.client.post(
+            "/api/grids/parse-email-trade-text",
+            json={
+                "subject": "全部執行: 買入IAUM: ISHARES GOLD TRUST MICRO的股/單位(交易編號: P353813)",
+                "sender": "HSBC <hsbc@hsbc.com.hk>",
+                "body": hsbc_real_iaum,
+            },
+        )
+        self.assertEqual(r_iaum.status_code, 200, r_iaum.text)
+        iaum_tr = r_iaum.json()["trades"]
+        self.assertEqual(len(iaum_tr), 1, r_iaum.text)
+        self.assertEqual(iaum_tr[0]["symbol"], "IAUM")
+        self.assertEqual(iaum_tr[0]["market"], "US")
+        self.assertEqual(iaum_tr[0]["currency"], "USD")
+        self.assertEqual(iaum_tr[0]["side"], "buy")
+        self.assertAlmostEqual(iaum_tr[0]["price"], 34.49, places=2)
+        self.assertAlmostEqual(iaum_tr[0]["quantity"], 1.0, places=2)
+
+        # Also test company name starting with a short ASCII word ("CSOP HKD MMF (03152)") does NOT grab "CSOP"!
+        hsbc_csop_body = """
         滙豐：證券交易執行通知
         指示類別：買入
-        股份名稱 / 編號：A博時港元 (03152)
-        成交股數 (股)：11 股
-        平均成交價 (港元)：1,085.50
+        股票名稱/ 股票編號：CSOP HKD MMF (03152)
+        已成交數量(股/單位)：11
+        成交價：HKD1085.50
         交易日期：2026年11月25日
         重要提示 / Disclaimer: This is not advice to buy or sell any securities.
         """
         r_tc = self.client.post(
             "/api/grids/parse-email-trade-text",
-            json={"subject": "滙豐：證券交易執行通知", "sender": "HSBC <hsbc@hsbc.com.hk>", "body": hsbc_tc_body},
+            json={"subject": "滙豐：證券交易執行通知", "sender": "HSBC <hsbc@hsbc.com.hk>", "body": hsbc_csop_body},
         )
         self.assertEqual(r_tc.status_code, 200, r_tc.text)
         tc_tr = r_tc.json()["trades"]

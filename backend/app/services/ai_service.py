@@ -1380,7 +1380,7 @@ def _extract_stock_trades_from_email(
     # Pattern 1: Structured key-value confirmation block (HSBC HK / CN email alerts & Contract Notes)
     kv_side = ""
     m_side = re.search(
-        rf"(?:买卖方向|交易方向|交易类型|交易類型|交易類別|交易类别|買賣類別|买卖类别|指示类别|指示類別|買賣|买卖|Action|Order\s*Type|Transaction\s*Type|Buy\s*/\s*Sell|Direction|Side|Instruction|Type){sep}([^\r\n]+)",
+        rf"(?:买卖方向|交易方向|交易类型|交易類型|交易類別|交易类别|買賣類別|买卖类别|指示类别|指示類別|買賣|买卖|Instruction\s*Type|Action|Order\s*Type|Transaction\s*Type|Buy\s*/\s*Sell|Direction|Side|Instruction|Type){sep}([^\r\n]+)",
         combined,
         re.IGNORECASE,
     )
@@ -1412,21 +1412,8 @@ def _extract_stock_trades_from_email(
 
     kv_sym = ""
     kv_name = ""
-    # Code first: e.g. "股份編號：03152 (A博時港元)" or "Stock Code: 00700.HK" (must NOT match leading 'A' of 'A博時港元')
-    sym_label = r"(?:股票代号|股票代码|股份代号|股份代號|證券代號|证券代码|股份編號|股票編號|證券編號|股份编号|股票编号|证券编号|代號|代号|代碼|代码|編號|编号|Stock\s*Code|Stock\s*No\.?|Stock\s*Number|Security\s*Code|Ticker|Symbol|Instrument)(?:\s*/\s*(?:名稱|名称|Name|Code|No\.?))?"
-    m_sym = re.search(
-        rf"{sym_label}{sep}(?:HKEX\s*:?\s*|HK\s*:?\s*)?([A-Za-z0-9]{{1,6}}(?:\.[A-Za-z]{{2}})?)(?=$|[\s,.;:()（）])(?:\s*HK)?(?:[\s（(]+([^\r\n）)]+)[）)]?)?",
-        combined,
-        re.IGNORECASE,
-    )
-    if m_sym:
-        cand_sym = m_sym.group(1).strip().upper()
-        # Reject years accidentally captured on date lines
-        if not (cand_sym.isdigit() and len(cand_sym) == 4 and 2020 <= int(cand_sym) <= 2035):
-            kv_sym = cand_sym
-            kv_name = (m_sym.group(2) or "").strip()
-
-    name_label = r"(?:股票名称|股份名称|股份名稱|證券名稱|证券名称|股票名稱|證券/股票名稱|股份名稱\s*/\s*編號|股份名称\s*/\s*编号|Stock\s*Name(?:\s*/\s*Code)?|Security\s*Name|Stock|Security)"
+    # Combined Name / Code field first (e.g. "股票名稱/ 股票編號: ISHARES GOLD TRUST MICRO (IAUM)" or "CSOP HKD MMF (03152)")
+    name_label = r"(?:股票名稱\s*/\s*股票編號|股票名称\s*/\s*股票编号|股份名稱\s*/\s*股份編號|股份名称\s*/\s*股份编号|股份名稱\s*/\s*編號|股份名称\s*/\s*编号|股票名稱\s*/\s*編號|股票名称\s*/\s*编号|證券名稱\s*/\s*編號|Stock\s*Name\s*/\s*(?:Stock\s*)?(?:Code|No\.?)|股票名称|股份名称|股份名稱|證券名稱|证券名称|股票名稱|證券/股票名稱|Stock\s*Name|Security\s*Name|Stock|Security)"
     m_name = re.search(
         rf"{name_label}{sep}([^\r\n\t]+)",
         combined,
@@ -1434,35 +1421,51 @@ def _extract_stock_trades_from_email(
     )
     if m_name:
         raw_nm = re.split(r"\s{3,}", m_name.group(1).strip())[0].strip()
-        # Check if field embeds code like "A博時港元 (03152)" or "騰訊控股 (00700)" or "03152 A博時港元"
-        m_emb = re.search(r"[（(]\s*([0-9]{4,5}(?:\.HK)?|[0-9]{6}(?:\.(?:SS|SH|SZ))?|[A-Z]{1,5})\s*[）)]", raw_nm, re.IGNORECASE)
-        if m_emb and not kv_sym:
-            kv_sym = m_emb.group(1).upper()
-            kv_name = raw_nm[: m_emb.start()].strip() or raw_nm
-        else:
-            m_lead = re.match(r"^([0-9]{4,5}(?:\.HK)?|[A-Z]{1,5})\s+(.+)$", raw_nm)
-            if m_lead and not kv_sym:
+        m_emb = re.search(r"[（(]\s*([0-9]{4,5}(?:\.HK)?|[0-9]{6}(?:\.(?:SS|SH|SZ))?|[A-Z]{1,5}(?:\.[A-Z])?)\s*[）)]", raw_nm, re.IGNORECASE)
+        if m_emb:
+            cand_emb = m_emb.group(1).upper()
+            if not (cand_emb.isdigit() and len(cand_emb) == 4 and 2020 <= int(cand_emb) <= 2035):
+                kv_sym = cand_emb
+                kv_name = raw_nm[: m_emb.start()].strip() or raw_nm
+        if not kv_sym:
+            m_lead = re.match(r"^([0-9]{4,5}(?:\.HK)?|[0-9]{6}(?:\.(?:SS|SH|SZ))?)\s+(.+)$", raw_nm)
+            if m_lead:
                 kv_sym = m_lead.group(1).upper()
                 kv_name = m_lead.group(2).strip()
             elif not kv_name:
                 kv_name = raw_nm
+
+    # Code-specific field (e.g. "股份編號：03152 (A博時港元)" or "Stock Code: 00700.HK")
+    sym_label = r"(?:股票代号|股票代码|股份代号|股份代號|證券代號|证券代码|股份編號|股票編號|證券編號|股份编号|股票编号|证券编号|代號|代号|代碼|代码|編號|编号|Stock\s*Code|Stock\s*No\.?|Stock\s*Number|Security\s*Code|Ticker|Symbol|Instrument)(?:\s*/\s*(?:名稱|名称|Name|Code|No\.?))?"
     if not kv_sym:
-        # Also inspect value right after sym_label when formatted as "編號：A博時港元 (03152)"
         m_sym_line = re.search(rf"{sym_label}{sep}([^\r\n\t]+)", combined, re.IGNORECASE)
         if m_sym_line:
-            line_val = m_sym_line.group(1).strip()
-            m_emb2 = re.search(r"[（(]\s*([0-9]{4,5}(?:\.HK)?|[0-9]{6}(?:\.(?:SS|SH|SZ))?|[A-Z]{1,5})\s*[）)]", line_val, re.IGNORECASE)
-            if m_emb2:
+            line_val = re.split(r"\s{3,}", m_sym_line.group(1).strip())[0].strip()
+            m_emb2 = re.search(r"[（(]\s*([0-9]{4,5}(?:\.HK)?|[0-9]{6}(?:\.(?:SS|SH|SZ))?|[A-Z]{1,5}(?:\.[A-Z])?)\s*[）)]", line_val, re.IGNORECASE)
+            if m_emb2 and not (m_emb2.group(1).isdigit() and 2020 <= int(m_emb2.group(1)) <= 2035):
                 kv_sym = m_emb2.group(1).upper()
                 if not kv_name:
                     kv_name = line_val[: m_emb2.start()].strip() or line_val
+            else:
+                m_sym = re.match(
+                    r"^(?:HKEX\s*:?\s*|HK\s*:?\s*)?([A-Za-z0-9]{1,6}(?:\.[A-Za-z]{2})?)(?=$|[\s,.;:()（）])(?:\s*HK)?(?:[\s（(]+([^\r\n）)]+)[）)]?)?",
+                    line_val,
+                    re.IGNORECASE,
+                )
+                if m_sym:
+                    cand_sym = m_sym.group(1).strip().upper()
+                    if not (cand_sym.isdigit() and len(cand_sym) == 4 and 2020 <= int(cand_sym) <= 2035):
+                        kv_sym = cand_sym
+                        if not kv_name:
+                            kv_name = (m_sym.group(2) or "").strip()
+
     if not kv_sym:
-        # Fallback: look for explicit code format like "00700.HK" or "(03152)" or "03152 (xxx)"
+        # Fallback: look for explicit code format like "00700.HK" or "(03152)" or "ISHARES GOLD TRUST MICRO (IAUM)"
         m_hk = re.search(r"\b([0-9]{4,5}\.HK|[0-9]{6}\.(?:SS|SH|SZ))\b", combined, re.IGNORECASE)
         if m_hk:
             kv_sym = m_hk.group(1).upper()
         else:
-            m_paren = re.search(r"([^\r\n\t()（）]{2,24})\s*[（(]\s*(0\d{3,4}|[1-9]\d{3,4}(?:\.HK)?|[A-Z]{1,5})\s*[）)]", combined)
+            m_paren = re.search(r"([^\r\n\t()（）]{2,40})\s*[（(]\s*(0\d{3,4}|[1-9]\d{3,4}(?:\.HK)?|[A-Z]{1,5})\s*[）)]", combined)
             if m_paren and not (m_paren.group(2).isdigit() and 2020 <= int(m_paren.group(2)) <= 2035):
                 kv_sym = m_paren.group(2).upper()
                 if not kv_name:
