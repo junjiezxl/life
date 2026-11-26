@@ -1433,7 +1433,7 @@ def _extract_stock_trades_from_email(
         re.IGNORECASE,
     )
     if m_name:
-        raw_nm = m_name.group(1).strip()
+        raw_nm = re.split(r"\s{3,}", m_name.group(1).strip())[0].strip()
         # Check if field embeds code like "A博時港元 (03152)" or "騰訊控股 (00700)" or "03152 A博時港元"
         m_emb = re.search(r"[（(]\s*([0-9]{4,5}(?:\.HK)?|[0-9]{6}(?:\.(?:SS|SH|SZ))?|[A-Z]{1,5})\s*[）)]", raw_nm, re.IGNORECASE)
         if m_emb and not kv_sym:

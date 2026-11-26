@@ -3824,6 +3824,7 @@ async def fetch_grid_email_trades(payload: GridEmailFetchRequest) -> Dict[str, A
             unread_only=False,
             skip_already_synced=False,
             existing_stock_refs=existing_stk_refs,
+            stock_only=True,
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

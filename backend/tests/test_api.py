@@ -2430,6 +2430,76 @@ class TestLifeHubAPI(unittest.TestCase):
         self.assertEqual(sp_tr[0]["symbol"], "03152")
         self.assertAlmostEqual(sp_tr[0]["price"], 1086.0, places=2)
 
+        # 6. Wrapper HTML table (<p>/<br> inside single-cell <td>) & ZIP-contained HTML Contract Note via email fetch
+        import email as py_email
+        import io as py_io
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+        import zipfile
+
+        mime_msg = MIMEMultipart()
+        mime_msg["Subject"] = "HSBC Securities Execution Advice"
+        mime_msg["From"] = "HSBC <advice@hsbc.com.hk>"
+        html_wrapper = """
+        <html><body><table><tr><td>
+          <p>滙豐證券交易通知</p>
+          <p>買賣方向：買入</p>
+          <p>股份編號：03152 (A博時港元)</p>
+          <p>成交股數：20 股</p>
+          <p>成交價：HKD 1,085.20</p>
+          <p>成交日期：2026年11月26日</p>
+          <p>Disclaimer: Not advice to buy or sell securities.</p>
+        </td></tr></table></body></html>
+        """
+        mime_msg.attach(MIMEText("Please view in HTML client.", "plain", "utf-8"))
+        mime_msg.attach(MIMEText(html_wrapper, "html", "utf-8"))
+        parsed_body, parsed_atts = email_service._extract_body_and_attachments(
+            py_email.message_from_bytes(mime_msg.as_bytes())
+        )
+        self.assertIn("\n", parsed_body)
+        r_html_wrap = self.client.post(
+            "/api/grids/parse-email-trade-text",
+            json={"subject": "HSBC Securities Execution Advice", "sender": "HSBC <advice@hsbc.com.hk>", "body": parsed_body},
+        )
+        self.assertEqual(r_html_wrap.status_code, 200, r_html_wrap.text)
+        hw_tr = r_html_wrap.json()["trades"]
+        self.assertEqual(len(hw_tr), 1, hw_tr)
+        self.assertEqual(hw_tr[0]["symbol"], "03152")
+        self.assertEqual(hw_tr[0]["side"], "buy")
+        self.assertAlmostEqual(hw_tr[0]["quantity"], 20.0, places=2)
+
+        # Verify ZIP containing HTML Contract Note works via direct mailbox fetch with keyword "汇丰" matching "HSBC"
+        zip_buf = py_io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w") as zf:
+            zf.writestr("ContractNote.html", "<html><body>Bought 50 shares of 00700 (TENCENT) at HKD 392.00</body></html>")
+        mb_res2 = self.client.post(
+            "/api/email-accounts",
+            json={"name": "汇丰附件测试", "imap_host": "imap.qq.com", "imap_port": 993, "username": "zip_test@qq.com", "password": "pwd"},
+        )
+        self.assertEqual(mb_res2.status_code, 200)
+        mb_id2 = mb_res2.json()["id"]
+        fake_zip_mail = [
+            {
+                "uid": "<hsbc-zip-001@hsbc.com.hk>",
+                "imap_uid": "201",
+                "subject": "HSBC eAdvice Attached",
+                "sender": "HSBC <eadvice@hsbc.com.hk>",
+                "received_at": "2026-11-26 15:00",
+                "body": "Dear Customer, please find your attached eAdvice.",
+                "attachments": [("eAdvice.zip", zip_buf.getvalue())],
+            }
+        ]
+        with patch.object(email_service, "_fetch_raw_emails_sync", return_value=fake_zip_mail):
+            f_zip = self.client.post(
+                "/api/grids/fetch-email-trades",
+                json={"days": 30, "account_id": mb_id2, "keyword": "汇丰"},
+            )
+            self.assertEqual(f_zip.status_code, 200, f_zip.text)
+            self.assertEqual(len(f_zip.json()["trades"]), 1, f_zip.text)
+            self.assertEqual(f_zip.json()["trades"][0]["symbol"], "00700")
+            self.assertEqual(f_zip.json()["trades"][0]["side"], "buy")
+        self.assertEqual(self.client.delete(f"/api/email-accounts/{mb_id2}").status_code, 200)
+
         # Cleanup
         self.assertEqual(self.client.delete(f"/api/grids/{sid}").status_code, 200)
         self.assertEqual(self.client.delete(f"/api/email-accounts/{mb_id}").status_code, 200)
