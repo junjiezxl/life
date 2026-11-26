@@ -284,10 +284,23 @@ async def _email_auto_sync_loop() -> None:
         try:
             settings = get_all_settings()
             interval_min = max(5, int(settings.get("email_sync_interval_min") or 30))
-            sync_days = max(1, min(365, int(settings.get("email_sync_days") or 30)))
+            sync_days = max(1, min(1825, int(settings.get("email_sync_days") or 30)))
             if settings.get("email_auto_sync_enabled") == "1":
                 accounts = _get_active_email_accounts(settings)
                 if accounts:
+                    # One-time 2-year (730d) historical cache backfill (cache only, never auto-commits 2y old bills/reminders)
+                    if settings.get("email_backfill_730d_done") != "1":
+                        try:
+                            await sync_emails_to_local_cache(
+                                base_settings=settings,
+                                accounts=accounts,
+                                days=730,
+                                limit=2500,
+                                force_refresh=False,
+                            )
+                            update_settings({"email_backfill_730d_done": "1"})
+                        except Exception:
+                            pass
                     sync_res = await sync_emails_to_local_cache(
                         base_settings=settings,
                         accounts=accounts,
@@ -2810,6 +2823,8 @@ async def sync_email_cache_endpoint(payload: Optional[EmailCacheSyncRequest] = N
             force_refresh=req.force_refresh,
             zip_password=req.zip_password,
         )
+        if req.days >= 730:
+            update_settings({"email_backfill_730d_done": "1"})
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     with get_conn() as conn:

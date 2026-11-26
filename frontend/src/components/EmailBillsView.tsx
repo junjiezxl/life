@@ -136,7 +136,7 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
     try {
       const res = await api.fetchParseEmails({
         days,
-        limit: 80,
+        limit: days >= 365 ? 1500 : 120,
         keyword,
         zip_password: zipPassword,
         include_body_ai: includeBodyAi,
@@ -161,12 +161,14 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
     }
   };
 
-  const handleSyncCacheOnly = async () => {
+  const handleSyncCacheOnly = async (overrideDays?: number, overrideLimit?: number) => {
     setSyncingCache(true);
+    const targetDays = overrideDays ?? Math.max(days, 30);
+    const targetLimit = overrideLimit ?? (targetDays >= 365 ? 2500 : 120);
     try {
       const res = await api.syncEmailCache({
-        days: Math.max(days, 30),
-        limit: 120,
+        days: targetDays,
+        limit: targetLimit,
         account_id: selectedMailboxId ? Number(selectedMailboxId) : undefined,
         zip_password: zipPassword,
       });
@@ -371,11 +373,21 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
               <button
                 type="button"
                 disabled={syncingCache}
-                onClick={handleSyncCacheOnly}
+                onClick={() => handleSyncCacheOnly()}
                 className="inline-flex items-center gap-1 rounded-lg border border-sky-200 bg-white px-2.5 py-1 text-[11px] font-medium text-sky-700 hover:bg-sky-100/60 disabled:opacity-50 cursor-pointer"
               >
                 <RefreshCw className={`h-3 w-3 ${syncingCache ? 'animate-spin' : ''}`} />
                 {syncingCache ? '同步中...' : '仅增量拉取新邮件'}
+              </button>
+              <button
+                type="button"
+                disabled={syncingCache}
+                onClick={() => handleSyncCacheOnly(730, 2500)}
+                className="inline-flex items-center gap-1 rounded-lg border border-indigo-200 bg-indigo-50 px-2.5 py-1 text-[11px] font-medium text-indigo-700 hover:bg-indigo-100 disabled:opacity-50 cursor-pointer"
+                title="一次性拉取最近 2 年（730天）的历史邮件到本地邮件库，之后增量同步即可"
+              >
+                <Download className="h-3 w-3" />
+                拉取最近 2 年历史
               </button>
             </div>
           </div>
@@ -390,6 +402,8 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
               <option value={14}>最近 14 天邮件</option>
               <option value={30}>最近 30 天邮件</option>
               <option value={90}>最近 90 天邮件</option>
+              <option value={365}>最近 1 年邮件</option>
+              <option value={730}>最近 2 年邮件</option>
             </select>
             <input
               type="text"

@@ -150,8 +150,8 @@ class BillReconcileRequest(BaseModel):
 
 
 class EmailFetchRequest(BaseModel):
-    days: int = Field(14, ge=1, le=365)
-    limit: int = Field(25, ge=1, le=200)
+    days: int = Field(14, ge=1, le=1825)
+    limit: int = Field(25, ge=1, le=5000)
     keyword: str = ""
     zip_password: str = ""
     include_body_ai: bool = True
@@ -161,8 +161,8 @@ class EmailFetchRequest(BaseModel):
 
 
 class EmailCacheSyncRequest(BaseModel):
-    days: int = Field(30, ge=1, le=365)
-    limit: int = Field(100, ge=1, le=300)
+    days: int = Field(30, ge=1, le=1825)
+    limit: int = Field(100, ge=1, le=5000)
     account_id: Optional[int] = None
     force_refresh: bool = False
     zip_password: str = ""
@@ -258,6 +258,7 @@ class SettingsUpdateRequest(BaseModel):
     email_auto_sync_enabled: Optional[str] = None
     email_sync_interval_min: Optional[str] = None
     email_sync_days: Optional[str] = None
+    email_backfill_730d_done: Optional[str] = None
     bark_enabled: Optional[str] = None
     bark_server_url: Optional[str] = None
     bark_device_key: Optional[str] = None
@@ -542,8 +543,8 @@ class GridIbkrSyncRequest(BaseModel):
 
 
 class GridEmailFetchRequest(BaseModel):
-    days: int = Field(30, ge=1, le=365)
-    limit: int = Field(50, ge=1, le=250)
+    days: int = Field(30, ge=1, le=1825)
+    limit: int = Field(50, ge=1, le=5000)
     keyword: str = ""
     pdf_password: str = ""
     account_id: Optional[int] = None

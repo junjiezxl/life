@@ -261,7 +261,7 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
     try {
       const res = await api.fetchGridEmailTrades({
         days: emailDays,
-        limit: 150,
+        limit: emailDays >= 365 ? 1500 : 150,
         keyword: emailKeyword.trim(),
         pdf_password: emailPdfPwd.trim(),
         account_id: emailMailboxId ? Number(emailMailboxId) : undefined,
@@ -1969,6 +1969,8 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
                   <option value={30}>最近 30 天</option>
                   <option value={90}>最近 90 天</option>
                   <option value={180}>最近 180 天</option>
+                  <option value={365}>最近 1 年</option>
+                  <option value={730}>最近 2 年</option>
                 </select>
                 <input
                   type="text"

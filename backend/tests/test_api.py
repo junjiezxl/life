@@ -2614,6 +2614,12 @@ class TestLifeHubAPI(unittest.TestCase):
             self.assertIn(("INBOX", "501"), seen_skip_sets[1])
             self.assertIn(("INBOX", "502"), seen_skip_sets[1])
 
+            # 2.1 Verify 2-year (730d) backfill sync accepts days=730 & limit=2000
+            s3 = self.client.post("/api/emails/sync", json={"days": 730, "limit": 2000, "account_id": mb_id})
+            self.assertEqual(s3.status_code, 200, s3.text)
+            self.assertEqual(s3.json()["fetched_new"], 0)
+            self.assertEqual(s3.json()["total_cached"], 3)
+
         # 3. Verify cache-stats reflects 3 cached emails (2 with stock_hint)
         cs = self.client.get("/api/emails/cache-stats")
         self.assertEqual(cs.status_code, 200)
@@ -2639,6 +2645,13 @@ class TestLifeHubAPI(unittest.TestCase):
             self.assertTrue(r_grids.json()["from_cache"])
             syms = {t["symbol"] for t in r_grids.json()["trades"]}
             self.assertEqual(syms, {"IAUM", "03152"})
+
+            r_2y = self.client.post(
+                "/api/grids/fetch-email-trades",
+                json={"days": 730, "limit": 1500, "account_id": mb_id, "source": "cache"},
+            )
+            self.assertEqual(r_2y.status_code, 200, r_2y.text)
+            self.assertEqual(len(r_2y.json()["trades"]), 2)
 
         self.assertEqual(self.client.delete(f"/api/email-accounts/{mb_id}").status_code, 200)
 

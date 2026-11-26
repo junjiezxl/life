@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from email.header import decode_header
 from email.message import Message
 from email.utils import parsedate_to_datetime
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from ..db import get_conn, now_iso, update_settings
 from .ai_service import _extract_stock_trades_from_email, extract_from_email_content
@@ -411,6 +411,7 @@ def _fetch_raw_emails_sync(
     keyword: str = "",
     stock_only: bool = False,
     skip_imap_uids: Optional[Set[Tuple[str, str]]] = None,
+    on_batch: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
 ) -> List[Dict[str, Any]]:
     client = _connect_imap(settings)
     fetched: List[Dict[str, Any]] = []
@@ -487,44 +488,77 @@ def _fetch_raw_emails_sync(
             else:
                 selected_uids = reversed_uids[:remaining]
 
-            for uid_bytes in selected_uids:
+            # Fetch RFC822 in chunks of 15 UIDs (20x fewer round-trips on 2-year backfills, with single-UID fallback)
+            def _parse_fetched_parts(msg_data_list: Any, fallback_uid: str) -> List[Dict[str, Any]]:
+                parsed_chunk: List[Dict[str, Any]] = []
+                if not msg_data_list:
+                    return parsed_chunk
+                for part in msg_data_list:
+                    if not (isinstance(part, tuple) and len(part) >= 2 and isinstance(part[1], (bytes, bytearray))):
+                        continue
+                    meta_line = part[0].decode("utf-8", errors="ignore") if isinstance(part[0], (bytes, bytearray)) else str(part[0])
+                    m_uid = re.search(r"UID\s+(\d+)", meta_line, re.IGNORECASE)
+                    uid_str = m_uid.group(1) if m_uid else fallback_uid
+                    raw_bytes = bytes(part[1])
+                    if not raw_bytes:
+                        continue
+                    msg = email.message_from_bytes(raw_bytes)
+                    subject = _decode_mime_str(msg.get("Subject"))
+                    sender = _decode_mime_str(msg.get("From"))
+                    received_at = _parse_email_date(msg.get("Date"))
+                    message_id = (msg.get("Message-ID") or "").strip() or f"uid:{folder}:{uid_str}"
+                    if message_id in seen_msg_ids:
+                        continue
+                    seen_msg_ids.add(message_id)
+                    body, attachments, alt_body = _extract_body_variants_and_attachments(msg)
+                    parsed_chunk.append(
+                        {
+                            "uid": message_id,
+                            "imap_uid": uid_str,
+                            "folder": folder,
+                            "subject": subject or "(无主题)",
+                            "sender": sender,
+                            "received_at": received_at,
+                            "body": body,
+                            "alt_body": alt_body,
+                            "attachments": attachments,
+                        }
+                    )
+                return parsed_chunk
+
+            for start in range(0, len(selected_uids), 15):
                 if len(fetched) >= limit:
                     break
-                uid_str = uid_bytes.decode("utf-8", errors="ignore")
-                typ_f, msg_data = client.uid("fetch", uid_bytes, "(RFC822)")
-                if typ_f != "OK" or not msg_data:
-                    continue
-                raw_bytes: Optional[bytes] = None
-                for part in msg_data:
-                    if isinstance(part, tuple) and len(part) >= 2 and isinstance(part[1], (bytes, bytearray)):
-                        raw_bytes = bytes(part[1])
-                        break
-                if not raw_bytes:
-                    continue
-
-                msg = email.message_from_bytes(raw_bytes)
-                subject = _decode_mime_str(msg.get("Subject"))
-                sender = _decode_mime_str(msg.get("From"))
-                received_at = _parse_email_date(msg.get("Date"))
-                message_id = (msg.get("Message-ID") or "").strip() or f"uid:{folder}:{uid_str}"
-                if message_id in seen_msg_ids:
-                    continue
-                seen_msg_ids.add(message_id)
-                body, attachments, alt_body = _extract_body_variants_and_attachments(msg)
-
-                fetched.append(
-                    {
-                        "uid": message_id,
-                        "imap_uid": uid_str,
-                        "folder": folder,
-                        "subject": subject or "(无主题)",
-                        "sender": sender,
-                        "received_at": received_at,
-                        "body": body,
-                        "alt_body": alt_body,
-                        "attachments": attachments,
-                    }
-                )
+                uid_chunk = selected_uids[start : start + 15]
+                batch_items: List[Dict[str, Any]] = []
+                chunk_ok = False
+                try:
+                    typ_f, msg_data = client.uid("fetch", b",".join(uid_chunk), "(RFC822)")
+                    if typ_f == "OK" and msg_data:
+                        batch_items = _parse_fetched_parts(msg_data, uid_chunk[0].decode("utf-8", errors="ignore"))
+                        chunk_ok = True
+                except Exception:
+                    chunk_ok = False
+                if not chunk_ok:
+                    for uid_bytes in uid_chunk:
+                        if len(fetched) >= limit:
+                            break
+                        uid_str = uid_bytes.decode("utf-8", errors="ignore")
+                        try:
+                            typ_f, msg_data = client.uid("fetch", uid_bytes, "(RFC822)")
+                            if typ_f == "OK" and msg_data:
+                                batch_items.extend(_parse_fetched_parts(msg_data, uid_str))
+                        except Exception:
+                            continue
+                if batch_items:
+                    room = max(0, limit - len(fetched))
+                    batch_slice = batch_items[:room]
+                    fetched.extend(batch_slice)
+                    if on_batch and batch_slice:
+                        try:
+                            on_batch(batch_slice)
+                        except Exception:
+                            pass
 
             # For Gmail All Mail we already scanned everything; no need to re-scan INBOX unless All Mail failed
             if "\\all" in folder.lower() or "all mail" in folder.lower():
@@ -801,6 +835,7 @@ def _call_fetch_raw_emails_compat(
     keyword: str,
     stock_only: bool,
     skip_imap_uids: Optional[Set[Tuple[str, str]]] = None,
+    on_batch: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
 ) -> List[Dict[str, Any]]:
     target_fn = getattr(_fetch_raw_emails_sync, "side_effect", None)
     sig_target = target_fn if callable(target_fn) else _fetch_raw_emails_sync
@@ -817,6 +852,8 @@ def _call_fetch_raw_emails_compat(
         fetch_kwargs["stock_only"] = True
     if skip_imap_uids and (accepts_var_kw or "skip_imap_uids" in sync_params):
         fetch_kwargs["skip_imap_uids"] = skip_imap_uids
+    if on_batch is not None and (accepts_var_kw or "on_batch" in sync_params):
+        fetch_kwargs["on_batch"] = on_batch
     return _fetch_raw_emails_sync(settings, **fetch_kwargs)
 
 
@@ -1112,6 +1149,24 @@ async def sync_emails_to_local_cache(
         skip_pairs = set() if force_refresh else known_pairs_by_acct.get(acct_id, set())
 
         try:
+            streamed_uids: Set[str] = set()
+
+            def _save_batch_cb(batch: List[Dict[str, Any]]) -> None:
+                nonlocal total_fetched_new
+                with get_conn() as bconn:
+                    saved = save_raw_emails_to_cache(
+                        bconn,
+                        batch,
+                        account_id=acct_id,
+                        account_name=acct_label,
+                        zip_password=effective_pwd,
+                    )
+                total_fetched_new += int(saved["saved_new"])
+                newly_cached_uids.extend(saved["newly_cached_uids"])
+                for bi in batch:
+                    if bi.get("uid"):
+                        streamed_uids.add(str(bi["uid"]))
+
             raw_items = await asyncio.to_thread(
                 _call_fetch_raw_emails_compat,
                 acct_settings,
@@ -1121,17 +1176,19 @@ async def sync_emails_to_local_cache(
                 keyword,
                 stock_only,
                 skip_pairs,
+                _save_batch_cb,
             )
             succeeded += 1
             scanned_accounts.append(acct_label)
             for item in raw_items:
                 if item.get("uid"):
                     returned_uids.append(str(item["uid"]))
-            if raw_items:
+            remaining_items = [it for it in raw_items if str(it.get("uid") or "") not in streamed_uids]
+            if remaining_items:
                 with get_conn() as conn:
                     saved = save_raw_emails_to_cache(
                         conn,
-                        raw_items,
+                        remaining_items,
                         account_id=acct_id,
                         account_name=acct_label,
                         zip_password=effective_pwd,
@@ -1425,6 +1482,7 @@ async def smart_fetch_and_parse_emails(
     - source='imap': live IMAP fetch (and persist fetched messages into local cache too).
     - source='auto' (default): incremental IMAP sync of unseen UIDs only -> instant local cache parse.
     """
+    cache_limit = max(limit, 1500 if days >= 365 else 200)
     if source == "cache":
         with get_conn() as conn:
             res = await parse_cached_emails(
@@ -1434,7 +1492,7 @@ async def smart_fetch_and_parse_emails(
                 existing_refs=existing_refs,
                 synced_uids=synced_uids,
                 days=days,
-                limit=max(limit, 200),
+                limit=cache_limit,
                 keyword=keyword,
                 zip_password=zip_password,
                 include_body_ai=include_body_ai,
@@ -1485,7 +1543,7 @@ async def smart_fetch_and_parse_emails(
             existing_refs=existing_refs,
             synced_uids=synced_uids,
             days=days,
-            limit=max(limit, 200),
+            limit=cache_limit,
             keyword=keyword,
             zip_password=zip_password,
             include_body_ai=include_body_ai,

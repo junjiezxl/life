@@ -56,6 +56,7 @@ DEFAULT_SETTINGS: Dict[str, str] = {
     "email_auto_sync_enabled": "0",
     "email_sync_interval_min": "30",
     "email_sync_days": "30",
+    "email_backfill_730d_done": "0",
     "email_last_sync_at": "",
     "email_last_sync_summary": "",
     "bark_enabled": "0",

@@ -904,7 +904,24 @@ export const SettingsView: React.FC<Props> = ({
               <option value="14">回溯 14 天</option>
               <option value="30">回溯 30 天</option>
               <option value="90">回溯 90 天</option>
+              <option value="365">回溯 1 年</option>
+              <option value="730">回溯 2 年</option>
             </select>
+            <button
+              type="button"
+              onClick={async () => {
+                try {
+                  onNotify('正在增量拉取最近 2 年历史邮件到本地库，请稍候...');
+                  const res = await api.syncEmailCache({ days: 730, limit: 2500 });
+                  onNotify(res.summary || `2年历史回补完成：新增 ${res.fetched_new} 封，本地共 ${res.total_cached} 封`);
+                } catch (err) {
+                  onNotify(err instanceof Error ? err.message : '拉取最近2年历史邮件失败');
+                }
+              }}
+              className="rounded-lg border border-indigo-200 bg-indigo-50 px-2.5 py-1 text-[11px] font-medium text-indigo-700 hover:bg-indigo-100 cursor-pointer"
+            >
+              立即拉取最近2年历史
+            </button>
           </div>
           {settings.email_last_sync_summary && (
             <span className="text-[11px] text-slate-500">
