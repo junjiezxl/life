@@ -465,6 +465,7 @@ def init_db(seed_demo: bool = True) -> None:
                 prev_close REAL NOT NULL DEFAULT 0,
                 quote_name TEXT DEFAULT '',
                 price_updated_at TEXT DEFAULT '',
+                ibkr_auto_sync INTEGER NOT NULL DEFAULT 1,
                 status TEXT NOT NULL DEFAULT 'active',
                 notes TEXT DEFAULT '',
                 created_at TEXT NOT NULL,
@@ -481,10 +482,13 @@ def init_db(seed_demo: bool = True) -> None:
                 tax REAL NOT NULL DEFAULT 0,
                 grid_level INTEGER,
                 traded_at TEXT NOT NULL,
+                source_type TEXT NOT NULL DEFAULT 'manual',
+                external_ref TEXT DEFAULT '',
                 note TEXT DEFAULT '',
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_stock_trades_strategy ON stock_trades(strategy_id, traded_at);
+            CREATE INDEX IF NOT EXISTS idx_stock_trades_ext_ref ON stock_trades(strategy_id, external_ref);
             """
         )
 
@@ -555,6 +559,16 @@ def init_db(seed_demo: bool = True) -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ctrader_deals_exec_ms ON ctrader_deals(account_id, execution_ms DESC)")
         if "bark_notified_at" not in rem_cols:
             conn.execute("ALTER TABLE reminders ADD COLUMN bark_notified_at TEXT DEFAULT ''")
+
+        grid_cols = {r["name"] for r in conn.execute("PRAGMA table_info(grid_strategies)").fetchall()}
+        if "ibkr_auto_sync" not in grid_cols:
+            conn.execute("ALTER TABLE grid_strategies ADD COLUMN ibkr_auto_sync INTEGER NOT NULL DEFAULT 1")
+        st_cols = {r["name"] for r in conn.execute("PRAGMA table_info(stock_trades)").fetchall()}
+        if "source_type" not in st_cols:
+            conn.execute("ALTER TABLE stock_trades ADD COLUMN source_type TEXT NOT NULL DEFAULT 'manual'")
+        if "external_ref" not in st_cols:
+            conn.execute("ALTER TABLE stock_trades ADD COLUMN external_ref TEXT DEFAULT ''")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_stock_trades_ext_ref ON stock_trades(strategy_id, external_ref)")
 
         ts = now_iso()
         for k, v in DEFAULT_SETTINGS.items():

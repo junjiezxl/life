@@ -373,3 +373,352 @@ async def fetch_tencent_quotes(items: List[Tuple[str, str]]) -> Dict[str, Dict[s
         resp.raise_for_status()
         text = resp.content.decode("gbk", errors="ignore")
     return parse_tencent_quote_text(text)
+
+
+# ---------------- IBKR Flex -> Stock Grid Sync ----------------
+
+
+def infer_market_from_ibkr(symbol: str, currency: str) -> str:
+    ccy = (currency or "").strip().upper()
+    if ccy == "HKD":
+        return "HK"
+    if ccy in ("CNY", "CNH"):
+        return "CN"
+    if ccy == "USD":
+        return "US"
+    s = (symbol or "").strip().upper()
+    if s.isdigit():
+        return "HK" if len(s) <= 5 else "CN"
+    return "US"
+
+
+def canonical_symbol_key(symbol: str, market: str) -> Tuple[str, str]:
+    """Return normalized (market, symbol_key) so 3152 / 03152 / 3152.HK match cleanly."""
+    mk = (market or "US").strip().upper()
+    s = (symbol or "").strip().upper()
+    s = re.sub(r"\.(HK|US|SS|SZ|SH|BJ)$", "", s)
+    if mk == "HK":
+        digits = re.sub(r"\D", "", s)
+        return ("HK", digits.lstrip("0") or "0") if digits else ("HK", s)
+    if mk == "CN":
+        s = re.sub(r"^(SH|SZ|BJ)", "", s)
+        return ("CN", s)
+    return ("US", s)
+
+
+def format_display_symbol(symbol: str, market: str) -> str:
+    mk, key = canonical_symbol_key(symbol, market)
+    if mk == "HK" and key.isdigit():
+        return key.zfill(5)
+    return key
+
+
+def _ibkr_fee_defaults(market: str) -> Tuple[float, float, float, str]:
+    if market == "HK":
+        return (0.0003, 3.0, 0.001, "both")
+    if market == "CN":
+        return (0.00025, 5.0, 0.0005, "sell")
+    return (0.0, 1.0, 0.0, "sell")
+
+
+def list_ibkr_grid_candidates(conn: Any) -> List[Dict[str, Any]]:
+    """Aggregate STK positions & trades from IBKR Flex tables and compare with existing grid strategies."""
+    strats = [dict(r) for r in conn.execute("SELECT * FROM grid_strategies ORDER BY id ASC").fetchall()]
+    strat_by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for s in strats:
+        k = canonical_symbol_key(s["symbol"], s["market"])
+        strat_by_key.setdefault(k, s)
+
+    ext_refs_by_strat: Dict[int, set] = {}
+    for r in conn.execute("SELECT strategy_id, external_ref FROM stock_trades WHERE external_ref != ''").fetchall():
+        ext_refs_by_strat.setdefault(int(r["strategy_id"]), set()).add(str(r["external_ref"]))
+
+    candidates: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+    # 1. Open positions (STK)
+    pos_rows = conn.execute(
+        "SELECT * FROM ibkr_positions WHERE UPPER(COALESCE(asset_category, 'STK')) IN ('STK', 'ETF', '') ORDER BY ABS(position_value_base) DESC"
+    ).fetchall()
+    for pr in pos_rows:
+        p = dict(pr)
+        sym = (p.get("symbol") or "").strip()
+        if not sym:
+            continue
+        mk = infer_market_from_ibkr(sym, p.get("currency") or "")
+        key = canonical_symbol_key(sym, mk)
+        entry = candidates.setdefault(
+            key,
+            {
+                "symbol": format_display_symbol(sym, mk),
+                "raw_symbol": sym,
+                "market": mk,
+                "currency": (p.get("currency") or MARKET_CURRENCY.get(mk, "USD")).upper(),
+                "description": (p.get("description") or "").strip(),
+                "position_qty": 0.0,
+                "mark_price": 0.0,
+                "avg_cost": 0.0,
+                "report_date": p.get("report_date") or "",
+                "trade_count": 0,
+                "unimported_trade_count": 0,
+                "latest_trade_price": 0.0,
+                "latest_trade_qty": 0.0,
+            },
+        )
+        entry["position_qty"] = round(entry["position_qty"] + float(p.get("position") or 0), 4)
+        if float(p.get("mark_price") or 0) > 0:
+            entry["mark_price"] = float(p["mark_price"])
+        if float(p.get("open_price") or 0) > 0 and entry["avg_cost"] <= 0:
+            entry["avg_cost"] = float(p["open_price"])
+        if not entry["description"] and p.get("description"):
+            entry["description"] = str(p["description"]).strip()
+
+    # 2. Executed trades (STK)
+    tr_rows = conn.execute(
+        "SELECT * FROM ibkr_trades WHERE UPPER(COALESCE(asset_category, 'STK')) IN ('STK', 'ETF', '') ORDER BY executed_at DESC, trade_date DESC"
+    ).fetchall()
+    for tr in tr_rows:
+        t = dict(tr)
+        sym = (t.get("symbol") or "").strip()
+        if not sym:
+            continue
+        mk = infer_market_from_ibkr(sym, t.get("currency") or "")
+        key = canonical_symbol_key(sym, mk)
+        entry = candidates.setdefault(
+            key,
+            {
+                "symbol": format_display_symbol(sym, mk),
+                "raw_symbol": sym,
+                "market": mk,
+                "currency": (t.get("currency") or MARKET_CURRENCY.get(mk, "USD")).upper(),
+                "description": (t.get("description") or "").strip(),
+                "position_qty": 0.0,
+                "mark_price": 0.0,
+                "avg_cost": 0.0,
+                "report_date": t.get("report_date") or "",
+                "trade_count": 0,
+                "unimported_trade_count": 0,
+                "latest_trade_price": 0.0,
+                "latest_trade_qty": 0.0,
+            },
+        )
+        entry["trade_count"] += 1
+        if entry["latest_trade_price"] <= 0 and float(t.get("trade_price") or 0) > 0:
+            entry["latest_trade_price"] = float(t["trade_price"])
+            entry["latest_trade_qty"] = abs(float(t.get("quantity") or 0))
+        if not entry["description"] and t.get("description"):
+            entry["description"] = str(t["description"]).strip()
+
+        linked = strat_by_key.get(key)
+        ext_ref = f"ibkr:{t['trade_key']}"
+        if linked:
+            if ext_ref not in ext_refs_by_strat.get(int(linked["id"]), set()):
+                entry["unimported_trade_count"] += 1
+        else:
+            entry["unimported_trade_count"] += 1
+
+    out: List[Dict[str, Any]] = []
+    for key, entry in candidates.items():
+        linked = strat_by_key.get(key)
+        entry["linked_strategy_id"] = int(linked["id"]) if linked else None
+        entry["linked_strategy_name"] = linked["name"] if linked else ""
+        if entry["mark_price"] <= 0 and entry["latest_trade_price"] > 0:
+            entry["mark_price"] = entry["latest_trade_price"]
+        out.append(entry)
+
+    out.sort(key=lambda x: (-x["unimported_trade_count"], -abs(x["position_qty"]), -x["trade_count"], x["symbol"]))
+    return out
+
+
+def sync_ibkr_to_grids(
+    conn: Any,
+    strategy_id: Optional[int] = None,
+    create_symbols: Optional[List[str]] = None,
+    default_step_pct: float = 3.0,
+) -> Dict[str, Any]:
+    """Sync IBKR Flex STK trades & mark prices into matching grid strategies (deduplicated by ibkr:<trade_key>)."""
+    from ..db import now_iso
+
+    ts = now_iso()
+    created_strategies: List[Dict[str, Any]] = []
+
+    # Step 1: Optionally auto-create strategies for user-selected IBKR symbols
+    if create_symbols:
+        wanted = {s.strip().upper() for s in create_symbols if s and s.strip()}
+        cands = list_ibkr_grid_candidates(conn)
+        for c in cands:
+            if c["linked_strategy_id"] is not None:
+                continue
+            cand_matches = (
+                c["symbol"].upper() in wanted
+                or c["raw_symbol"].upper() in wanted
+                or canonical_symbol_key(c["symbol"], c["market"])[1].upper() in wanted
+            )
+            if not cand_matches:
+                continue
+            ref_p = float(c["mark_price"] or c["latest_trade_price"] or c["avg_cost"] or 0)
+            low_p = round(ref_p * 0.80, 4) if ref_p > 0 else 0.0
+            high_p = round(ref_p * 1.25, 4) if ref_p > 0 else 0.0
+            shares = float(c["latest_trade_qty"] or (abs(c["position_qty"]) if abs(c["position_qty"]) > 0 else 100.0))
+            fee_rate, min_fee, tax_rate, tax_side = _ibkr_fee_defaults(c["market"])
+            name = (c["description"] or c["symbol"])[:40]
+            cur = conn.execute(
+                """INSERT INTO grid_strategies
+                (name, symbol, market, currency, grid_type, lower_price, upper_price, step_value, shares_per_grid,
+                 base_price, fee_rate, min_fee, stamp_tax_rate, stamp_tax_side, current_price, price_updated_at,
+                 ibkr_auto_sync, status, notes, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'geometric', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'active', ?, ?, ?)""",
+                (
+                    name,
+                    c["symbol"],
+                    c["market"],
+                    c["currency"],
+                    low_p,
+                    high_p,
+                    round(float(default_step_pct or 3.0), 2),
+                    round(shares, 4),
+                    ref_p,
+                    fee_rate,
+                    min_fee,
+                    tax_rate,
+                    tax_side,
+                    ref_p,
+                    ts if ref_p > 0 else "",
+                    f"从 IBKR 自动创建（原代码 {c['raw_symbol']}），可按需调整网格上下沿与步长",
+                    ts,
+                    ts,
+                ),
+            )
+            created_strategies.append(dict(conn.execute("SELECT * FROM grid_strategies WHERE id = ?", (cur.lastrowid,)).fetchone()))
+
+    # Step 2: Load target grid strategies
+    if strategy_id is not None:
+        strat_rows = conn.execute("SELECT * FROM grid_strategies WHERE id = ?", (strategy_id,)).fetchall()
+    else:
+        strat_rows = conn.execute(
+            "SELECT * FROM grid_strategies WHERE status != 'closed' AND COALESCE(ibkr_auto_sync, 1) = 1 ORDER BY id ASC"
+        ).fetchall()
+    strategies = [dict(r) for r in strat_rows]
+
+    if not strategies:
+        return {
+            "created_strategies": created_strategies,
+            "imported_trades": 0,
+            "skipped_duplicates": 0,
+            "updated_prices": 0,
+            "matched_strategies": 0,
+        }
+
+    # Index IBKR STK trades & positions by canonical (market, symbol)
+    ibkr_trades_by_key: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for r in conn.execute(
+        "SELECT * FROM ibkr_trades WHERE UPPER(COALESCE(asset_category, 'STK')) IN ('STK', 'ETF', '') ORDER BY executed_at ASC, trade_date ASC, trade_key ASC"
+    ).fetchall():
+        t = dict(r)
+        sym = (t.get("symbol") or "").strip()
+        if not sym:
+            continue
+        mk = infer_market_from_ibkr(sym, t.get("currency") or "")
+        key = canonical_symbol_key(sym, mk)
+        ibkr_trades_by_key.setdefault(key, []).append(t)
+
+    ibkr_pos_by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for r in conn.execute(
+        "SELECT * FROM ibkr_positions WHERE UPPER(COALESCE(asset_category, 'STK')) IN ('STK', 'ETF', '') ORDER BY report_date DESC"
+    ).fetchall():
+        p = dict(r)
+        sym = (p.get("symbol") or "").strip()
+        if not sym:
+            continue
+        mk = infer_market_from_ibkr(sym, p.get("currency") or "")
+        key = canonical_symbol_key(sym, mk)
+        if key not in ibkr_pos_by_key and float(p.get("mark_price") or 0) > 0:
+            ibkr_pos_by_key[key] = p
+
+    imported_trades = 0
+    skipped_duplicates = 0
+    updated_prices = 0
+    matched_strategies = 0
+
+    for strat in strategies:
+        sid = int(strat["id"])
+        key = canonical_symbol_key(strat["symbol"], strat["market"])
+        matching_trades = ibkr_trades_by_key.get(key, [])
+        matching_pos = ibkr_pos_by_key.get(key)
+
+        if not matching_trades and not matching_pos:
+            continue
+        matched_strategies += 1
+
+        existing_refs = {
+            str(r["external_ref"])
+            for r in conn.execute(
+                "SELECT external_ref FROM stock_trades WHERE strategy_id = ? AND external_ref != ''",
+                (sid,),
+            ).fetchall()
+        }
+        levels = build_grid_levels(
+            strat.get("lower_price") or 0,
+            strat.get("upper_price") or 0,
+            strat.get("grid_type") or "arithmetic",
+            strat.get("step_value") or 0,
+        )
+
+        latest_tr_price = 0.0
+        for tr in matching_trades:
+            ext_ref = f"ibkr:{tr['trade_key']}"
+            if ext_ref in existing_refs:
+                skipped_duplicates += 1
+                continue
+
+            qty = abs(float(tr.get("quantity") or 0))
+            price = float(tr.get("trade_price") or 0)
+            if qty <= 0 or price <= 0:
+                continue
+
+            raw_side = (tr.get("side") or "").strip().upper()
+            if raw_side in ("BUY", "B", "BOT"):
+                side = "buy"
+            elif raw_side in ("SELL", "S", "SLD"):
+                side = "sell"
+            else:
+                side = "buy" if float(tr.get("quantity") or 0) > 0 else "sell"
+
+            fee = round(abs(float(tr.get("commission") or 0)), 2)
+            executed = (tr.get("executed_at") or tr.get("trade_date") or "").strip()
+            if len(executed) == 10:
+                executed = f"{executed} 16:00"
+            elif len(executed) >= 16:
+                executed = executed[:16]
+            else:
+                executed = ts[:16].replace("T", " ")
+
+            lvl = nearest_level(levels, price)
+            note = f"IBKR 同步 ({tr.get('account_id') or ''})".strip()
+            conn.execute(
+                """INSERT INTO stock_trades
+                (strategy_id, side, price, quantity, fee, tax, grid_level, traded_at, source_type, external_ref, note, created_at)
+                VALUES (?, ?, ?, ?, ?, 0.0, ?, ?, 'ibkr', ?, ?, ?)""",
+                (sid, side, round(price, 4), round(qty, 4), fee, lvl, executed, ext_ref, note, ts),
+            )
+            existing_refs.add(ext_ref)
+            imported_trades += 1
+            latest_tr_price = price
+
+        # Sync IBKR mark_price as reference price when current_price is missing or not fresher
+        ref_price = float(matching_pos["mark_price"]) if matching_pos else latest_tr_price
+        if ref_price > 0 and (float(strat.get("current_price") or 0) <= 0 or matching_pos is not None):
+            # Only overwrite existing current_price if it was 0 or quote_name is empty (don't clobber fresh live quote!)
+            if float(strat.get("current_price") or 0) <= 0 or not (strat.get("quote_name") or "").strip():
+                conn.execute(
+                    "UPDATE grid_strategies SET current_price = ?, price_updated_at = ?, updated_at = ? WHERE id = ?",
+                    (round(ref_price, 4), ts, ts, sid),
+                )
+                updated_prices += 1
+
+    return {
+        "created_strategies": created_strategies,
+        "imported_trades": imported_trades,
+        "skipped_duplicates": skipped_duplicates,
+        "updated_prices": updated_prices,
+        "matched_strategies": matched_strategies,
+    }

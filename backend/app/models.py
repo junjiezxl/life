@@ -478,6 +478,7 @@ class GridStrategyCreate(BaseModel):
     stamp_tax_rate: float = Field(0.0, ge=0, le=0.05)
     stamp_tax_side: Literal["sell", "both"] = "sell"
     current_price: float = Field(0.0, ge=0)
+    ibkr_auto_sync: bool = True
     status: Literal["active", "paused", "closed"] = "active"
     notes: str = ""
 
@@ -498,8 +499,16 @@ class GridStrategyUpdate(BaseModel):
     stamp_tax_rate: Optional[float] = Field(None, ge=0, le=0.05)
     stamp_tax_side: Optional[Literal["sell", "both"]] = None
     current_price: Optional[float] = Field(None, ge=0)
+    ibkr_auto_sync: Optional[bool] = None
     status: Optional[Literal["active", "paused", "closed"]] = None
     notes: Optional[str] = None
+
+
+class GridIbkrSyncRequest(BaseModel):
+    strategy_id: Optional[int] = None
+    create_symbols: List[str] = Field(default_factory=list)
+    refresh_flex_first: bool = False
+    default_step_pct: float = Field(3.0, gt=0.1, le=50.0)
 
 
 class StockTradeCreate(BaseModel):

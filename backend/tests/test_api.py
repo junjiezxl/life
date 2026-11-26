@@ -2121,6 +2121,101 @@ class TestLifeHubAPI(unittest.TestCase):
         self.assertEqual(r_del_s.status_code, 200)
         self.assertTrue(r_del_s.json()["deleted"])
 
+    def test_27_ibkr_flex_sync_to_stock_grids_and_quote_fallback(self):
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+        from app.db import get_conn, now_iso, update_settings
+        from app.services import ibkr_service
+
+        ts = now_iso()
+        # Seed IBKR Flex positions & trades (HK ETF 3152 -> canonical 03152 + US ETF QQQ)
+        with get_conn() as conn:
+            conn.execute("DELETE FROM ibkr_positions")
+            conn.execute("DELETE FROM ibkr_trades")
+            conn.execute(
+                """INSERT INTO ibkr_positions
+                (account_id, report_date, conid, symbol, asset_category, description, currency, fx_rate_to_base,
+                 position, mark_price, position_value, position_value_base, open_price, cost_basis,
+                 unrealized_pnl, unrealized_pnl_base, side, updated_at)
+                VALUES ('U21801100', '2026-11-25', '70001', '3152', 'STK', 'A博时港元ETF', 'HKD', 0.128,
+                        20, 1085.5, 21710.0, 2778.88, 1060.0, 21200.0, 510.0, 65.28, 'Long', ?)""",
+                (ts,),
+            )
+            conn.execute(
+                """INSERT INTO ibkr_trades
+                (trade_key, account_id, trade_id, order_id, conid, symbol, asset_category, description, currency,
+                 fx_rate_to_base, side, open_close, quantity, trade_price, proceeds, proceeds_base, commission,
+                 commission_base, realized_pnl, realized_pnl_base, trade_date, trade_time, report_date, executed_at, created_at)
+                VALUES
+                ('IBKR_T_001', 'U21801100', '1001', 'O1', '70001', '3152', 'STK', 'A博时港元ETF', 'HKD', 0.128,
+                 'BUY', 'O', 20, 1050.0, -21000.0, -2688.0, -18.5, -2.37, 0.0, 0.0, '2026-11-20', '10:15:00', '2026-11-20', '2026-11-20 10:15:00', ?),
+                ('IBKR_T_002', 'U21801100', '1002', 'O2', '70001', '3152', 'STK', 'A博时港元ETF', 'HKD', 0.128,
+                 'SELL', 'C', -10, 1090.0, 10900.0, 1395.2, -12.0, -1.54, 400.0, 51.2, '2026-11-24', '14:20:00', '2026-11-24', '2026-11-24 14:20:00', ?)""",
+                (ts, ts),
+            )
+
+        # 1. Candidates endpoint lists 03152 with 2 unimported trades
+        cands = self.client.get("/api/grids/ibkr-candidates")
+        self.assertEqual(cands.status_code, 200, cands.text)
+        items = cands.json()["items"]
+        hk_item = next(x for x in items if x["symbol"] == "03152")
+        self.assertEqual(hk_item["market"], "HK")
+        self.assertEqual(hk_item["unimported_trade_count"], 2)
+        self.assertAlmostEqual(hk_item["mark_price"], 1085.5, places=2)
+
+        # 2. One-click create grid & import trades from IBKR
+        sync1 = self.client.post("/api/grids/sync-ibkr", json={"create_symbols": ["03152"], "default_step_pct": 3.0})
+        self.assertEqual(sync1.status_code, 200, sync1.text)
+        sb1 = sync1.json()
+        self.assertEqual(len(sb1["created_strategies"]), 1)
+        self.assertEqual(sb1["imported_trades"], 2)
+        sid = sb1["created_strategies"][0]["id"]
+
+        # Verify grid paired the 10-share sell against the 20-share buy & preserved exact IBKR commissions
+        d1 = self.client.get(f"/api/grids/{sid}").json()
+        self.assertEqual(d1["summary"]["holding_qty"], 10.0)
+        self.assertEqual(d1["summary"]["completed_grids"], 1)
+        self.assertAlmostEqual(d1["summary"]["total_fees"], 30.5, places=2)
+        self.assertEqual(d1["trades"][0]["source_type"], "ibkr")
+
+        # 3. Re-sync must be 100% deduplicated (0 new imports, 2 skipped)
+        sync2 = self.client.post("/api/grids/sync-ibkr", json={"strategy_id": sid})
+        self.assertEqual(sync2.status_code, 200)
+        self.assertEqual(sync2.json()["imported_trades"], 0)
+        self.assertEqual(sync2.json()["skipped_duplicates"], 2)
+
+        # 4. Refresh quotes falls back to IBKR mark_price when Tencent returns empty
+        self.client.patch(f"/api/grids/{sid}", json={"current_price": 0})
+        with patch("app.main.fetch_tencent_quotes", new=AsyncMock(return_value={})):
+            rq = self.client.post(f"/api/grids/refresh-quotes?strategy_id={sid}")
+            self.assertEqual(rq.status_code, 200)
+            self.assertEqual(rq.json()["updated_count"], 1)
+            self.assertEqual(rq.json()["ibkr_fallback_count"], 1)
+        d_q = self.client.get(f"/api/grids/{sid}").json()
+        self.assertAlmostEqual(d_q["strategy"]["current_price"], 1085.5, places=2)
+
+        # 5. Auto-sync hook inside sync_ibkr_flex imports a brand-new IBKR trade automatically!
+        sample_xml = """<FlexQueryResponse queryName="LifeHub" type="AF"><FlexStatements count="1">
+          <FlexStatement accountId="U21801100" fromDate="20261125" toDate="20261125" period="LastBusinessDay" whenGenerated="20261125;200000">
+            <Trades>
+              <Trade accountId="U21801100" tradeID="1003" ibOrderID="O3" conid="70001" symbol="3152" assetCategory="STK"
+                     description="A博时港元ETF" currency="HKD" fxRateToBase="0.128" buySell="SELL" openCloseIndicator="C"
+                     quantity="-10" tradePrice="1100.0" proceeds="11000" ibCommission="-11.0" fifoPnlRealized="500"
+                     tradeDate="20261125" tradeTime="150000" reportDate="20261125" multiplier="1" />
+            </Trades>
+          </FlexStatement></FlexStatements></FlexQueryResponse>"""
+        update_settings({"ibkr_flex_token": "tok_grid_hook", "ibkr_flex_query_id": "999001"})
+        with patch.object(ibkr_service, "fetch_flex_statement_xml", new=AsyncMock(return_value=sample_xml)):
+            flex_res = asyncio.run(ibkr_service.sync_ibkr_flex(push_summary=False))
+            self.assertEqual(flex_res["grid_trades_imported"], 1)
+        d_after = self.client.get(f"/api/grids/{sid}").json()
+        self.assertEqual(d_after["summary"]["holding_qty"], 0.0)
+        self.assertEqual(d_after["summary"]["completed_grids"], 2)
+
+        # Cleanup
+        self.assertEqual(self.client.delete(f"/api/grids/{sid}").status_code, 200)
+        update_settings({"ibkr_flex_token": "", "ibkr_flex_query_id": ""})
+
 
 if __name__ == "__main__":
     unittest.main()

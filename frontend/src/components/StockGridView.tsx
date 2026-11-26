@@ -4,11 +4,14 @@ import {
   ArrowUpCircle,
   BellRing,
   CheckCircle2,
+  CheckSquare,
+  Download,
   Edit3,
   Grid3x3,
   Layers,
   Plus,
   RefreshCw,
+  Square,
   Trash2,
   TrendingUp,
   X,
@@ -16,6 +19,7 @@ import {
 import { api } from '../api';
 import type {
   GridDetailResponse,
+  GridIbkrCandidate,
   GridListItem,
   GridListResponse,
   GridStrategy,
@@ -91,8 +95,19 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
   const [formTaxRate, setFormTaxRate] = useState('0');
   const [formTaxSide, setFormTaxSide] = useState<'sell' | 'both'>('sell');
   const [formCurPrice, setFormCurPrice] = useState('');
+  const [formIbkrAutoSync, setFormIbkrAutoSync] = useState(true);
   const [formNotes, setFormNotes] = useState('');
   const [savingStrat, setSavingStrat] = useState(false);
+
+  // IBKR import/sync modal
+  const [showIbkrModal, setShowIbkrModal] = useState(false);
+  const [ibkrLoading, setIbkrLoading] = useState(false);
+  const [ibkrSyncing, setIbkrSyncing] = useState(false);
+  const [ibkrConfigured, setIbkrConfigured] = useState(false);
+  const [ibkrCandidates, setIbkrCandidates] = useState<GridIbkrCandidate[]>([]);
+  const [ibkrSelectedSyms, setIbkrSelectedSyms] = useState<Record<string, boolean>>({});
+  const [ibkrRefreshFlexFirst, setIbkrRefreshFlexFirst] = useState(false);
+  const [ibkrDefaultStepPct, setIbkrDefaultStepPct] = useState('3');
 
   const loadList = async (keepSelected?: number | null) => {
     setLoading(true);
@@ -151,6 +166,7 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
     setFormTaxRate('0');
     setFormTaxSide('sell');
     setFormCurPrice('');
+    setFormIbkrAutoSync(true);
     setFormNotes('');
     setShowModal(true);
   };
@@ -170,8 +186,80 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
     setFormTaxRate(String(s.stamp_tax_rate));
     setFormTaxSide(s.stamp_tax_side);
     setFormCurPrice(s.current_price > 0 ? String(s.current_price) : '');
+    setFormIbkrAutoSync(s.ibkr_auto_sync !== 0 && s.ibkr_auto_sync !== false);
     setFormNotes(s.notes || '');
     setShowModal(true);
+  };
+
+  const openIbkrModal = async () => {
+    setShowIbkrModal(true);
+    setIbkrLoading(true);
+    try {
+      const res = await api.listGridIbkrCandidates();
+      setIbkrConfigured(res.configured);
+      setIbkrCandidates(res.items || []);
+      const sel: Record<string, boolean> = {};
+      (res.items || []).forEach((it) => {
+        if (it.linked_strategy_id === null && (it.trade_count > 0 || Math.abs(it.position_qty) > 0)) {
+          sel[it.symbol] = true;
+        }
+      });
+      setIbkrSelectedSyms(sel);
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : '加载 IBKR 标的失败');
+    } finally {
+      setIbkrLoading(false);
+    }
+  };
+
+  const handleSyncIbkrAll = async (includeCreate: boolean) => {
+    setIbkrSyncing(true);
+    try {
+      const createSymbols = includeCreate
+        ? ibkrCandidates.filter((c) => c.linked_strategy_id === null && ibkrSelectedSyms[c.symbol]).map((c) => c.symbol)
+        : [];
+      const res = await api.syncGridFromIbkr({
+        create_symbols: createSymbols,
+        refresh_flex_first: ibkrRefreshFlexFirst,
+        default_step_pct: Number(ibkrDefaultStepPct || 3),
+      });
+      const parts: string[] = [];
+      if (res.flex_refreshed) parts.push('已拉取最新 IBKR Flex 报表');
+      if (res.created_strategies.length > 0) parts.push(`新建网格 ${res.created_strategies.length} 个`);
+      parts.push(`导入成交 ${res.imported_trades} 笔`);
+      if (res.skipped_duplicates > 0) parts.push(`跳过已存在 ${res.skipped_duplicates} 笔`);
+      onNotify(`IBKR 同步完成：${parts.join('，')}`);
+      const firstNewId = res.created_strategies[0]?.id;
+      await loadList(firstNewId ?? selectedId);
+      if (firstNewId) {
+        setSelectedId(firstNewId);
+      } else if (selectedId) {
+        await loadDetail(selectedId);
+      }
+      setShowIbkrModal(false);
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : 'IBKR 同步失败');
+    } finally {
+      setIbkrSyncing(false);
+    }
+  };
+
+  const handleSyncIbkrSingle = async (strategyId: number) => {
+    setIbkrSyncing(true);
+    try {
+      const res = await api.syncGridFromIbkr({ strategy_id: strategyId });
+      if (res.detail) setDetail(res.detail);
+      await loadList(strategyId);
+      onNotify(
+        res.imported_trades > 0
+          ? `已从 IBKR 同步导入 ${res.imported_trades} 笔新成交（跳过重复 ${res.skipped_duplicates} 笔）`
+          : `IBKR 成交已是最新（已核对 ${res.skipped_duplicates} 笔，无新增）`,
+      );
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : '同步 IBKR 成交失败');
+    } finally {
+      setIbkrSyncing(false);
+    }
   };
 
   const applyPreset = (p: (typeof FEE_PRESETS)[number]) => {
@@ -233,6 +321,7 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
         stamp_tax_rate: Number(formTaxRate || 0),
         stamp_tax_side: formTaxSide,
         current_price: Number(formCurPrice || 0),
+        ibkr_auto_sync: formIbkrAutoSync,
         notes: formNotes.trim(),
       };
       if (editingStrategy) {
@@ -448,22 +537,29 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
             </span>
             <span className="font-bold text-slate-900">{portfolio?.triggered_count ?? 0} 只</span>
           </div>
-          <div className="mt-3 flex flex-wrap gap-2">
+          <div className="mt-3 flex flex-wrap gap-1.5">
             <button
               type="button"
               onClick={() => handleRefreshQuotes()}
               disabled={refreshingQuotes || items.length === 0}
-              className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-45 cursor-pointer"
+              className="flex-1 inline-flex items-center justify-center gap-1 rounded-xl border border-slate-200 bg-slate-50 px-2.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-45 cursor-pointer"
             >
               <RefreshCw className={`h-3.5 w-3.5 ${refreshingQuotes ? 'animate-spin' : ''}`} />
               刷新行情
             </button>
             <button
               type="button"
-              onClick={openCreateModal}
-              className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-xl bg-slate-900 px-3 py-2 text-xs font-medium text-white hover:bg-slate-800 cursor-pointer"
+              onClick={openIbkrModal}
+              className="flex-1 inline-flex items-center justify-center gap-1 rounded-xl border border-sky-200 bg-sky-50 px-2.5 py-2 text-xs font-medium text-sky-700 hover:bg-sky-100 cursor-pointer"
             >
-              <Plus className="h-3.5 w-3.5" /> 新建网格
+              <Download className="h-3.5 w-3.5" /> IBKR 同步
+            </button>
+            <button
+              type="button"
+              onClick={openCreateModal}
+              className="w-full inline-flex items-center justify-center gap-1.5 rounded-xl bg-slate-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-slate-800 cursor-pointer"
+            >
+              <Plus className="h-3.5 w-3.5" /> 新建网格计划
             </button>
           </div>
         </div>
@@ -631,6 +727,15 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
                         设价
                       </button>
                     </div>
+                    <button
+                      type="button"
+                      onClick={() => handleSyncIbkrSingle(detail.strategy.id)}
+                      disabled={ibkrSyncing}
+                      title="从 IBKR Flex 同步该标的成交记录"
+                      className="inline-flex items-center gap-1 rounded-xl border border-sky-200 bg-sky-50 px-2.5 py-1.5 text-xs font-medium text-sky-700 hover:bg-sky-100 disabled:opacity-50 cursor-pointer"
+                    >
+                      <Download className="h-3.5 w-3.5" /> 同步IBKR
+                    </button>
                     <button
                       type="button"
                       onClick={() => handleRefreshQuotes(detail.strategy.id)}
@@ -1033,6 +1138,11 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
                               >
                                 {t.side === 'buy' ? '买入' : '卖出'}
                               </span>
+                              {t.source_type === 'ibkr' && (
+                                <span className="rounded bg-sky-50 border border-sky-200 px-1.5 py-0.5 text-[10px] font-semibold text-sky-700">
+                                  IBKR
+                                </span>
+                              )}
                               <span className="font-mono font-bold text-slate-900">
                                 {fmtPrice(t.price)} × {t.quantity} 股
                               </span>
@@ -1418,6 +1528,15 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
               </div>
             </div>
 
+            <label className="inline-flex items-center gap-2 text-xs text-slate-600 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={formIbkrAutoSync}
+                onChange={(e) => setFormIbkrAutoSync(e.target.checked)}
+              />
+              <span>每次 IBKR Flex 同步时，自动将同代码的新成交记录写入该网格（自动去重）</span>
+            </label>
+
             {modalPreview && (
               <div className="rounded-xl bg-indigo-50/70 border border-indigo-200 p-3 text-xs text-indigo-900 flex flex-wrap gap-x-5 gap-y-1">
                 <span>
@@ -1449,6 +1568,156 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
               </button>
             </div>
           </form>
+        </div>
+      )}
+
+      {/* IBKR Flex Import & Sync Modal */}
+      {showIbkrModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4 backdrop-blur-[1px]">
+          <div className="w-full max-w-2xl rounded-2xl bg-white p-6 shadow-xl space-y-4 max-h-[88vh] flex flex-col">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <div>
+                <h3 className="text-base font-bold text-slate-900">从 IBKR 盈透同步标的与成交到网格账本</h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  直接复用「IBKR 每日汇总」拉取的真实成交（精准成交价、股数、佣金）与持仓市价，按交易号自动去重
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowIbkrModal(false)}
+                className="text-slate-400 hover:text-slate-700 cursor-pointer"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl bg-sky-50/70 border border-sky-200/80 px-3.5 py-2.5 text-xs">
+              <label className="inline-flex items-center gap-2 text-slate-700 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={ibkrRefreshFlexFirst}
+                  onChange={(e) => setIbkrRefreshFlexFirst(e.target.checked)}
+                  disabled={!ibkrConfigured}
+                />
+                <span>同步前先向 IBKR Flex 拉取最新报表{!ibkrConfigured ? '（未配置 Flex Token）' : ''}</span>
+              </label>
+              <div className="flex items-center gap-1.5">
+                <span className="text-slate-500">新建网格默认等比步长</span>
+                <input
+                  type="number"
+                  step="0.5"
+                  min="0.5"
+                  max="20"
+                  value={ibkrDefaultStepPct}
+                  onChange={(e) => setIbkrDefaultStepPct(e.target.value)}
+                  className="w-16 rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs font-mono"
+                />
+                <span className="text-slate-500">%</span>
+              </div>
+            </div>
+
+            <div className="flex-1 overflow-y-auto space-y-2 pr-1">
+              {ibkrLoading ? (
+                <div className="py-10 text-center text-xs text-slate-400">正在读取 IBKR 持仓与成交标的...</div>
+              ) : ibkrCandidates.length === 0 ? (
+                <div className="rounded-xl bg-slate-50 py-10 px-4 text-center text-xs text-slate-500 space-y-2">
+                  <div>本地 IBKR 数据库里还没有股票/ETF 持仓或成交记录。</div>
+                  <div>请先在「IBKR 每日汇总」完成一次同步，或勾选上方「先向 IBKR Flex 拉取最新报表」后直接点同步。</div>
+                </div>
+              ) : (
+                ibkrCandidates.map((c) => {
+                  const isLinked = c.linked_strategy_id !== null;
+                  const checked = Boolean(ibkrSelectedSyms[c.symbol]);
+                  const mk = MARKET_META[c.market] || MARKET_META.US;
+                  return (
+                    <div
+                      key={`${c.market}-${c.symbol}`}
+                      className={`flex flex-wrap items-center justify-between gap-2 rounded-xl border px-3.5 py-2.5 text-xs ${
+                        isLinked
+                          ? 'border-emerald-200 bg-emerald-50/30'
+                          : checked
+                            ? 'border-sky-300 bg-sky-50/40'
+                            : 'border-slate-100 bg-slate-50/50'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        {isLinked ? (
+                          <CheckCircle2 className="h-4 w-4 text-emerald-600 shrink-0" />
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => setIbkrSelectedSyms((p) => ({ ...p, [c.symbol]: !p[c.symbol] }))}
+                            className="text-sky-600 cursor-pointer shrink-0"
+                          >
+                            {checked ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4 text-slate-400" />}
+                          </button>
+                        )}
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span className={`rounded border px-1.5 py-0.5 text-[10px] font-medium ${mk.cls}`}>
+                              {mk.label}
+                            </span>
+                            <span className="font-mono font-bold text-slate-900">{c.symbol}</span>
+                            {c.description && (
+                              <span className="text-slate-600 truncate max-w-[200px]">{c.description}</span>
+                            )}
+                            {isLinked ? (
+                              <span className="rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700">
+                                已关联：{c.linked_strategy_name}
+                              </span>
+                            ) : (
+                              <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">
+                                勾选自动建网格
+                              </span>
+                            )}
+                          </div>
+                          <div className="mt-0.5 text-[11px] text-slate-400">
+                            持仓 {c.position_qty} 股 · 市价 {c.mark_price > 0 ? fmtPrice(c.mark_price) : '-'} {c.currency} · IBKR 总成交 {c.trade_count} 笔
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="text-right shrink-0">
+                        {c.unimported_trade_count > 0 ? (
+                          <span className="rounded-md bg-amber-50 border border-amber-200 px-2 py-0.5 text-[11px] font-semibold text-amber-700">
+                            待导入 {c.unimported_trade_count} 笔
+                          </span>
+                        ) : (
+                          <span className="text-[11px] text-slate-400">成交已同步</span>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+
+            <div className="flex flex-wrap items-center justify-end gap-2 border-t border-slate-100 pt-3">
+              <button
+                type="button"
+                onClick={() => setShowIbkrModal(false)}
+                className="rounded-xl border border-slate-200 px-4 py-2 text-xs font-medium text-slate-600 hover:bg-slate-50 cursor-pointer"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                disabled={ibkrSyncing}
+                onClick={() => handleSyncIbkrAll(false)}
+                className="rounded-xl border border-sky-200 bg-sky-50 px-4 py-2 text-xs font-medium text-sky-700 hover:bg-sky-100 disabled:opacity-50 cursor-pointer"
+              >
+                {ibkrSyncing ? '同步中...' : '仅同步已有网格新成交'}
+              </button>
+              <button
+                type="button"
+                disabled={ibkrSyncing}
+                onClick={() => handleSyncIbkrAll(true)}
+                className="rounded-xl bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-50 cursor-pointer"
+              >
+                {ibkrSyncing ? '导入中...' : '勾选标的建网格并导入全部成交'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

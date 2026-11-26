@@ -36,6 +36,7 @@ from .models import (
     EmailFetchRequest,
     EmailImportRequest,
     EmailParseTextRequest,
+    GridIbkrSyncRequest,
     GridStrategyCreate,
     GridStrategyUpdate,
     LoanCreate,
@@ -115,9 +116,13 @@ from .services.grid_service import (
     MARKET_CURRENCY,
     build_grid_levels,
     calc_trade_fees,
+    canonical_symbol_key,
     compute_strategy_state,
     fetch_tencent_quotes,
+    infer_market_from_ibkr,
+    list_ibkr_grid_candidates,
     nearest_level,
+    sync_ibkr_to_grids,
     to_tencent_code,
 )
 from .services.ibkr_service import (
@@ -3715,8 +3720,8 @@ def create_grid_strategy(payload: GridStrategyCreate) -> Dict[str, Any]:
         cur = conn.execute(
             """INSERT INTO grid_strategies
             (name, symbol, market, currency, grid_type, lower_price, upper_price, step_value, shares_per_grid,
-             base_price, fee_rate, min_fee, stamp_tax_rate, stamp_tax_side, current_price, status, notes, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             base_price, fee_rate, min_fee, stamp_tax_rate, stamp_tax_side, current_price, ibkr_auto_sync, status, notes, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 name,
                 sym,
@@ -3733,6 +3738,7 @@ def create_grid_strategy(payload: GridStrategyCreate) -> Dict[str, Any]:
                 payload.stamp_tax_rate,
                 payload.stamp_tax_side,
                 payload.current_price,
+                1 if payload.ibkr_auto_sync else 0,
                 payload.status,
                 payload.notes.strip(),
                 ts,
@@ -3740,6 +3746,41 @@ def create_grid_strategy(payload: GridStrategyCreate) -> Dict[str, Any]:
             ),
         )
         return _load_grid_detail(conn, int(cur.lastrowid))
+
+
+@app.get("/api/grids/ibkr-candidates")
+def get_grid_ibkr_candidates() -> Dict[str, Any]:
+    cfg = get_all_settings()
+    configured = bool((cfg.get("ibkr_flex_token") or "").strip() and (cfg.get("ibkr_flex_query_id") or "").strip())
+    with get_conn() as conn:
+        items = list_ibkr_grid_candidates(conn)
+    return {"configured": configured, "items": items}
+
+
+@app.post("/api/grids/sync-ibkr")
+async def sync_grid_from_ibkr(payload: Optional[GridIbkrSyncRequest] = None) -> Dict[str, Any]:
+    req = payload or GridIbkrSyncRequest()
+    flex_result: Optional[Dict[str, Any]] = None
+    if req.refresh_flex_first:
+        try:
+            flex_result = await sync_ibkr_flex(push_summary=False)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"拉取 IBKR Flex 报表失败：{exc}") from exc
+
+    with get_conn() as conn:
+        res = sync_ibkr_to_grids(
+            conn,
+            strategy_id=req.strategy_id,
+            create_symbols=req.create_symbols,
+            default_step_pct=req.default_step_pct,
+        )
+        detail = _load_grid_detail(conn, req.strategy_id) if req.strategy_id is not None else None
+    return {
+        **res,
+        "flex_refreshed": flex_result is not None,
+        "flex_result": flex_result,
+        "detail": detail,
+    }
 
 
 @app.get("/api/grids/{strategy_id}")
@@ -3761,6 +3802,8 @@ def update_grid_strategy(strategy_id: int, payload: GridStrategyUpdate) -> Dict[
         updates["notes"] = updates["notes"].strip()
     if "currency" in updates and updates["currency"] is not None:
         updates["currency"] = updates["currency"].strip().upper()
+    if "ibkr_auto_sync" in updates and updates["ibkr_auto_sync"] is not None:
+        updates["ibkr_auto_sync"] = 1 if updates["ibkr_auto_sync"] else 0
     ts = now_iso()
     if "current_price" in updates:
         updates["price_updated_at"] = ts
@@ -3867,25 +3910,47 @@ async def refresh_grid_quotes(strategy_id: Optional[int] = Query(None)) -> Dict[
 
     ts = now_iso()
     updated = 0
+    ibkr_fallback_count = 0
     with get_conn() as conn:
+        # Build IBKR mark_price fallback map in case Tencent doesn't return an overseas ETF/stock quote
+        ibkr_pos_map: Dict[tuple, Dict[str, Any]] = {}
+        for pr in conn.execute("SELECT symbol, currency, mark_price, description FROM ibkr_positions WHERE mark_price > 0 ORDER BY report_date DESC").fetchall():
+            pd = _row_to_dict(pr)
+            mk = infer_market_from_ibkr(pd["symbol"], pd.get("currency") or "")
+            k = canonical_symbol_key(pd["symbol"], mk)
+            ibkr_pos_map.setdefault(k, pd)
+
         for s in strats:
             code = to_tencent_code(s["symbol"], s["market"])
             q = quotes.get(code)
-            if not q:
-                errors.append(f"未获取到 {s['symbol']} ({code}) 报价")
+            if q:
+                new_name = s["name"]
+                if (not new_name or new_name.upper() == s["symbol"].upper()) and q.get("name"):
+                    new_name = q["name"]
+                conn.execute(
+                    """UPDATE grid_strategies
+                    SET current_price = ?, prev_close = ?, quote_name = ?, name = ?, price_updated_at = ?, updated_at = ?
+                    WHERE id = ?""",
+                    (q["price"], q["prev_close"], q.get("name") or "", new_name, ts, ts, s["id"]),
+                )
+                updated += 1
                 continue
-            new_name = s["name"]
-            if (not new_name or new_name.upper() == s["symbol"].upper()) and q.get("name"):
-                new_name = q["name"]
-            conn.execute(
-                """UPDATE grid_strategies
-                SET current_price = ?, prev_close = ?, quote_name = ?, name = ?, price_updated_at = ?, updated_at = ?
-                WHERE id = ?""",
-                (q["price"], q["prev_close"], q.get("name") or "", new_name, ts, ts, s["id"]),
-            )
-            updated += 1
 
-    return {"updated_count": updated, "quotes": quotes, "errors": errors}
+            # Fallback to IBKR Flex mark_price if available
+            ibkr_p = ibkr_pos_map.get(canonical_symbol_key(s["symbol"], s["market"]))
+            if ibkr_p and float(ibkr_p.get("mark_price") or 0) > 0:
+                conn.execute(
+                    """UPDATE grid_strategies
+                    SET current_price = ?, price_updated_at = ?, updated_at = ?
+                    WHERE id = ?""",
+                    (round(float(ibkr_p["mark_price"]), 4), ts, ts, s["id"]),
+                )
+                updated += 1
+                ibkr_fallback_count += 1
+            else:
+                errors.append(f"未获取到 {s['symbol']} ({code}) 报价")
+
+    return {"updated_count": updated, "ibkr_fallback_count": ibkr_fallback_count, "quotes": quotes, "errors": errors}
 
 
 # ---------------- Settings ----------------

@@ -679,11 +679,22 @@ async def sync_ibkr_flex(
             parsed = parse_flex_xml(xml_text)
             counts = _persist_parsed_flex(parsed)
 
+            # Auto-sync newly fetched IBKR stock/ETF trades into linked stock grid strategies
+            grid_sync_summary: Dict[str, Any] = {}
+            try:
+                from .grid_service import sync_ibkr_to_grids
+
+                with get_conn() as conn:
+                    grid_sync_summary = sync_ibkr_to_grids(conn)
+            except Exception as grid_exc:
+                logger.warning("Auto-sync IBKR trades to grids failed: %s", grid_exc)
+
             synced_at = now_iso()
             result = {
                 "ok": True,
                 "accounts": parsed["accounts"],
                 **counts,
+                "grid_trades_imported": int(grid_sync_summary.get("imported_trades") or 0),
                 "synced_at": synced_at,
             }
 

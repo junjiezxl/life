@@ -665,6 +665,7 @@ export interface GridStrategy {
   prev_close: number;
   quote_name: string;
   price_updated_at: string;
+  ibkr_auto_sync?: number | boolean;
   status: 'active' | 'paused' | 'closed';
   notes: string;
   created_at: string;
@@ -721,6 +722,8 @@ export interface StockTrade {
   amount: number;
   grid_level: number | null;
   traded_at: string;
+  source_type?: string;
+  external_ref?: string;
   note: string;
   remaining_qty?: number;
   pair_status?: 'open' | 'partial' | 'closed' | 'paired' | 'unmatched';
@@ -791,6 +794,34 @@ export interface GridDetailResponse {
   pairs: GridPairRecord[];
   open_lots: GridOpenLot[];
   signals: GridSignals;
+}
+
+export interface GridIbkrCandidate {
+  symbol: string;
+  raw_symbol: string;
+  market: 'CN' | 'HK' | 'US';
+  currency: string;
+  description: string;
+  position_qty: number;
+  mark_price: number;
+  avg_cost: number;
+  report_date: string;
+  trade_count: number;
+  unimported_trade_count: number;
+  latest_trade_price: number;
+  latest_trade_qty: number;
+  linked_strategy_id: number | null;
+  linked_strategy_name: string;
+}
+
+export interface GridIbkrSyncResponse {
+  created_strategies: GridStrategy[];
+  imported_trades: number;
+  skipped_duplicates: number;
+  updated_prices: number;
+  matched_strategies: number;
+  flex_refreshed: boolean;
+  detail: GridDetailResponse | null;
 }
 
 export interface CreditCard {

@@ -584,10 +584,22 @@ export const api = {
       { method: 'DELETE' },
     ),
   refreshGridQuotes: (strategyId?: number) =>
-    request<{ updated_count: number; quotes: Record<string, unknown>; errors: string[] }>(
+    request<{ updated_count: number; ibkr_fallback_count?: number; quotes: Record<string, unknown>; errors: string[] }>(
       `/api/grids/refresh-quotes${strategyId ? `?strategy_id=${strategyId}` : ''}`,
       { method: 'POST' },
     ),
+  listGridIbkrCandidates: () =>
+    request<{ configured: boolean; items: import('./types').GridIbkrCandidate[] }>('/api/grids/ibkr-candidates'),
+  syncGridFromIbkr: (payload?: {
+    strategy_id?: number;
+    create_symbols?: string[];
+    refresh_flex_first?: boolean;
+    default_step_pct?: number;
+  }) =>
+    request<import('./types').GridIbkrSyncResponse>('/api/grids/sync-ibkr', {
+      method: 'POST',
+      body: JSON.stringify(payload || {}),
+    }),
 
   resetData: (reseed = false) =>
     request<{ ok: boolean; reseeded: boolean }>(`/api/settings/reset-data?reseed=${reseed}`, { method: 'POST' }),
