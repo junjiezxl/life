@@ -427,6 +427,7 @@ class TestLifeHubAPI(unittest.TestCase):
                 "bark_sound": "bell",
                 "bark_push_on_create": "1",
                 "bark_due_advance_min": "15",
+                "extra_push_urls": "",
             },
         )
 
@@ -923,6 +924,7 @@ class TestLifeHubAPI(unittest.TestCase):
                 "bark_device_key": "test_bark_key_upd",
                 "bark_group": "LifeHub",
                 "bark_push_on_update": "1",
+                "extra_push_urls": "",
             },
         )
 
@@ -2672,6 +2674,63 @@ class TestLifeHubAPI(unittest.TestCase):
             self.assertEqual(len(r_2y.json()["trades"]), 2)
 
         self.assertEqual(self.client.delete(f"/api/email-accounts/{mb_id}").status_code, 200)
+
+    def test_31_extra_push_chuckfang_meow(self) -> None:
+        """Verify notifications dispatch to both Bark and extra MeoW/Chuckfang URLs cleanly."""
+        from unittest.mock import AsyncMock, patch
+        from app.db import DEFAULT_SETTINGS, update_settings
+
+        # 1. Default settings include https://api.chuckfang.com/f6281445/ enabled out-of-the-box
+        self.assertIn("https://api.chuckfang.com/f6281445/", DEFAULT_SETTINGS["extra_push_urls"])
+        self.assertEqual(DEFAULT_SETTINGS["extra_push_enabled"], "1")
+
+        update_settings(
+            {
+                "bark_enabled": "1",
+                "bark_server_url": "https://api.day.app",
+                "bark_device_key": "test_bark_key_dual",
+                "bark_group": "LifeHub",
+                "bark_push_on_create": "1",
+                "extra_push_enabled": "1",
+                "extra_push_urls": "https://api.chuckfang.com/f6281445/",
+            }
+        )
+
+        class FakeResp:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"status": 200, "code": 200, "data": True, "msg": "发送成功"}
+
+        with patch("app.services.bark_service.httpx.AsyncClient.post", new=AsyncMock(return_value=FakeResp())) as mock_post:
+            # 2. Test-bark triggers BOTH Bark and https://api.chuckfang.com/f6281445/
+            res = self.client.post("/api/settings/test-bark")
+            self.assertEqual(res.status_code, 200, res.text)
+            self.assertTrue(res.json()["ok"], res.json())
+            self.assertEqual(mock_post.call_count, 2)
+            urls = [c.args[0] for c in mock_post.call_args_list]
+            self.assertEqual(urls[0], "https://api.day.app/test_bark_key_dual")
+            self.assertEqual(urls[1], "https://api.chuckfang.com/f6281445/")
+            meow_payload = mock_post.call_args_list[1].kwargs["json"]
+            self.assertIn("title", meow_payload)
+            self.assertIn("msg", meow_payload)
+            self.assertNotIn("body", meow_payload)
+
+            # 3. Works standalone with only extra_push_urls even when bark_device_key is blank
+            mock_post.reset_mock()
+            update_settings({"bark_device_key": ""})
+            rem = self.client.post(
+                "/api/reminders",
+                json={"title": "MeoW 独立测试", "description": "仅附加地址推送", "priority": "high", "category": "life"},
+            )
+            self.assertEqual(rem.status_code, 200, rem.text)
+            self.assertEqual(mock_post.call_count, 1)
+            self.assertEqual(mock_post.call_args.args[0], "https://api.chuckfang.com/f6281445/")
+            self.assertIn("MeoW 独立测试", mock_post.call_args.kwargs["json"]["title"])
+            self.client.delete(f"/api/reminders/{rem.json()['id']}")
+
+        update_settings({"bark_enabled": "0", "bark_device_key": ""})
 
 
 if __name__ == "__main__":

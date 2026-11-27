@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 from ..db import get_all_settings, get_conn, now_iso, update_settings
-from .bark_service import send_bark_push
+from .bark_service import has_any_push_channel, send_bark_push
 from .proxy_service import resolve_proxy_url
 
 logger = logging.getLogger("lifehub.ibkr")
@@ -703,7 +703,7 @@ async def sync_ibkr_flex(
                 if push_summary is None
                 else bool(push_summary)
             )
-            if should_push and cfg.get("bark_enabled") == "1" and (cfg.get("bark_device_key") or "").strip():
+            if should_push and has_any_push_channel(cfg):
                 overview = get_ibkr_overview()
                 latest_date = overview["summary"].get("latest_report_date") or ""
                 if latest_date and latest_date != (cfg.get("ibkr_last_notified_date") or ""):

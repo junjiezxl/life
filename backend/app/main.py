@@ -80,7 +80,7 @@ from .services.auth_service import (
     has_any_user,
     update_user_credentials,
 )
-from .services.bark_service import format_reminder_bark_message, send_bark_push
+from .services.bark_service import format_reminder_bark_message, has_any_push_channel, send_bark_push
 from .services.ctrader_service import (
     get_ctrader_sync_status,
     list_ctrader_deals,
@@ -380,7 +380,7 @@ async def _push_new_reminders_bark(reminders: List[Dict[str, Any]], prefix: str 
     if not reminders:
         return
     settings = get_all_settings()
-    if settings.get("bark_enabled", "0") != "1" or settings.get("bark_push_on_create", "1") != "1":
+    if not has_any_push_channel(settings) or settings.get("bark_push_on_create", "1") != "1":
         return
     for rem in reminders[:10]:
         msg = format_reminder_bark_message(rem, prefix=prefix)
@@ -413,7 +413,7 @@ def _parse_due_dt(due_str: str) -> Optional[datetime]:
 
 async def _check_and_push_due_reminders() -> int:
     settings = get_all_settings()
-    if settings.get("bark_enabled", "0") != "1":
+    if not has_any_push_channel(settings):
         return 0
 
     advance_min = max(0, int(settings.get("bark_due_advance_min") or 15))
@@ -569,7 +569,7 @@ async def check_and_notify_version_update() -> Dict[str, Any]:
     settings = get_all_settings()
     if settings.get("bark_push_on_update", "1") != "1":
         return {"notified": False, "reason": "disabled"}
-    if settings.get("bark_enabled") != "1" or not (settings.get("bark_device_key") or "").strip():
+    if not has_any_push_channel(settings):
         return {"notified": False, "reason": "bark_unconfigured"}
     if settings.get("last_notified_build_id", "") == notify_key:
         return {"notified": False, "reason": "already_notified"}

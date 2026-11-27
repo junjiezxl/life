@@ -67,6 +67,8 @@ DEFAULT_SETTINGS: Dict[str, str] = {
     "bark_push_on_create": "1",
     "bark_push_on_update": "1",
     "bark_due_advance_min": "15",
+    "extra_push_enabled": "1",
+    "extra_push_urls": "https://api.chuckfang.com/f6281445/",
     "global_proxy_url": "",
     "global_proxy_enabled": "1",
     "ai_use_proxy": "0",

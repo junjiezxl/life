@@ -19,7 +19,7 @@ import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..db import get_all_settings, get_conn, now_iso
-from .bark_service import send_bark_push
+from .bark_service import has_any_push_channel, send_bark_push
 from .ctrader_oauth_service import is_token_expired_error, refresh_ctrader_token
 
 logger = logging.getLogger("lifehub.ctrader_sync")
@@ -1256,7 +1256,7 @@ async def sync_ctrader_deals(
                 should_push
                 and inserted_deals
                 and cfg.get("ctrader_bark_push_enabled", "1") != "0"
-                and cfg.get("bark_enabled") == "1"
+                and has_any_push_channel(cfg)
             ):
                 _sync_state["phase"] = "pushing_bark"
                 for d in inserted_deals[:10]:

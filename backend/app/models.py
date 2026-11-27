@@ -268,6 +268,8 @@ class SettingsUpdateRequest(BaseModel):
     bark_push_on_create: Optional[str] = None
     bark_push_on_update: Optional[str] = None
     bark_due_advance_min: Optional[str] = None
+    extra_push_enabled: Optional[str] = None
+    extra_push_urls: Optional[str] = None
     global_proxy_url: Optional[str] = None
     global_proxy_enabled: Optional[str] = None
     ai_use_proxy: Optional[str] = None

@@ -1269,7 +1269,15 @@ export const SettingsView: React.FC<Props> = ({
               checked={settings.bark_enabled === '1'}
               onChange={(e) => updateField('bark_enabled', e.target.checked ? '1' : '0')}
             />
-            <span>启用 Bark 提醒推送</span>
+            <span>启用消息推送（Bark / 附加通道）</span>
+          </label>
+          <label className="inline-flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={settings.extra_push_enabled !== '0'}
+              onChange={(e) => updateField('extra_push_enabled', e.target.checked ? '1' : '0')}
+            />
+            <span>同时推送附加地址（MeoW / Chuckfang 等）</span>
           </label>
           <label className="inline-flex items-center gap-2 cursor-pointer">
             <input
@@ -1285,8 +1293,21 @@ export const SettingsView: React.FC<Props> = ({
               checked={settings.bark_push_on_update !== '0'}
               onChange={(e) => updateField('bark_push_on_update', e.target.checked ? '1' : '0')}
             />
-            <span>版本更新上线后自动发送 Bark 通知（同一版本只推一次）</span>
+            <span>版本更新上线后自动发送通知（同一版本只推一次）</span>
           </label>
+        </div>
+
+        <div>
+          <label className="block text-xs font-medium text-slate-700 mb-1">
+            附加推送地址（每行一个或逗号分隔；支持 MeoW <code className="text-slate-600">api.chuckfang.com</code>、其他 Bark 地址或 Webhook）
+          </label>
+          <textarea
+            rows={2}
+            value={settings.extra_push_urls ?? 'https://api.chuckfang.com/f6281445/'}
+            onChange={(e) => updateField('extra_push_urls', e.target.value)}
+            placeholder="https://api.chuckfang.com/f6281445/"
+            className="w-full rounded-xl border border-slate-200 px-3 py-2 text-xs font-mono"
+          />
         </div>
 
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">

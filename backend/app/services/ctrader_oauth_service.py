@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional
 import httpx
 
 from ..db import get_all_settings, update_settings
-from .bark_service import send_bark_push
+from .bark_service import has_any_push_channel, send_bark_push
 from .proxy_service import build_httpx_kwargs
 
 logger = logging.getLogger("lifehub.ctrader_oauth")
@@ -232,7 +232,7 @@ async def refresh_ctrader_token(
             )
             saved = _save_token_bundle(data)
         except Exception as exc:
-            if notify_bark and cfg.get("bark_enabled") == "1" and cfg.get("bark_device_key"):
+            if notify_bark and has_any_push_channel(cfg):
                 try:
                     await send_bark_push(
                         title="⚠️ cTrader Token 自动续期失败",
@@ -245,7 +245,7 @@ async def refresh_ctrader_token(
                     pass
             raise
 
-    if notify_bark and cfg.get("bark_enabled") == "1" and cfg.get("bark_device_key"):
+    if notify_bark and has_any_push_channel(cfg):
         try:
             await send_bark_push(
                 title="🔄 cTrader Token 自动续期成功",
