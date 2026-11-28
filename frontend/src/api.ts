@@ -553,6 +553,54 @@ export const api = {
     request<import('./types').IbkrOverviewResponse>(
       `/api/ibkr/overview${accountId ? `?account_id=${encodeURIComponent(accountId)}` : ''}`,
     ),
+  getIbGatewayStatus: () => request<import('./types').IbGatewayStatus>('/api/ibgw/status'),
+  connectIbGateway: () => request<import('./types').IbGatewayStatus>('/api/ibgw/connect', { method: 'POST' }),
+  disconnectIbGateway: () => request<import('./types').IbGatewayStatus>('/api/ibgw/disconnect', { method: 'POST' }),
+  testIbGateway: () =>
+    request<{ ok: boolean; accounts: string[]; trading_mode?: string; gateway_status?: import('./types').IbGatewayStatus; message: string }>(
+      '/api/ibgw/test',
+      { method: 'POST' },
+    ),
+  syncIbGateway: (options?: { sync_grids?: boolean; reconcile_orders?: boolean; push_summary?: boolean }) =>
+    request<{
+      ok: boolean;
+      accounts: string[];
+      trading_mode?: string;
+      equity_snapshots: number;
+      positions: number;
+      trades_inserted: number;
+      trades_updated: number;
+      open_orders_synced?: number;
+      grid_trades_imported?: number;
+      synced_at: string;
+    }>('/api/ibgw/sync', {
+      method: 'POST',
+      body: JSON.stringify(options || { sync_grids: true }),
+    }),
+  listIbGatewayOrders: (strategyId?: number) =>
+    request<{ items: import('./types').IbGatewayOrder[] }>(
+      `/api/ibgw/orders${strategyId ? `?strategy_id=${strategyId}` : ''}`,
+    ),
+  placeIbGatewayTestOrder: (payload: {
+    symbol: string;
+    market: 'CN' | 'HK' | 'US';
+    side: 'buy' | 'sell';
+    quantity: number;
+    lmt_price: number;
+    currency?: string;
+    exchange?: string;
+    strategy_id?: number;
+    dry_run?: boolean;
+  }) =>
+    request<{ ok: boolean; dry_run: boolean; message: string; order?: import('./types').IbGatewayOrder }>(
+      '/api/ibgw/test-order',
+      { method: 'POST', body: JSON.stringify(payload) },
+    ),
+  cancelIbGatewayOrder: (orderRowId: number) =>
+    request<{ ok: boolean; cancelled_live: boolean; order: import('./types').IbGatewayOrder }>(
+      `/api/ibgw/orders/${orderRowId}/cancel`,
+      { method: 'POST' },
+    ),
   syncIbkrFlex: (options?: { query_id?: string; push_summary?: boolean }) =>
     request<{
       ok: boolean;
@@ -561,13 +609,12 @@ export const api = {
       positions: number;
       trades_inserted: number;
       trades_updated: number;
-      cash_transactions: number;
       synced_at: string;
-    }>('/api/ibkr/sync', {
+    }>('/api/ibgw/sync', {
       method: 'POST',
-      body: JSON.stringify(options || {}),
+      body: JSON.stringify({ sync_grids: true, push_summary: Boolean(options?.push_summary) }),
     }),
-  testIbkr: () => request<{ ok: boolean; accounts: string[]; message: string }>('/api/ibkr/test', { method: 'POST' }),
+  testIbkr: () => request<{ ok: boolean; accounts: string[]; message: string }>('/api/ibgw/test', { method: 'POST' }),
 
   // Stock Grid Trading Ledger
   listGridStrategies: () => request<import('./types').GridListResponse>('/api/grids'),
@@ -616,69 +663,32 @@ export const api = {
       { method: 'POST' },
     ),
   listGridIbkrCandidates: () =>
-    request<{ configured: boolean; items: import('./types').GridIbkrCandidate[] }>('/api/grids/ibkr-candidates'),
+    request<{ configured: boolean; gateway_status?: import('./types').IbGatewayStatus; items: import('./types').GridIbkrCandidate[] }>(
+      '/api/grids/ibkr-candidates',
+    ),
   syncGridFromIbkr: (payload?: {
     strategy_id?: number;
     create_symbols?: string[];
     refresh_flex_first?: boolean;
+    refresh_gateway_first?: boolean;
     default_step_pct?: number;
   }) =>
     request<import('./types').GridIbkrSyncResponse>('/api/grids/sync-ibkr', {
       method: 'POST',
       body: JSON.stringify(payload || {}),
     }),
-  fetchGridEmailTrades: (payload?: {
-    days?: number;
-    limit?: number;
-    keyword?: string;
-    pdf_password?: string;
-    account_id?: number;
-    include_body_ai?: boolean;
-    source?: 'auto' | 'cache' | 'imap';
-  }) =>
-    request<import('./types').GridEmailFetchResponse>('/api/grids/fetch-email-trades', {
+  syncGridAutoOrders: (strategyId: number, cancelOnly = false) =>
+    request<{
+      ok: boolean;
+      strategy_count: number;
+      placed: number;
+      cancelled: number;
+      kept: number;
+      errors: Array<{ strategy_id: number; symbol: string; error: string }>;
+      detail: import('./types').GridDetailResponse;
+    }>(`/api/grids/${strategyId}/auto-sync-orders`, {
       method: 'POST',
-      body: JSON.stringify(payload || {}),
-    }),
-  parseGridEmailTradeText: (params: { subject?: string; sender?: string; body: string }) =>
-    request<{ trades: import('./types').EmailStockTradeCandidate[]; engine?: string; warning?: string }>(
-      '/api/grids/parse-email-trade-text',
-      { method: 'POST', body: JSON.stringify(params) },
-    ),
-  parseGridEmailTradePdf: async (file: File, pdfPassword = '') => {
-    const fd = new FormData();
-    fd.append('file', file);
-    fd.append('pdf_password', pdfPassword);
-    const resp = await fetch('/api/grids/parse-email-trade-pdf', {
-      method: 'POST',
-      credentials: 'same-origin',
-      body: fd,
-    });
-    if (!resp.ok) {
-      if (resp.status === 401) {
-        unauthorizedHandler?.();
-      }
-      let msg = `PDF 解析失败 (${resp.status})`;
-      try {
-        const d = await resp.json();
-        msg = d.detail || msg;
-      } catch {
-        // ignore
-      }
-      throw new Error(msg);
-    }
-    return resp.json() as Promise<{ trades: import('./types').EmailStockTradeCandidate[]; extracted_preview: string }>;
-  },
-  importGridEmailTrades: (payload: {
-    trades: import('./types').EmailStockTradeCandidate[];
-    strategy_id?: number;
-    auto_create_missing?: boolean;
-    default_step_pct?: number;
-    broker_tag?: string;
-  }) =>
-    request<import('./types').GridEmailImportResponse>('/api/grids/import-email-trades', {
-      method: 'POST',
-      body: JSON.stringify(payload),
+      body: JSON.stringify({ cancel_only: cancelOnly }),
     }),
 
   resetData: (reseed = false) =>

@@ -299,11 +299,47 @@ class SettingsUpdateRequest(BaseModel):
     ibkr_sync_interval_min: Optional[str] = None
     ibkr_bark_daily_summary: Optional[str] = None
     ibkr_proxy_url: Optional[str] = None
+    ibgw_enabled: Optional[str] = None
+    ibgw_host: Optional[str] = None
+    ibgw_port: Optional[str] = None
+    ibgw_client_id: Optional[str] = None
+    ibgw_trading_mode: Optional[str] = None
+    ibgw_paper_only_guard: Optional[str] = None
+    ibgw_auto_reconnect: Optional[str] = None
+    ibgw_auto_grid_enabled: Optional[str] = None
+    ibgw_sync_interval_sec: Optional[str] = None
+    ibgw_notify_fills: Optional[str] = None
+    ibgw_notify_disconnect: Optional[str] = None
+    ibgw_account: Optional[str] = None
 
 
 class IBKRSyncRequest(BaseModel):
     query_id: Optional[str] = None
     push_summary: Optional[bool] = None
+    sync_grids: bool = True
+    reconcile_orders: bool = False
+
+
+class IbGatewaySyncRequest(BaseModel):
+    sync_grids: bool = True
+    reconcile_orders: bool = False
+    push_summary: bool = False
+
+
+class IbGatewayTestOrderRequest(BaseModel):
+    symbol: str = Field(..., min_length=1, max_length=20)
+    market: Literal["CN", "HK", "US"] = "US"
+    side: Literal["buy", "sell"] = "buy"
+    quantity: float = Field(1.0, gt=0)
+    lmt_price: float = Field(..., gt=0)
+    currency: str = ""
+    exchange: str = ""
+    strategy_id: Optional[int] = None
+    dry_run: bool = False
+
+
+class GridAutoSyncOrdersRequest(BaseModel):
+    cancel_only: bool = False
 
 
 class CTraderSyncRequest(BaseModel):
@@ -512,6 +548,14 @@ class GridStrategyCreate(BaseModel):
     current_price: float = Field(0.0, ge=0)
     ibkr_auto_sync: bool = True
     broker: str = Field("", max_length=40)
+    auto_trade_enabled: bool = False
+    auto_allow_live: bool = False
+    max_holding_qty: float = Field(0.0, ge=0)
+    stop_buy_below_lower: bool = True
+    lot_size: float = Field(0.0, ge=0)
+    tick_size: float = Field(0.0, ge=0)
+    conid: str = Field("", max_length=32)
+    exchange: str = Field("", max_length=32)
     status: Literal["active", "paused", "closed"] = "active"
     notes: str = ""
 
@@ -534,6 +578,14 @@ class GridStrategyUpdate(BaseModel):
     current_price: Optional[float] = Field(None, ge=0)
     ibkr_auto_sync: Optional[bool] = None
     broker: Optional[str] = Field(None, max_length=40)
+    auto_trade_enabled: Optional[bool] = None
+    auto_allow_live: Optional[bool] = None
+    max_holding_qty: Optional[float] = Field(None, ge=0)
+    stop_buy_below_lower: Optional[bool] = None
+    lot_size: Optional[float] = Field(None, ge=0)
+    tick_size: Optional[float] = Field(None, ge=0)
+    conid: Optional[str] = Field(None, max_length=32)
+    exchange: Optional[str] = Field(None, max_length=32)
     status: Optional[Literal["active", "paused", "closed"]] = None
     notes: Optional[str] = None
 
@@ -542,6 +594,7 @@ class GridIbkrSyncRequest(BaseModel):
     strategy_id: Optional[int] = None
     create_symbols: List[str] = Field(default_factory=list)
     refresh_flex_first: bool = False
+    refresh_gateway_first: bool = False
     default_step_pct: float = Field(3.0, gt=0.1, le=50.0)
 
 

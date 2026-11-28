@@ -3,28 +3,23 @@ import {
   ArrowDownCircle,
   ArrowUpCircle,
   BellRing,
+  Bot,
   CheckCircle2,
   CheckSquare,
   Download,
   Edit3,
   Grid3x3,
   Layers,
-  Mail,
   Plus,
   RefreshCw,
   Square,
   Trash2,
   TrendingUp,
-  Upload,
   X,
 } from 'lucide-react';
 import { api } from '../api';
 import type {
-  EmailAccount,
-  EmailCacheStats,
-  EmailStockTradeCandidate,
   GridDetailResponse,
-  GridEmailScannedItem,
   GridIbkrCandidate,
   GridListItem,
   GridListResponse,
@@ -104,36 +99,24 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
   const [formIbkrAutoSync, setFormIbkrAutoSync] = useState(true);
   const [formBroker, setFormBroker] = useState('');
   const [formNotes, setFormNotes] = useState('');
+  const [formAutoTrade, setFormAutoTrade] = useState(false);
+  const [formAutoAllowLive, setFormAutoAllowLive] = useState(false);
+  const [formMaxHoldingQty, setFormMaxHoldingQty] = useState('');
+  const [formStopBuyBelowLower, setFormStopBuyBelowLower] = useState(true);
+  const [formLotSize, setFormLotSize] = useState('');
+  const [formTickSize, setFormTickSize] = useState('');
+  const [formExchange, setFormExchange] = useState('');
   const [savingStrat, setSavingStrat] = useState(false);
+  const [reconcilingOrders, setReconcilingOrders] = useState(false);
 
-  // Email / HSBC import modal
-  const [showEmailModal, setShowEmailModal] = useState(false);
-  const [emailDays, setEmailDays] = useState(30);
-  const [emailKeyword, setEmailKeyword] = useState('');
-  const [emailPdfPwd, setEmailPdfPwd] = useState('');
-  const [emailMailboxes, setEmailMailboxes] = useState<EmailAccount[]>([]);
-  const [emailMailboxId, setEmailMailboxId] = useState('');
-  const [emailScanning, setEmailScanning] = useState(false);
-  const [emailImporting, setEmailImporting] = useState(false);
-  const [emailScannedCount, setEmailScannedCount] = useState<number | null>(null);
-  const [emailScannedList, setEmailScannedList] = useState<GridEmailScannedItem[]>([]);
-  const [emailCacheStats, setEmailCacheStats] = useState<EmailCacheStats | null>(null);
-  const [emailWarnings, setEmailWarnings] = useState<string[]>([]);
-  const [emailCandidates, setEmailCandidates] = useState<EmailStockTradeCandidate[]>([]);
-  const [emailSelected, setEmailSelected] = useState<Record<number, boolean>>({});
-  const [emailAutoCreate, setEmailAutoCreate] = useState(true);
-  const [emailDefaultStep, setEmailDefaultStep] = useState('3');
-  const [emailPasteText, setEmailPasteText] = useState('');
-  const [emailPasteSubj, setEmailPasteSubj] = useState('汇丰股票交易成交确认');
-
-  // IBKR import/sync modal
+  // IBKR Gateway import/sync modal
   const [showIbkrModal, setShowIbkrModal] = useState(false);
   const [ibkrLoading, setIbkrLoading] = useState(false);
   const [ibkrSyncing, setIbkrSyncing] = useState(false);
   const [ibkrConfigured, setIbkrConfigured] = useState(false);
   const [ibkrCandidates, setIbkrCandidates] = useState<GridIbkrCandidate[]>([]);
   const [ibkrSelectedSyms, setIbkrSelectedSyms] = useState<Record<string, boolean>>({});
-  const [ibkrRefreshFlexFirst, setIbkrRefreshFlexFirst] = useState(false);
+  const [ibkrRefreshGatewayFirst, setIbkrRefreshGatewayFirst] = useState(false);
   const [ibkrDefaultStepPct, setIbkrDefaultStepPct] = useState('3');
 
   const loadList = async (keepSelected?: number | null) => {
@@ -196,6 +179,13 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
     setFormIbkrAutoSync(true);
     setFormBroker('');
     setFormNotes('');
+    setFormAutoTrade(false);
+    setFormAutoAllowLive(false);
+    setFormMaxHoldingQty('');
+    setFormStopBuyBelowLower(true);
+    setFormLotSize('');
+    setFormTickSize('');
+    setFormExchange('');
     setShowModal(true);
   };
 
@@ -217,139 +207,14 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
     setFormIbkrAutoSync(s.ibkr_auto_sync !== 0 && s.ibkr_auto_sync !== false);
     setFormBroker(s.broker || '');
     setFormNotes(s.notes || '');
+    setFormAutoTrade(Boolean(s.auto_trade_enabled));
+    setFormAutoAllowLive(Boolean(s.auto_allow_live));
+    setFormMaxHoldingQty(s.max_holding_qty && s.max_holding_qty > 0 ? String(s.max_holding_qty) : '');
+    setFormStopBuyBelowLower(s.stop_buy_below_lower !== 0 && s.stop_buy_below_lower !== false);
+    setFormLotSize(s.lot_size && s.lot_size > 0 ? String(s.lot_size) : '');
+    setFormTickSize(s.tick_size && s.tick_size > 0 ? String(s.tick_size) : '');
+    setFormExchange(s.exchange || '');
     setShowModal(true);
-  };
-
-  const openEmailModal = async () => {
-    setShowEmailModal(true);
-    try {
-      const [mbs, cs] = await Promise.all([
-        api.listEmailAccounts(),
-        api.getEmailCacheStats().catch(() => null),
-      ]);
-      setEmailMailboxes(mbs.filter((m) => m.enabled));
-      if (cs) setEmailCacheStats(cs);
-    } catch {
-      // ignore
-    }
-  };
-
-  const populateEmailTrades = (rows: EmailStockTradeCandidate[], append = false) => {
-    if (append) {
-      setEmailCandidates((prev) => {
-        const next = [...prev, ...rows];
-        const sel: Record<number, boolean> = { ...emailSelected };
-        rows.forEach((t, offset) => {
-          sel[prev.length + offset] = !t.already_imported;
-        });
-        setEmailSelected(sel);
-        return next;
-      });
-      return;
-    }
-    setEmailCandidates(rows);
-    const sel: Record<number, boolean> = {};
-    rows.forEach((t, idx) => {
-      sel[idx] = !t.already_imported;
-    });
-    setEmailSelected(sel);
-  };
-
-  const handleScanEmailTrades = async (source: 'auto' | 'cache' = 'auto') => {
-    setEmailScanning(true);
-    setEmailWarnings([]);
-    try {
-      const res = await api.fetchGridEmailTrades({
-        days: emailDays,
-        limit: emailDays >= 365 ? 1500 : 150,
-        keyword: emailKeyword.trim(),
-        pdf_password: emailPdfPwd.trim(),
-        account_id: emailMailboxId ? Number(emailMailboxId) : undefined,
-        include_body_ai: true,
-        source,
-      });
-      setEmailScannedCount(res.emails_scanned);
-      setEmailScannedList(res.scanned_emails || []);
-      if (res.cache_stats) setEmailCacheStats(res.cache_stats);
-      setEmailWarnings(res.warnings || []);
-      populateEmailTrades(res.trades || [], false);
-      const prefix = source === 'cache' ? '从本地邮件库重扫' : `增量拉取并扫描`;
-      onNotify(`${prefix} ${res.emails_scanned} 封邮件，识别到 ${res.trades.length} 笔股票成交`);
-    } catch (err) {
-      onNotify(err instanceof Error ? err.message : '扫描邮箱股票成交失败');
-    } finally {
-      setEmailScanning(false);
-    }
-  };
-
-  const handleParseEmailTradePaste = async () => {
-    if (!emailPasteText.trim()) return;
-    setEmailScanning(true);
-    try {
-      const res = await api.parseGridEmailTradeText({
-        subject: emailPasteSubj.trim() || '汇丰股票交易通知',
-        sender: '汇丰银行 HSBC',
-        body: emailPasteText.trim(),
-      });
-      populateEmailTrades(res.trades || [], true);
-      onNotify(`从正文识别出 ${res.trades.length} 笔股票成交`);
-    } catch (err) {
-      onNotify(err instanceof Error ? err.message : '解析邮件正文失败');
-    } finally {
-      setEmailScanning(false);
-    }
-  };
-
-  const handleUploadTradePdf = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setEmailScanning(true);
-    try {
-      const res = await api.parseGridEmailTradePdf(file, emailPdfPwd.trim());
-      populateEmailTrades(res.trades || [], true);
-      onNotify(`从 PDF「${file.name}」识别出 ${res.trades.length} 笔股票成交`);
-    } catch (err) {
-      onNotify(err instanceof Error ? err.message : 'PDF 成交单解析失败');
-    } finally {
-      setEmailScanning(false);
-      e.target.value = '';
-    }
-  };
-
-  const handleCommitEmailTrades = async () => {
-    const picked = emailCandidates.filter((_, idx) => emailSelected[idx]);
-    if (picked.length === 0) {
-      onNotify('请先勾选至少一笔股票成交');
-      return;
-    }
-    setEmailImporting(true);
-    try {
-      const res = await api.importGridEmailTrades({
-        trades: picked,
-        auto_create_missing: emailAutoCreate,
-        default_step_pct: Number(emailDefaultStep || 3),
-      });
-      const parts: string[] = [];
-      if (res.created_strategies.length > 0) parts.push(`自动新建网格 ${res.created_strategies.length} 个`);
-      parts.push(`导入成交 ${res.imported_trades} 笔`);
-      if (res.skipped_duplicates > 0) parts.push(`跳过重复 ${res.skipped_duplicates} 笔`);
-      if (res.unmatched_count > 0) parts.push(`未匹配跳过 ${res.unmatched_count} 笔`);
-      onNotify(`邮件交易同步完成：${parts.join('，')}`);
-      const firstCreated = res.created_strategies[0]?.id;
-      await loadList(firstCreated ?? selectedId);
-      if (firstCreated) {
-        setSelectedId(firstCreated);
-      } else if (selectedId) {
-        await loadDetail(selectedId);
-      }
-      setEmailCandidates([]);
-      setEmailSelected({});
-      setShowEmailModal(false);
-    } catch (err) {
-      onNotify(err instanceof Error ? err.message : '导入邮件成交失败');
-    } finally {
-      setEmailImporting(false);
-    }
   };
 
   const openIbkrModal = async () => {
@@ -381,11 +246,11 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
         : [];
       const res = await api.syncGridFromIbkr({
         create_symbols: createSymbols,
-        refresh_flex_first: ibkrRefreshFlexFirst,
+        refresh_gateway_first: ibkrRefreshGatewayFirst,
         default_step_pct: Number(ibkrDefaultStepPct || 3),
       });
       const parts: string[] = [];
-      if (res.flex_refreshed) parts.push('已拉取最新 IBKR Flex 报表');
+      if (res.gateway_refreshed || res.flex_refreshed) parts.push('已从 IB Gateway 同步最新实时数据');
       if (res.created_strategies.length > 0) parts.push(`新建网格 ${res.created_strategies.length} 个`);
       parts.push(`导入成交 ${res.imported_trades} 笔`);
       if (res.skipped_duplicates > 0) parts.push(`跳过已存在 ${res.skipped_duplicates} 笔`);
@@ -420,6 +285,26 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
       onNotify(err instanceof Error ? err.message : '同步 IBKR 成交失败');
     } finally {
       setIbkrSyncing(false);
+    }
+  };
+
+  const handleReconcileOrders = async (strategyId: number, cancelOnly = false) => {
+    setReconcilingOrders(true);
+    try {
+      const res = await api.syncGridAutoOrders(strategyId, cancelOnly);
+      if (res.detail) setDetail(res.detail);
+      await loadList(strategyId);
+      if (res.errors?.length) {
+        onNotify(`自动挂单受阻：${res.errors[0].error}`);
+      } else if (cancelOnly) {
+        onNotify(`已撤销 ${res.cancelled} 笔自动挂单`);
+      } else {
+        onNotify(`自动挂单校验完成：新挂 ${res.placed} 笔，撤旧 ${res.cancelled} 笔，保留 ${res.kept} 笔`);
+      }
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : '自动网格挂单校验失败');
+    } finally {
+      setReconcilingOrders(false);
     }
   };
 
@@ -498,6 +383,13 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
         current_price: Number(formCurPrice || 0),
         ibkr_auto_sync: formIbkrAutoSync,
         broker: formBroker.trim(),
+        auto_trade_enabled: formAutoTrade,
+        auto_allow_live: formAutoAllowLive,
+        max_holding_qty: Number(formMaxHoldingQty || 0),
+        stop_buy_below_lower: formStopBuyBelowLower,
+        lot_size: Number(formLotSize || 0),
+        tick_size: Number(formTickSize || 0),
+        exchange: formExchange.trim().toUpperCase(),
         notes: formNotes.trim(),
       };
       if (editingStrategy) {
@@ -728,14 +620,7 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
               onClick={openIbkrModal}
               className="flex-1 inline-flex items-center justify-center gap-1 rounded-xl border border-sky-200 bg-sky-50 px-2 py-1.5 text-[11px] font-medium text-sky-700 hover:bg-sky-100 cursor-pointer"
             >
-              <Download className="h-3 w-3" /> IBKR
-            </button>
-            <button
-              type="button"
-              onClick={openEmailModal}
-              className="flex-1 inline-flex items-center justify-center gap-1 rounded-xl border border-rose-200 bg-rose-50 px-2 py-1.5 text-[11px] font-medium text-rose-700 hover:bg-rose-100 cursor-pointer"
-            >
-              <Mail className="h-3 w-3" /> 汇丰/邮件
+              <Download className="h-3 w-3" /> IBKR 网关
             </button>
             <button
               type="button"
@@ -998,6 +883,66 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
                       </span>
                     </div>
                   </div>
+                </div>
+
+                {/* Auto-Grid Limit Order Engine Strip */}
+                <div className="rounded-xl border border-indigo-200/80 bg-indigo-50/40 p-3 space-y-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex flex-wrap items-center gap-2 text-xs">
+                      <Bot className="h-4 w-4 text-indigo-600" />
+                      <span className="font-semibold text-slate-900">自动网格限价挂单（IB Gateway）</span>
+                      <span
+                        className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                          detail.strategy.auto_trade_enabled
+                            ? 'bg-emerald-100 text-emerald-700'
+                            : 'bg-slate-200/70 text-slate-600'
+                        }`}
+                      >
+                        {detail.strategy.auto_trade_enabled ? '策略自动挂单已开启' : '未开启自动挂单（编辑可启用）'}
+                      </span>
+                      {detail.strategy.max_holding_qty ? (
+                        <span className="text-[11px] text-slate-500">上限 {detail.strategy.max_holding_qty} 股</span>
+                      ) : null}
+                    </div>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <button
+                        type="button"
+                        disabled={reconcilingOrders}
+                        onClick={() => handleReconcileOrders(detail.strategy.id, false)}
+                        className="rounded-lg bg-indigo-600 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-indigo-700 disabled:opacity-50 cursor-pointer"
+                      >
+                        {reconcilingOrders ? '校验中...' : '立即核对挂单'}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={reconcilingOrders}
+                        onClick={() => handleReconcileOrders(detail.strategy.id, true)}
+                        className="rounded-lg border border-rose-200 bg-white px-2.5 py-1 text-[11px] font-medium text-rose-700 hover:bg-rose-50 disabled:opacity-50 cursor-pointer"
+                      >
+                        一键撤活动单
+                      </button>
+                    </div>
+                  </div>
+                  {detail.orders && detail.orders.filter((o) => !['Filled', 'Cancelled', 'ApiCancelled', 'Inactive'].includes(o.status)).length > 0 && (
+                    <div className="flex flex-wrap gap-2 pt-1">
+                      {detail.orders
+                        .filter((o) => !['Filled', 'Cancelled', 'ApiCancelled', 'Inactive'].includes(o.status))
+                        .map((o) => (
+                          <span
+                            key={o.id}
+                            className="inline-flex items-center gap-1.5 rounded-lg border border-indigo-200 bg-white px-2.5 py-1 text-[11px] font-mono text-slate-800"
+                          >
+                            <span className={o.side === 'buy' ? 'font-bold text-rose-600' : 'font-bold text-emerald-600'}>
+                              {o.action}
+                            </span>
+                            <span>
+                              {fmtPrice(o.lmt_price)} × {o.total_qty}
+                            </span>
+                            <span className="text-[10px] text-slate-400">({o.status || 'Submitted'})</span>
+                          </span>
+                        ))}
+                    </div>
+                  )}
                 </div>
 
                 {/* Next Buy / Next Sell Signal Strip */}
@@ -1732,14 +1677,90 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
               </div>
             </div>
 
-            <label className="inline-flex items-center gap-2 text-xs text-slate-600 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={formIbkrAutoSync}
-                onChange={(e) => setFormIbkrAutoSync(e.target.checked)}
-              />
-              <span>每次 IBKR Flex 同步时，自动将同代码的新成交记录写入该网格（自动去重）</span>
-            </label>
+            <div className="space-y-3 rounded-xl border border-indigo-100 bg-indigo-50/40 p-3.5">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-xs font-semibold text-indigo-900">IB Gateway 自动同步与限价挂单设置</span>
+                <label className="inline-flex items-center gap-1.5 text-xs text-slate-700 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={formIbkrAutoSync}
+                    onChange={(e) => setFormIbkrAutoSync(e.target.checked)}
+                  />
+                  <span>自动同步该标的 IBKR 成交记录</span>
+                </label>
+              </div>
+              <div className="flex flex-wrap items-center gap-4 text-xs text-slate-700">
+                <label className="inline-flex items-center gap-1.5 font-medium cursor-pointer text-indigo-800">
+                  <input
+                    type="checkbox"
+                    checked={formAutoTrade}
+                    onChange={(e) => setFormAutoTrade(e.target.checked)}
+                  />
+                  <span>启用该网格自动限价挂单 (BUY/SELL LMT)</span>
+                </label>
+                <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={formStopBuyBelowLower}
+                    onChange={(e) => setFormStopBuyBelowLower(e.target.checked)}
+                  />
+                  <span>跌破网格下沿时停止挂买单</span>
+                </label>
+                <label className="inline-flex items-center gap-1.5 cursor-pointer text-rose-700">
+                  <input
+                    type="checkbox"
+                    checked={formAutoAllowLive}
+                    onChange={(e) => setFormAutoAllowLive(e.target.checked)}
+                  />
+                  <span>允许实盘自动下单（默认仅模拟盘）</span>
+                </label>
+              </div>
+              <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
+                <div>
+                  <label className="text-[11px] text-slate-500">最大持仓上限（0=不限）</label>
+                  <input
+                    type="number"
+                    step="any"
+                    value={formMaxHoldingQty}
+                    onChange={(e) => setFormMaxHoldingQty(e.target.value)}
+                    placeholder="如 100"
+                    className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="text-[11px] text-slate-500">最小手数（0=自动）</label>
+                  <input
+                    type="number"
+                    step="any"
+                    value={formLotSize}
+                    onChange={(e) => setFormLotSize(e.target.value)}
+                    placeholder="美股1 / 港股填每手股数"
+                    className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="text-[11px] text-slate-500">最小跳价 Tick（0=自动）</label>
+                  <input
+                    type="number"
+                    step="any"
+                    value={formTickSize}
+                    onChange={(e) => setFormTickSize(e.target.value)}
+                    placeholder="0 按港/美股规范"
+                    className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="text-[11px] text-slate-500">指定交易所（留空默认）</label>
+                  <input
+                    type="text"
+                    value={formExchange}
+                    onChange={(e) => setFormExchange(e.target.value)}
+                    placeholder="SMART / SEHK"
+                    className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-mono"
+                  />
+                </div>
+              </div>
+            </div>
 
             {modalPreview ? (
               <div className="rounded-xl bg-indigo-50/70 border border-indigo-200 p-3 text-xs text-indigo-900 flex flex-wrap gap-x-5 gap-y-1">
@@ -1779,15 +1800,15 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
         </div>
       )}
 
-      {/* IBKR Flex Import & Sync Modal */}
+      {/* IBKR Gateway Import & Sync Modal */}
       {showIbkrModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4 backdrop-blur-[1px]">
           <div className="w-full max-w-2xl rounded-2xl bg-white p-6 shadow-xl space-y-4 max-h-[88vh] flex flex-col">
             <div className="flex items-center justify-between border-b border-slate-100 pb-3">
               <div>
-                <h3 className="text-base font-bold text-slate-900">从 IBKR 盈透同步标的与成交到网格账本</h3>
+                <h3 className="text-base font-bold text-slate-900">从 IBKR Gateway 同步标的与成交到网格账本</h3>
                 <p className="text-xs text-slate-500 mt-0.5">
-                  直接复用「IBKR 每日汇总」拉取的真实成交（精准成交价、股数、佣金）与持仓市价，按交易号自动去重
+                  直接读取 IB Gateway 实时同步的持仓市价与成交回报（精确成交价、股数、佣金），按执行编号自动去重
                 </p>
               </div>
               <button
@@ -1803,11 +1824,11 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
               <label className="inline-flex items-center gap-2 text-slate-700 cursor-pointer">
                 <input
                   type="checkbox"
-                  checked={ibkrRefreshFlexFirst}
-                  onChange={(e) => setIbkrRefreshFlexFirst(e.target.checked)}
+                  checked={ibkrRefreshGatewayFirst}
+                  onChange={(e) => setIbkrRefreshGatewayFirst(e.target.checked)}
                   disabled={!ibkrConfigured}
                 />
-                <span>同步前先向 IBKR Flex 拉取最新报表{!ibkrConfigured ? '（未配置 Flex Token）' : ''}</span>
+                <span>同步前先向 IB Gateway 拉取最新持仓与成交{!ibkrConfigured ? '（尚未开启网关）' : ''}</span>
               </label>
               <div className="flex items-center gap-1.5">
                 <span className="text-slate-500">新建网格默认等比步长</span>
@@ -1830,7 +1851,7 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
               ) : ibkrCandidates.length === 0 ? (
                 <div className="rounded-xl bg-slate-50 py-10 px-4 text-center text-xs text-slate-500 space-y-2">
                   <div>本地 IBKR 数据库里还没有股票/ETF 持仓或成交记录。</div>
-                  <div>请先在「IBKR 每日汇总」完成一次同步，或勾选上方「先向 IBKR Flex 拉取最新报表」后直接点同步。</div>
+                  <div>请先在「IBKR 交易网关」完成一次同步，或勾选上方「先向 IB Gateway 拉取最新持仓与成交」后直接点同步。</div>
                 </div>
               ) : (
                 ibkrCandidates.map((c) => {
@@ -1929,336 +1950,6 @@ export const StockGridView: React.FC<Props> = ({ onNotify }) => {
         </div>
       )}
 
-      {/* HSBC / Broker Email & PDF Contract Note Import Modal */}
-      {showEmailModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4 backdrop-blur-[1px]">
-          <div className="w-full max-w-3xl rounded-2xl bg-white p-6 shadow-xl space-y-4 max-h-[90vh] flex flex-col">
-            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-              <div>
-                <h3 className="text-base font-bold text-slate-900">从汇丰 / 券商邮件与 PDF 成交单导入股票交易</h3>
-                <p className="text-xs text-slate-500 mt-0.5">
-                  自动扫描已接入邮箱中的汇丰 (HSBC) 股票成交确认邮件或 PDF 成交单据（支持简体/繁体/英文），自动提取价格、股数、佣金与印花税并按单去重
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={() => setShowEmailModal(false)}
-                className="text-slate-400 hover:text-slate-700 cursor-pointer"
-              >
-                <X className="h-5 w-5" />
-              </button>
-            </div>
-
-            {/* Mailbox scan bar */}
-            <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3.5 space-y-2.5">
-              {emailCacheStats && (
-                <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-600 bg-white/80 rounded-lg border border-slate-200/70 px-2.5 py-1.5">
-                  <span>
-                    本地邮件库已缓存 <strong>{emailCacheStats.total_cached}</strong> 封（含{' '}
-                    <strong>{emailCacheStats.stock_hint_count}</strong> 封券商线索）
-                    {emailCacheStats.auto_sync_enabled ? ` · 定时增量每 ${emailCacheStats.sync_interval_min} 分钟` : ' · 未开定时拉取'}
-                  </span>
-                  {emailCacheStats.last_sync_at && (
-                    <span className="text-slate-400">
-                      上次同步：{emailCacheStats.last_sync_at.slice(0, 16).replace('T', ' ')}
-                    </span>
-                  )}
-                </div>
-              )}
-              <div className="grid grid-cols-2 gap-2 sm:grid-cols-6">
-                <select
-                  value={emailMailboxId}
-                  onChange={(e) => setEmailMailboxId(e.target.value)}
-                  className="rounded-xl border border-slate-200 bg-white px-2.5 py-1.5 text-xs"
-                >
-                  <option value="">全部已启用邮箱 ({emailMailboxes.length})</option>
-                  {emailMailboxes.map((m) => (
-                    <option key={m.id} value={String(m.id)}>
-                      {m.name || m.username}
-                    </option>
-                  ))}
-                </select>
-                <select
-                  value={emailDays}
-                  onChange={(e) => setEmailDays(Number(e.target.value))}
-                  className="rounded-xl border border-slate-200 bg-white px-2.5 py-1.5 text-xs"
-                >
-                  <option value={7}>最近 7 天</option>
-                  <option value={14}>最近 14 天</option>
-                  <option value={30}>最近 30 天</option>
-                  <option value={90}>最近 90 天</option>
-                  <option value={180}>最近 180 天</option>
-                  <option value={365}>最近 1 年</option>
-                  <option value={730}>最近 2 年</option>
-                </select>
-                <input
-                  type="text"
-                  value={emailKeyword}
-                  onChange={(e) => setEmailKeyword(e.target.value)}
-                  placeholder="关键词（可留空，如 HSBC/汇丰）"
-                  className="rounded-xl border border-slate-200 bg-white px-2.5 py-1.5 text-xs"
-                />
-                <input
-                  type="password"
-                  value={emailPdfPwd}
-                  onChange={(e) => setEmailPdfPwd(e.target.value)}
-                  placeholder="PDF 加密密码（可选）"
-                  className="rounded-xl border border-slate-200 bg-white px-2.5 py-1.5 text-xs"
-                />
-                <button
-                  type="button"
-                  disabled={emailScanning}
-                  onClick={() => handleScanEmailTrades('cache')}
-                  className="inline-flex items-center justify-center gap-1 rounded-xl border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50 cursor-pointer"
-                >
-                  本地库秒扫
-                </button>
-                <button
-                  type="button"
-                  disabled={emailScanning}
-                  onClick={() => handleScanEmailTrades('auto')}
-                  className="inline-flex items-center justify-center gap-1.5 rounded-xl bg-rose-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-rose-700 disabled:opacity-50 cursor-pointer"
-                >
-                  <RefreshCw className={`h-3.5 w-3.5 ${emailScanning ? 'animate-spin' : ''}`} />
-                  {emailScanning ? '扫描中...' : '增量扫描'}
-                </button>
-              </div>
-
-              <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-slate-200/60">
-                <label className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50 cursor-pointer">
-                  <Upload className="h-3.5 w-3.5 text-indigo-600" />
-                  <span>直接上传汇丰成交单据 (.pdf)</span>
-                  <input type="file" accept=".pdf" onChange={handleUploadTradePdf} className="hidden" />
-                </label>
-                {emailScannedCount !== null && (
-                  <span className="text-[11px] text-slate-500">本次扫描 {emailScannedCount} 封邮件</span>
-                )}
-              </div>
-            </div>
-
-            {/* Quick paste box for HSBC confirmation emails */}
-            <details className="rounded-xl border border-slate-200/80 bg-slate-50/40 px-3.5 py-2 text-xs">
-              <summary className="cursor-pointer font-medium text-slate-700">
-                或直接粘贴汇丰成交确认邮件正文测试/导入
-              </summary>
-              <div className="mt-2.5 space-y-2">
-                <input
-                  type="text"
-                  value={emailPasteSubj}
-                  onChange={(e) => setEmailPasteSubj(e.target.value)}
-                  placeholder="邮件主题（如：汇丰银行证券交易成交通知）"
-                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs"
-                />
-                <textarea
-                  rows={3}
-                  value={emailPasteText}
-                  onChange={(e) => setEmailPasteText(e.target.value)}
-                  placeholder="粘贴汇丰股票买卖成交确认文本（如：买入 00700 腾讯控股 100股，成交价 HKD 388.50，佣金 HKD 50.00，印花税 HKD 39.00）"
-                  className="w-full rounded-xl border border-slate-200 bg-white p-2.5 text-xs"
-                />
-                <button
-                  type="button"
-                  disabled={emailScanning || !emailPasteText.trim()}
-                  onClick={handleParseEmailTradePaste}
-                  className="rounded-xl bg-indigo-600 px-3.5 py-1.5 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50 cursor-pointer"
-                >
-                  解析正文成交
-                </button>
-              </div>
-            </details>
-
-            {emailWarnings.length > 0 && (
-              <div className="rounded-xl bg-amber-50 border border-amber-200 px-3 py-2 text-xs text-amber-800 space-y-0.5">
-                {emailWarnings.map((w, i) => (
-                  <div key={i}>• {w}</div>
-                ))}
-              </div>
-            )}
-
-            {emailScannedList.length > 0 && (
-              <details
-                open={emailCandidates.length === 0}
-                className="rounded-xl border border-slate-200/80 bg-slate-50/60 px-3.5 py-2 text-xs"
-              >
-                <summary className="cursor-pointer font-medium text-slate-700 flex items-center justify-between">
-                  <span>
-                    已扫描邮件列表（共 {emailScannedList.length} 封
-                    {emailScannedList.some((e) => e.stock_hint)
-                      ? ` · 其中 ${emailScannedList.filter((e) => e.stock_hint).length} 封含汇丰/证券关键词`
-                      : ''}
-                    ）
-                  </span>
-                  <span className="text-[11px] font-normal text-slate-400">可展开查看原文或填入正文框排查</span>
-                </summary>
-                <div className="mt-2 max-h-44 overflow-y-auto space-y-1.5 pr-1">
-                  {emailScannedList.map((em) => (
-                    <div
-                      key={`${em.uid}-${em.received_at}`}
-                      className={`rounded-lg border px-2.5 py-1.5 ${
-                        em.stock_hint ? 'border-rose-200 bg-rose-50/40' : 'border-slate-200 bg-white'
-                      }`}
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <div className="min-w-0 truncate font-medium text-slate-800">
-                          {em.stock_hint && (
-                            <span className="mr-1 rounded bg-rose-100 px-1 py-0.5 text-[10px] text-rose-700">券商线索</span>
-                          )}
-                          {em.subject}
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setEmailPasteSubj(em.subject || '汇丰股票交易通知');
-                            setEmailPasteText(em.body_preview || '');
-                            onNotify('已将该邮件内容填入下方粘贴框，可直接核对或点击解析正文');
-                          }}
-                          className="shrink-0 rounded bg-slate-100 px-2 py-0.5 text-[10px] text-slate-700 hover:bg-slate-200 cursor-pointer"
-                        >
-                          填入正文排查
-                        </button>
-                      </div>
-                      <div className="mt-0.5 flex flex-wrap items-center gap-2 text-[11px] text-slate-400">
-                        <span>{em.received_at}</span>
-                        <span className="truncate max-w-[200px]">{em.sender}</span>
-                        {em.attachments && em.attachments.length > 0 && (
-                          <span className="text-indigo-600">附件: {em.attachments.join(', ')}</span>
-                        )}
-                      </div>
-                      {em.stock_hint && em.body_preview && (
-                        <div className="mt-1 line-clamp-2 text-[11px] text-slate-500">
-                          {em.body_preview}
-                        </div>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              </details>
-            )}
-
-            {/* Options */}
-            <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl bg-indigo-50/50 border border-indigo-100 px-3.5 py-2 text-xs">
-              <label className="inline-flex items-center gap-2 text-slate-700 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={emailAutoCreate}
-                  onChange={(e) => setEmailAutoCreate(e.target.checked)}
-                />
-                <span>若某只标的尚无网格，自动以券商标签（如汇丰 HSBC）新建网格计划</span>
-              </label>
-              <div className="flex items-center gap-1.5">
-                <span className="text-slate-500">默认等比步长</span>
-                <input
-                  type="number"
-                  step="0.5"
-                  min="0.5"
-                  max="20"
-                  value={emailDefaultStep}
-                  onChange={(e) => setEmailDefaultStep(e.target.value)}
-                  className="w-14 rounded-lg border border-slate-200 bg-white px-2 py-0.5 text-xs font-mono"
-                />
-                <span className="text-slate-500">%</span>
-              </div>
-            </div>
-
-            {/* Candidate trades list */}
-            <div className="flex-1 overflow-y-auto space-y-2 pr-1">
-              {emailCandidates.length === 0 ? (
-                <div className="rounded-xl bg-slate-50 py-10 text-center text-xs text-slate-400">
-                  暂无待导入的邮件股票成交。点击上方「扫描邮箱交易」、上传 PDF 成交单或粘贴汇丰邮件正文即可提取。
-                </div>
-              ) : (
-                emailCandidates.map((tr, idx) => {
-                  const checked = Boolean(emailSelected[idx]);
-                  const mk = MARKET_META[tr.market] || MARKET_META.HK;
-                  return (
-                    <div
-                      key={`${tr.external_ref}-${idx}`}
-                      className={`flex flex-wrap items-center justify-between gap-2 rounded-xl border px-3.5 py-2.5 text-xs ${
-                        tr.already_imported
-                          ? 'border-slate-100 bg-slate-50 opacity-55'
-                          : checked
-                            ? 'border-rose-200 bg-rose-50/30'
-                            : 'border-slate-200 bg-white'
-                      }`}
-                    >
-                      <div className="flex items-center gap-2.5 min-w-0">
-                        <button
-                          type="button"
-                          onClick={() => setEmailSelected((p) => ({ ...p, [idx]: !p[idx] }))}
-                          className="text-rose-600 cursor-pointer shrink-0"
-                        >
-                          {checked ? <CheckSquare className="h-4 w-4" /> : <Square className="h-4 w-4 text-slate-400" />}
-                        </button>
-                        <div className="min-w-0">
-                          <div className="flex flex-wrap items-center gap-1.5">
-                            <span
-                              className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${
-                                tr.side === 'buy' ? 'bg-rose-100 text-rose-700' : 'bg-emerald-100 text-emerald-700'
-                              }`}
-                            >
-                              {tr.side === 'buy' ? '买入' : '卖出'}
-                            </span>
-                            <span className={`rounded border px-1.5 py-0.5 text-[10px] font-medium ${mk.cls}`}>
-                              {mk.label}
-                            </span>
-                            <span className="font-mono font-bold text-slate-900">{tr.symbol}</span>
-                            {tr.name && tr.name !== tr.symbol && (
-                              <span className="text-slate-700 truncate max-w-[150px]">{tr.name}</span>
-                            )}
-                            <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-600">
-                              {tr.broker}
-                            </span>
-                            {tr.matched_strategy_name ? (
-                              <span className="rounded bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 text-[10px] text-emerald-700">
-                                归属：{tr.matched_strategy_name}
-                              </span>
-                            ) : (
-                              <span className="rounded bg-indigo-50 border border-indigo-200 px-1.5 py-0.5 text-[10px] text-indigo-700">
-                                将自动新建网格
-                              </span>
-                            )}
-                            {tr.already_imported && (
-                              <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] text-amber-700">
-                                已导入
-                              </span>
-                            )}
-                          </div>
-                          <div className="mt-0.5 text-[11px] text-slate-400">
-                            {tr.traded_at} · 佣金 {formatCurrency(tr.fee, tr.currency)} · 税费 {formatCurrency(tr.tax, tr.currency)}
-                            {tr.email_subject ? ` · 来自《${tr.email_subject.slice(0, 26)}》` : ''}
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className="text-right shrink-0 font-mono font-bold text-slate-900">
-                        {fmtPrice(tr.price)} × {tr.quantity} 股
-                      </div>
-                    </div>
-                  );
-                })
-              )}
-            </div>
-
-            <div className="flex flex-wrap items-center justify-end gap-2 border-t border-slate-100 pt-3">
-              <button
-                type="button"
-                onClick={() => setShowEmailModal(false)}
-                className="rounded-xl border border-slate-200 px-4 py-2 text-xs font-medium text-slate-600 hover:bg-slate-50 cursor-pointer"
-              >
-                取消
-              </button>
-              <button
-                type="button"
-                disabled={emailImporting || emailCandidates.length === 0}
-                onClick={handleCommitEmailTrades}
-                className="rounded-xl bg-slate-900 px-5 py-2 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-45 cursor-pointer"
-              >
-                {emailImporting ? '导入中...' : '确认导入选中成交到股票网格'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 };

@@ -18,7 +18,6 @@ import type {
   EmailAccount,
   EmailCacheStats,
   EmailScanSummary,
-  EmailStockTradeCandidate,
   EmailSyncLog,
   EmailSyncStatus,
   NoteCandidate,
@@ -56,8 +55,6 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
   const [txSelected, setTxSelected] = useState<Record<number, boolean>>({});
   const [remCandidates, setRemCandidates] = useState<NoteCandidate[]>([]);
   const [remSelected, setRemSelected] = useState<Record<number, boolean>>({});
-  const [stockCandidates, setStockCandidates] = useState<EmailStockTradeCandidate[]>([]);
-  const [stockImporting, setStockImporting] = useState(false);
   const [warnings, setWarnings] = useState<string[]>([]);
   const [importing, setImporting] = useState(false);
 
@@ -177,12 +174,11 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
       setEmails(res.emails || []);
       setWarnings(res.warnings || []);
       setDetectedCards(res.detected_cards || []);
-      setStockCandidates(res.stock_trades || []);
       if (res.cache_stats) setCacheStats(res.cache_stats);
       populateCandidates(res.transactions || [], res.reminders || [], false);
       const modeTag = res.from_cache && source === 'cache' ? '（从本地缓存秒读）' : '';
       onNotify(
-        `已解析 ${res.emails.length} 封邮件${modeTag}，识别出 ${res.transactions.length} 笔消费账目、${res.stock_trades?.length || 0} 笔股票交易与 ${res.reminders.length} 条提醒`,
+        `已解析 ${res.emails.length} 封邮件${modeTag}，识别出 ${res.transactions.length} 笔消费账目与 ${res.reminders.length} 条提醒`,
       );
     } catch (err) {
       onNotify(err instanceof Error ? err.message : '扫描邮箱失败');
@@ -283,37 +279,12 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
       if (res.detected_cards?.length) {
         setDetectedCards((prev) => [...prev, ...res.detected_cards!]);
       }
-      if (res.stock_trades?.length) {
-        setStockCandidates((prev) => [...prev, ...res.stock_trades!]);
-      }
       populateCandidates(res.transactions || [], res.reminders || [], true);
-      onNotify(`从正文识别出 ${res.transactions.length} 笔账目、${res.stock_trades?.length || 0} 笔股票成交、${res.reminders.length} 条提醒`);
+      onNotify(`从正文识别出 ${res.transactions.length} 笔账目、${res.reminders.length} 条提醒`);
     } catch (err) {
       onNotify(err instanceof Error ? err.message : '解析失败');
     } finally {
       setParsingText(false);
-    }
-  };
-
-  const handleImportEmailStocks = async () => {
-    const pending = stockCandidates.filter((s) => !s.already_imported);
-    const toImport = pending.length > 0 ? pending : stockCandidates;
-    if (toImport.length === 0) return;
-    setStockImporting(true);
-    try {
-      const res = await api.importGridEmailTrades({
-        trades: toImport,
-        auto_create_missing: true,
-        default_step_pct: 3.0,
-      });
-      onNotify(
-        `已导入 ${res.imported_trades} 笔股票成交到「股票网格记账」（新建网格 ${res.created_strategies.length} 个，跳过重复 ${res.skipped_duplicates} 笔）`,
-      );
-      setStockCandidates([]);
-    } catch (err) {
-      onNotify(err instanceof Error ? err.message : '导入股票成交失败');
-    } finally {
-      setStockImporting(false);
     }
   };
 
@@ -746,43 +717,6 @@ export const EmailBillsView: React.FC<Props> = ({ onRefreshDashboard, onNotify }
                       {c.count}笔 · {formatMoney(c.expense)}
                     </span>
                   </span>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Detected HSBC / Broker Stock Trades */}
-          {stockCandidates.length > 0 && (
-            <div className="rounded-xl border border-rose-200 bg-rose-50/40 p-3.5 space-y-2.5">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="text-xs font-semibold text-rose-800">
-                  识别到 {stockCandidates.length} 笔证券/汇丰股票交易（请导入「股票网格记账」，不计入日常消费）
-                </div>
-                <button
-                  type="button"
-                  disabled={stockImporting}
-                  onClick={handleImportEmailStocks}
-                  className="inline-flex items-center gap-1 rounded-lg bg-rose-600 px-3 py-1 text-[11px] font-medium text-white hover:bg-rose-700 disabled:opacity-50 cursor-pointer"
-                >
-                  {stockImporting ? '导入中...' : '一键导入股票网格记账'}
-                </button>
-              </div>
-              <div className="space-y-1.5">
-                {stockCandidates.map((st, idx) => (
-                  <div key={`${st.external_ref}-${idx}`} className="flex items-center justify-between rounded-lg bg-white border border-rose-100 px-3 py-1.5 text-xs">
-                    <div className="flex flex-wrap items-center gap-1.5">
-                      <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${st.side === 'buy' ? 'bg-rose-100 text-rose-700' : 'bg-emerald-100 text-emerald-700'}`}>
-                        {st.side === 'buy' ? '买入' : '卖出'}
-                      </span>
-                      <span className="font-mono font-bold text-slate-900">{st.symbol}</span>
-                      {st.name && st.name !== st.symbol && <span className="text-slate-600">{st.name}</span>}
-                      <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">{st.broker}</span>
-                      {st.already_imported && <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] text-amber-700">已导入</span>}
-                    </div>
-                    <div className="font-mono text-slate-800">
-                      {st.price} × {st.quantity} 股 ({formatCurrency(st.price * st.quantity, st.currency)})
-                    </div>
-                  </div>
                 ))}
               </div>
             </div>

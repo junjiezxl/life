@@ -5,21 +5,28 @@ import {
   BarChart3,
   Briefcase,
   Calendar,
+  CheckCircle2,
   Coins,
+  ListOrdered,
+  PlugZap,
+  PowerOff,
   RefreshCw,
   Search,
+  Send,
   Settings,
+  ShieldAlert,
   TrendingUp,
+  XCircle,
 } from 'lucide-react';
 import { api } from '../api';
-import type { IbkrOverviewResponse } from '../types';
+import type { IbGatewayOrder, IbkrOverviewResponse } from '../types';
 
 interface Props {
   onNotify: (msg: string) => void;
   onNavigateSettings: () => void;
 }
 
-type SubTab = 'daily' | 'positions' | 'trades' | 'cash';
+type SubTab = 'orders' | 'daily' | 'positions' | 'trades' | 'cash';
 
 function formatMoney(value: number, currency = 'USD', withSign = false): string {
   const abs = Math.abs(value).toLocaleString('en-US', {
@@ -35,20 +42,30 @@ function formatMoney(value: number, currency = 'USD', withSign = false): string 
 export const IbkrView: React.FC<Props> = ({ onNotify, onNavigateSettings }) => {
   const [data, setData] = useState<IbkrOverviewResponse | null>(null);
   const [selectedAccount, setSelectedAccount] = useState('');
-  const [subTab, setSubTab] = useState<SubTab>('daily');
+  const [subTab, setSubTab] = useState<SubTab>('orders');
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
+  const [connecting, setConnecting] = useState(false);
+  const [cancellingId, setCancellingId] = useState<number | null>(null);
 
   const [tradeFilter, setTradeFilter] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('ALL');
   const [sideFilter, setSideFilter] = useState('ALL');
+
+  // Test / manual order form
+  const [testSymbol, setTestSymbol] = useState('IAUM');
+  const [testMarket, setTestMarket] = useState<'US' | 'HK' | 'CN'>('US');
+  const [testSide, setTestSide] = useState<'buy' | 'sell'>('buy');
+  const [testQty, setTestQty] = useState('1');
+  const [testPrice, setTestPrice] = useState('34.0');
+  const [submittingOrder, setSubmittingOrder] = useState(false);
 
   const loadData = async (acct = selectedAccount) => {
     try {
       const res = await api.getIbkrOverview(acct);
       setData(res);
     } catch (err) {
-      onNotify(err instanceof Error ? err.message : '加载 IBKR 数据失败');
+      onNotify(err instanceof Error ? err.message : '加载 IBKR 网关数据失败');
     } finally {
       setLoading(false);
     }
@@ -59,18 +76,82 @@ export const IbkrView: React.FC<Props> = ({ onNotify, onNavigateSettings }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedAccount]);
 
+  const handleConnect = async () => {
+    setConnecting(true);
+    try {
+      await api.connectIbGateway();
+      await loadData(selectedAccount);
+      onNotify('已连接 IB Gateway');
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : '连接 IB Gateway 失败');
+    } finally {
+      setConnecting(false);
+    }
+  };
+
+  const handleDisconnect = async () => {
+    try {
+      await api.disconnectIbGateway();
+      await loadData(selectedAccount);
+      onNotify('已断开 IB Gateway 连接');
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : '断开失败');
+    }
+  };
+
   const handleSync = async () => {
     setSyncing(true);
     try {
-      const res = await api.syncIbkrFlex();
+      const res = await api.syncIbGateway({ sync_grids: true, reconcile_orders: false });
       await loadData(selectedAccount);
       onNotify(
-        `IBKR Flex 同步完成：净值 ${res.equity_snapshots} 条、持仓 ${res.positions} 个、新增成交 ${res.trades_inserted} 笔`,
+        `IB Gateway 同步完成：净值 ${res.equity_snapshots} 条、持仓 ${res.positions} 个、新增成交 ${res.trades_inserted} 笔、同步挂单 ${res.open_orders_synced ?? 0} 笔`,
       );
     } catch (err) {
-      onNotify(err instanceof Error ? err.message : 'IBKR Flex 同步失败');
+      onNotify(err instanceof Error ? err.message : 'IB Gateway 同步失败');
     } finally {
       setSyncing(false);
+    }
+  };
+
+  const handlePlaceTestOrder = async (dryRun: boolean) => {
+    const qty = Number(testQty);
+    const lmt = Number(testPrice);
+    if (!testSymbol.trim() || !(qty > 0 && lmt > 0)) {
+      onNotify('请填写有效的标的代码、数量与限价');
+      return;
+    }
+    setSubmittingOrder(true);
+    try {
+      const res = await api.placeIbGatewayTestOrder({
+        symbol: testSymbol.trim().toUpperCase(),
+        market: testMarket,
+        side: testSide,
+        quantity: qty,
+        lmt_price: lmt,
+        dry_run: dryRun,
+      });
+      onNotify(res.message);
+      if (!dryRun) {
+        await loadData(selectedAccount);
+      }
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : '提交测试委托失败');
+    } finally {
+      setSubmittingOrder(false);
+    }
+  };
+
+  const handleCancelOrder = async (order: IbGatewayOrder) => {
+    setCancellingId(order.id);
+    try {
+      await api.cancelIbGatewayOrder(order.id);
+      await loadData(selectedAccount);
+      onNotify(`已撤单：${order.action} ${order.symbol} @ ${order.lmt_price}`);
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : '撤单失败');
+    } finally {
+      setCancellingId(null);
     }
   };
 
@@ -94,6 +175,9 @@ export const IbkrView: React.FC<Props> = ({ onNotify, onNavigateSettings }) => {
   }, [data]);
 
   const s = data?.summary;
+  const gw = data?.gateway_status;
+  const orders = data?.orders || [];
+  const openOrdersCount = orders.filter((o) => !['Filled', 'Cancelled', 'ApiCancelled', 'Inactive'].includes(o.status)).length;
   const ccy = s?.base_currency || 'USD';
 
   return (
@@ -101,21 +185,36 @@ export const IbkrView: React.FC<Props> = ({ onNotify, onNavigateSettings }) => {
       {/* Header Bar */}
       <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-200/80 bg-white p-4 shadow-xs">
         <div className="flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-blue-600 text-white shadow-xs">
+          <div className={`flex h-10 w-10 items-center justify-center rounded-xl text-white shadow-xs ${gw?.connected ? 'bg-emerald-600' : 'bg-blue-600'}`}>
             <TrendingUp className="h-5 w-5" />
           </div>
           <div>
-            <div className="flex items-center gap-2">
-              <h2 className="text-base font-bold text-slate-900">盈透证券 (IBKR) 每日账户与交易汇总</h2>
-              {s?.latest_report_date && (
-                <span className="rounded-full bg-slate-100 px-2.5 py-0.5 text-[11px] font-medium text-slate-600">
-                  最新报告日：{s.latest_report_date}
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="text-base font-bold text-slate-900">盈透证券 IB Gateway 实时控制台 (`ib_async`)</h2>
+              {gw?.connected ? (
+                <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 border border-emerald-200 px-2.5 py-0.5 text-[11px] font-semibold text-emerald-700">
+                  <CheckCircle2 className="h-3 w-3" />
+                  已连接 {gw.host}:{gw.port} · {(gw.trading_mode || 'paper').toUpperCase()}
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2.5 py-0.5 text-[11px] font-medium text-slate-600">
+                  <XCircle className="h-3 w-3 text-slate-400" />
+                  未连接 ({gw?.cfg_host || '127.0.0.1'}:{gw?.cfg_port || 4002})
+                </span>
+              )}
+              {gw?.paper_only_guard && (
+                <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 border border-amber-200 px-2 py-0.5 text-[10px] font-medium text-amber-700">
+                  <ShieldAlert className="h-3 w-3" /> 模拟盘保护锁开启
                 </span>
               )}
             </div>
-            <p className="text-xs text-slate-500">
-              基于官方 Flex Web Service（免挂机 / 免 2FA），汇总每日净值、当前持仓、已实现盈亏与分红流水。
+            <p className="text-xs text-slate-500 mt-0.5">
+              实时同步账户净值、持仓与成交明细，并支撑股票网格自动限价挂单与委托管理。
+              {gw?.last_sync_at ? ` · 上次同步 ${gw.last_sync_at.slice(0, 19).replace('T', ' ')}` : ''}
             </p>
+            {gw?.last_error && (
+              <p className="text-[11px] text-rose-600 mt-0.5">网关状态提示：{gw.last_error}</p>
+            )}
           </div>
         </div>
 
@@ -137,11 +236,29 @@ export const IbkrView: React.FC<Props> = ({ onNotify, onNavigateSettings }) => {
           <button
             type="button"
             onClick={onNavigateSettings}
-            className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 cursor-pointer"
+            className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 cursor-pointer"
           >
             <Settings className="h-3.5 w-3.5" />
-            <span>Flex 配置</span>
+            <span>网关设置</span>
           </button>
+          {gw?.connected ? (
+            <button
+              type="button"
+              onClick={handleDisconnect}
+              className="inline-flex items-center gap-1 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700 hover:bg-rose-100 cursor-pointer"
+            >
+              <PowerOff className="h-3.5 w-3.5" /> 断开
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={handleConnect}
+              disabled={connecting}
+              className="inline-flex items-center gap-1 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs font-medium text-emerald-700 hover:bg-emerald-100 disabled:opacity-50 cursor-pointer"
+            >
+              <PlugZap className="h-3.5 w-3.5" /> {connecting ? '连接中...' : '连接网关'}
+            </button>
+          )}
           <button
             type="button"
             onClick={handleSync}
@@ -149,31 +266,24 @@ export const IbkrView: React.FC<Props> = ({ onNotify, onNavigateSettings }) => {
             className="inline-flex items-center gap-1.5 rounded-xl bg-blue-600 px-4 py-2 text-xs font-medium text-white shadow-xs hover:bg-blue-700 disabled:opacity-50 cursor-pointer"
           >
             <RefreshCw className={`h-3.5 w-3.5 ${syncing ? 'animate-spin' : ''}`} />
-            <span>{syncing ? '正在拉取 Flex...' : '立即同步 Flex 报告'}</span>
+            <span>{syncing ? '正在同步...' : '立即同步网关'}</span>
           </button>
         </div>
       </div>
 
-      {/* Onboarding guide when not configured or empty */}
-      {!loading && s && !s.configured && s.trade_count === 0 && s.position_count === 0 && (
+      {/* Onboarding guide when not connected & empty */}
+      {!loading && !gw?.connected && s && s.trade_count === 0 && s.position_count === 0 && (
         <div className="rounded-2xl border border-blue-200/80 bg-blue-50/70 p-5 space-y-2.5 text-xs text-slate-700">
-          <h3 className="text-sm font-semibold text-blue-900">4 步接入 IBKR Flex 每日汇总（约 2 分钟）</h3>
+          <h3 className="text-sm font-semibold text-blue-900">3 步启动同机 Docker IB Gateway + `ib_async` 实时网关</h3>
           <ol className="list-decimal pl-5 space-y-1.5 leading-relaxed">
             <li>
-              登录 IBKR 网页端 → 顶部菜单 <strong>业绩与报告 → 自主查询</strong>（英文界面为 Flex Queries），在 <strong>活动自主查询</strong>（Activity Flex Queries）旁点击 <strong>+</strong> 新建，交付格式务必选 <strong>XML</strong>。
+              进入服务器仓库 <code className="rounded bg-white px-1.5 py-0.5 text-blue-800">deploy/ib-gateway/</code> 目录，复制 <code className="rounded bg-white px-1.5 py-0.5 text-blue-800">.env.example</code> 为 <code className="rounded bg-white px-1.5 py-0.5 text-blue-800">.env</code> 并填入 IBKR 用户名与密码（默认 <code className="rounded bg-white px-1.5 py-0.5 text-blue-800">TRADING_MODE=paper</code>，安全绑定 <code className="rounded bg-white px-1.5 py-0.5 text-blue-800">127.0.0.1:4002</code>）。
             </li>
             <li>
-              勾选以下 4 个部分并选择全部字段（Full / 全选）：
-              <code className="mx-1 rounded bg-white px-1.5 py-0.5 text-blue-800">基础货币权益汇总 (Equity Summary in Base)</code>、
-              <code className="mx-1 rounded bg-white px-1.5 py-0.5 text-blue-800">未平仓头寸 (Open Positions)</code>、
-              <code className="mx-1 rounded bg-white px-1.5 py-0.5 text-blue-800">交易 / 成交 (Trades)</code>、
-              <code className="mx-1 rounded bg-white px-1.5 py-0.5 text-blue-800">现金交易 (Cash Transactions)</code>，周期建议选 <strong>最近 30 个日历日 (Last 30 Calendar Days)</strong>。
+              执行 <code className="rounded bg-white px-1.5 py-0.5 text-blue-800">docker compose up -d</code> 并在手机 <strong>IBKR Mobile (IB Key)</strong> 点确认完成登录。
             </li>
             <li>
-              保存后点进刚创建的查询或查看列表右侧的 <strong>Query ID（查询编号）</strong>；然后在同页面点开 <strong>Flex Web 服务配置（自主网络服务配置）</strong>，开启服务并点 <strong>生成新口令（Generate New Token）</strong>（有效期最长可设 1 年，IP 限制可留空）。
-            </li>
-            <li>
-              前往 <button type="button" onClick={onNavigateSettings} className="font-semibold text-blue-700 underline cursor-pointer">系统设置 → 盈透证券 (IBKR) Flex 配置</button> 填入 Token 与 Query ID，保存后点「立即同步 Flex 报告」即可。
+              前往 <button type="button" onClick={onNavigateSettings} className="font-semibold text-blue-700 underline cursor-pointer">系统设置 → IBKR 盈透</button> 开启后台网关并保存，点击上方「连接网关 / 立即同步网关」即可开始实盘/模拟盘测试！
             </li>
           </ol>
         </div>
@@ -261,10 +371,11 @@ export const IbkrView: React.FC<Props> = ({ onNotify, onNavigateSettings }) => {
       <div className="flex flex-wrap gap-2">
         {(
           [
+            { key: 'orders', label: `网关委托与模拟测试 (${openOrdersCount} 活动中 / 共 ${orders.length})` },
             { key: 'daily', label: '每日净值与盈亏汇总' },
             { key: 'positions', label: `当前持仓 (${data?.positions.length || 0})` },
-            { key: 'trades', label: `历史成交 (${data?.trades.length || 0})` },
-            { key: 'cash', label: `分红与现金流水 (${data?.cash_transactions.length || 0})` },
+            { key: 'trades', label: `成交明细 (${data?.trades.length || 0})` },
+            { key: 'cash', label: `历史分红与现金 (${data?.cash_transactions.length || 0})` },
           ] as Array<{ key: SubTab; label: string }>
         ).map((tab) => (
           <button
@@ -281,6 +392,176 @@ export const IbkrView: React.FC<Props> = ({ onNotify, onNavigateSettings }) => {
           </button>
         ))}
       </div>
+
+      {/* Sub-tab 0: Gateway Orders & Paper Test Order */}
+      {subTab === 'orders' && data && (
+        <div className="space-y-4">
+          <div className="rounded-2xl border border-slate-200/80 bg-white p-4 shadow-xs space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-xs font-semibold text-slate-800">
+                <Send className="h-4 w-4 text-indigo-600" />
+                <span>模拟盘 / 网关测试限价委托（支持规则预校验 & 一键发单）</span>
+              </div>
+              <span className="text-[11px] text-slate-400">
+                自动按美股 $0.01 / 港股阶梯最小价位与手数取整；开启模拟盘保护锁时会拦截实盘发送
+              </span>
+            </div>
+            <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-6">
+              <select
+                value={testMarket}
+                onChange={(e) => setTestMarket(e.target.value as 'US' | 'HK' | 'CN')}
+                className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs"
+              >
+                <option value="US">美股 (US)</option>
+                <option value="HK">港股 (HK)</option>
+                <option value="CN">A股通 (CN)</option>
+              </select>
+              <input
+                type="text"
+                value={testSymbol}
+                onChange={(e) => setTestSymbol(e.target.value)}
+                placeholder="代码 如 IAUM / 03152"
+                className="rounded-xl border border-slate-200 px-3 py-2 text-xs font-mono"
+              />
+              <select
+                value={testSide}
+                onChange={(e) => setTestSide(e.target.value as 'buy' | 'sell')}
+                className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs"
+              >
+                <option value="buy">限价买入 (BUY)</option>
+                <option value="sell">限价卖出 (SELL)</option>
+              </select>
+              <input
+                type="number"
+                step="any"
+                value={testPrice}
+                onChange={(e) => setTestPrice(e.target.value)}
+                placeholder="限价价格"
+                className="rounded-xl border border-slate-200 px-3 py-2 text-xs font-mono"
+              />
+              <input
+                type="number"
+                step="any"
+                value={testQty}
+                onChange={(e) => setTestQty(e.target.value)}
+                placeholder="数量 (股)"
+                className="rounded-xl border border-slate-200 px-3 py-2 text-xs font-mono"
+              />
+              <div className="flex gap-1.5">
+                <button
+                  type="button"
+                  disabled={submittingOrder}
+                  onClick={() => handlePlaceTestOrder(true)}
+                  className="flex-1 rounded-xl border border-slate-200 bg-white px-2.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
+                >
+                  预校验
+                </button>
+                <button
+                  type="button"
+                  disabled={submittingOrder}
+                  onClick={() => handlePlaceTestOrder(false)}
+                  className="flex-1 rounded-xl bg-indigo-600 px-2.5 py-2 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50 cursor-pointer"
+                >
+                  发送测试单
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div className="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-xs overflow-x-auto space-y-3">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-slate-900 flex items-center gap-1.5">
+                <ListOrdered className="h-4 w-4 text-blue-600" />
+                <span>IB Gateway 限价挂单流水</span>
+              </h3>
+              <span className="text-[11px] text-slate-400">包含自动网格限价单 (`LH_GRID_*`) 与手动测试单</span>
+            </div>
+            <table className="w-full text-left text-xs">
+              <thead className="border-b border-slate-100 text-[11px] text-slate-500">
+                <tr>
+                  <th className="py-2 pr-3 font-medium">标的</th>
+                  <th className="py-2 px-2 font-medium">方向 / 档位</th>
+                  <th className="py-2 px-2 font-medium text-right">限价</th>
+                  <th className="py-2 px-2 font-medium text-right">委托 / 已成交</th>
+                  <th className="py-2 px-2 font-medium">OrderRef</th>
+                  <th className="py-2 px-2 font-medium">模式 / 状态</th>
+                  <th className="py-2 px-2 font-medium">更新时间</th>
+                  <th className="py-2 pl-2 font-medium text-right">操作</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100 tabular-nums">
+                {orders.length === 0 ? (
+                  <tr>
+                    <td colSpan={8} className="py-8 text-center text-slate-400">
+                      暂无网关委托单记录；开启网格自动交易或使用上方模拟测试下单后将在此实时显示。
+                    </td>
+                  </tr>
+                ) : (
+                  orders.map((ord) => {
+                    const isTerminal = ['Filled', 'Cancelled', 'ApiCancelled', 'Inactive'].includes(ord.status);
+                    return (
+                      <tr key={ord.id} className="hover:bg-slate-50/70">
+                        <td className="py-2.5 pr-3">
+                          <span className="font-mono font-semibold text-slate-900">{ord.symbol}</span>
+                          <span className="ml-1.5 rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">
+                            {ord.market}
+                          </span>
+                        </td>
+                        <td className="py-2.5 px-2">
+                          <span className={`rounded px-2 py-0.5 text-[11px] font-medium ${ord.side === 'buy' ? 'bg-rose-50 text-rose-700' : 'bg-emerald-50 text-emerald-700'}`}>
+                            {ord.action}
+                          </span>
+                          {ord.grid_level !== null && (
+                            <span className="ml-1 text-[11px] text-slate-500">第 {ord.grid_level + 1} 档</span>
+                          )}
+                        </td>
+                        <td className="py-2.5 px-2 text-right font-mono font-semibold text-slate-900">
+                          {ord.lmt_price}
+                        </td>
+                        <td className="py-2.5 px-2 text-right font-mono text-slate-700">
+                          {ord.total_qty} / {ord.filled_qty}
+                        </td>
+                        <td className="py-2.5 px-2 font-mono text-[11px] text-slate-500">
+                          {ord.order_ref || `#${ord.order_id}`}
+                        </td>
+                        <td className="py-2.5 px-2">
+                          <span className="mr-1 rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-600">
+                            {ord.trading_mode.toUpperCase()}
+                          </span>
+                          <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
+                            ord.status === 'Filled'
+                              ? 'bg-emerald-100 text-emerald-700'
+                              : isTerminal
+                                ? 'bg-slate-100 text-slate-500'
+                                : 'bg-blue-100 text-blue-700'
+                          }`}>
+                            {ord.status || 'Submitted'}
+                          </span>
+                        </td>
+                        <td className="py-2.5 px-2 text-slate-400">
+                          {ord.updated_at.slice(0, 19).replace('T', ' ')}
+                        </td>
+                        <td className="py-2.5 pl-2 text-right">
+                          {!isTerminal && (
+                            <button
+                              type="button"
+                              disabled={cancellingId === ord.id}
+                              onClick={() => handleCancelOrder(ord)}
+                              className="rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1 text-[11px] font-medium text-rose-700 hover:bg-rose-100 disabled:opacity-50 cursor-pointer"
+                            >
+                              {cancellingId === ord.id ? '撤单中...' : '撤单'}
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
 
       {/* Sub-tab 1: Daily Equity & Daily Trade Aggregation */}
       {subTab === 'daily' && data && (

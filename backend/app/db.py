@@ -99,6 +99,18 @@ DEFAULT_SETTINGS: Dict[str, str] = {
     "ibkr_bark_daily_summary": "0",
     "ibkr_proxy_url": "",
     "ibkr_last_notified_date": "",
+    "ibgw_enabled": "0",
+    "ibgw_host": "127.0.0.1",
+    "ibgw_port": "4002",
+    "ibgw_client_id": "18",
+    "ibgw_trading_mode": "paper",
+    "ibgw_paper_only_guard": "1",
+    "ibgw_auto_reconnect": "1",
+    "ibgw_auto_grid_enabled": "0",
+    "ibgw_sync_interval_sec": "30",
+    "ibgw_notify_fills": "1",
+    "ibgw_notify_disconnect": "1",
+    "ibgw_account": "",
 }
 
 
@@ -502,11 +514,46 @@ def init_db(seed_demo: bool = True) -> None:
                 price_updated_at TEXT DEFAULT '',
                 ibkr_auto_sync INTEGER NOT NULL DEFAULT 1,
                 broker TEXT DEFAULT '',
+                auto_trade_enabled INTEGER NOT NULL DEFAULT 0,
+                auto_allow_live INTEGER NOT NULL DEFAULT 0,
+                max_holding_qty REAL NOT NULL DEFAULT 0,
+                stop_buy_below_lower INTEGER NOT NULL DEFAULT 1,
+                lot_size REAL NOT NULL DEFAULT 1,
+                tick_size REAL NOT NULL DEFAULT 0,
+                conid TEXT DEFAULT '',
+                exchange TEXT DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'active',
                 notes TEXT DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS ibgw_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                strategy_id INTEGER REFERENCES grid_strategies(id) ON DELETE CASCADE,
+                perm_id INTEGER DEFAULT 0,
+                order_id INTEGER DEFAULT 0,
+                client_id INTEGER DEFAULT 0,
+                order_ref TEXT DEFAULT '',
+                account_id TEXT DEFAULT '',
+                symbol TEXT NOT NULL,
+                market TEXT DEFAULT 'US',
+                side TEXT NOT NULL,
+                action TEXT NOT NULL,
+                total_qty REAL NOT NULL,
+                filled_qty REAL NOT NULL DEFAULT 0,
+                remaining_qty REAL NOT NULL DEFAULT 0,
+                lmt_price REAL NOT NULL,
+                avg_fill_price REAL NOT NULL DEFAULT 0,
+                grid_level INTEGER,
+                status TEXT DEFAULT '',
+                trading_mode TEXT DEFAULT 'paper',
+                error_msg TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ibgw_orders_strategy ON ibgw_orders(strategy_id, status, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_ibgw_orders_ref ON ibgw_orders(order_ref, perm_id);
 
             CREATE TABLE IF NOT EXISTS stock_trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -600,6 +647,22 @@ def init_db(seed_demo: bool = True) -> None:
             conn.execute("ALTER TABLE grid_strategies ADD COLUMN ibkr_auto_sync INTEGER NOT NULL DEFAULT 1")
         if "broker" not in grid_cols:
             conn.execute("ALTER TABLE grid_strategies ADD COLUMN broker TEXT DEFAULT ''")
+        if "auto_trade_enabled" not in grid_cols:
+            conn.execute("ALTER TABLE grid_strategies ADD COLUMN auto_trade_enabled INTEGER NOT NULL DEFAULT 0")
+        if "auto_allow_live" not in grid_cols:
+            conn.execute("ALTER TABLE grid_strategies ADD COLUMN auto_allow_live INTEGER NOT NULL DEFAULT 0")
+        if "max_holding_qty" not in grid_cols:
+            conn.execute("ALTER TABLE grid_strategies ADD COLUMN max_holding_qty REAL NOT NULL DEFAULT 0")
+        if "stop_buy_below_lower" not in grid_cols:
+            conn.execute("ALTER TABLE grid_strategies ADD COLUMN stop_buy_below_lower INTEGER NOT NULL DEFAULT 1")
+        if "lot_size" not in grid_cols:
+            conn.execute("ALTER TABLE grid_strategies ADD COLUMN lot_size REAL NOT NULL DEFAULT 1")
+        if "tick_size" not in grid_cols:
+            conn.execute("ALTER TABLE grid_strategies ADD COLUMN tick_size REAL NOT NULL DEFAULT 0")
+        if "conid" not in grid_cols:
+            conn.execute("ALTER TABLE grid_strategies ADD COLUMN conid TEXT DEFAULT ''")
+        if "exchange" not in grid_cols:
+            conn.execute("ALTER TABLE grid_strategies ADD COLUMN exchange TEXT DEFAULT ''")
         st_cols = {r["name"] for r in conn.execute("PRAGMA table_info(stock_trades)").fetchall()}
         if "source_type" not in st_cols:
             conn.execute("ALTER TABLE stock_trades ADD COLUMN source_type TEXT NOT NULL DEFAULT 'manual'")
@@ -937,6 +1000,7 @@ def reset_all_data(reseed: bool = False) -> None:
             DELETE FROM debt_operations;
             DELETE FROM credit_cards;
             DELETE FROM loans;
+            DELETE FROM ibgw_orders;
             DELETE FROM stock_trades;
             DELETE FROM grid_strategies;
             """

@@ -85,6 +85,56 @@ export interface IbkrCashTransaction {
   date_time: string;
 }
 
+export interface IbGatewayStatus {
+  connected: boolean;
+  connecting: boolean;
+  enabled: boolean;
+  auto_grid_enabled: boolean;
+  paper_only_guard: boolean;
+  auto_reconnect: boolean;
+  sync_interval_sec: number;
+  host: string;
+  port: number;
+  client_id: number;
+  cfg_host: string;
+  cfg_port: number;
+  cfg_client_id: number;
+  trading_mode: 'paper' | 'live' | string;
+  managed_accounts: string[];
+  account_id: string;
+  last_connect_at: string;
+  last_sync_at: string;
+  last_order_sync_at: string;
+  last_error: string | null;
+  phase: string;
+  ib_async_installed?: boolean;
+}
+
+export interface IbGatewayOrder {
+  id: number;
+  strategy_id: number | null;
+  perm_id: number;
+  order_id: number;
+  client_id: number;
+  order_ref: string;
+  account_id: string;
+  symbol: string;
+  market: string;
+  side: 'buy' | 'sell';
+  action: 'BUY' | 'SELL' | string;
+  total_qty: number;
+  filled_qty: number;
+  remaining_qty: number;
+  lmt_price: number;
+  avg_fill_price: number;
+  grid_level: number | null;
+  status: string;
+  trading_mode: string;
+  error_msg: string;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface IbkrOverviewResponse {
   summary: {
     configured: boolean;
@@ -108,6 +158,8 @@ export interface IbkrOverviewResponse {
     account_count: number;
     position_count: number;
     trade_count: number;
+    open_order_count?: number;
+    trading_mode?: string;
   };
   accounts: string[];
   daily_equity: IbkrEquitySnapshot[];
@@ -115,6 +167,8 @@ export interface IbkrOverviewResponse {
   positions: IbkrPosition[];
   trades: IbkrTrade[];
   cash_transactions: IbkrCashTransaction[];
+  gateway_status?: IbGatewayStatus;
+  orders?: IbGatewayOrder[];
   sync_status: {
     running: boolean;
     phase: string;
@@ -710,6 +764,14 @@ export interface GridStrategy {
   price_updated_at: string;
   ibkr_auto_sync?: number | boolean;
   broker?: string;
+  auto_trade_enabled?: number | boolean;
+  auto_allow_live?: number | boolean;
+  max_holding_qty?: number;
+  stop_buy_below_lower?: number | boolean;
+  lot_size?: number;
+  tick_size?: number;
+  conid?: string;
+  exchange?: string;
   status: 'active' | 'paused' | 'closed';
   notes: string;
   created_at: string;
@@ -838,6 +900,7 @@ export interface GridDetailResponse {
   pairs: GridPairRecord[];
   open_lots: GridOpenLot[];
   signals: GridSignals;
+  orders?: IbGatewayOrder[];
 }
 
 export interface GridIbkrCandidate {
@@ -864,7 +927,8 @@ export interface GridIbkrSyncResponse {
   skipped_duplicates: number;
   updated_prices: number;
   matched_strategies: number;
-  flex_refreshed: boolean;
+  flex_refreshed?: boolean;
+  gateway_refreshed?: boolean;
   detail: GridDetailResponse | null;
 }
 

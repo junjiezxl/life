@@ -33,7 +33,7 @@ const NAV_ITEMS: Array<{ key: TabKey; label: string; icon: React.ComponentType<{
   { key: 'finance', label: '个人财务 & 结账', icon: Wallet },
   { key: 'grids', label: '股票网格记账', icon: Grid3x3 },
   { key: 'ctrader', label: 'cTrader 行情 & 订单', icon: Activity },
-  { key: 'ibkr', label: 'IBKR 每日汇总', icon: TrendingUp },
+  { key: 'ibkr', label: 'IBKR 交易网关', icon: TrendingUp },
   { key: 'settings', label: '系统设置', icon: Settings },
 ];
 

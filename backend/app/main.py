@@ -37,11 +37,12 @@ from .models import (
     EmailFetchRequest,
     EmailImportRequest,
     EmailParseTextRequest,
-    GridEmailFetchRequest,
-    GridEmailImportRequest,
+    GridAutoSyncOrdersRequest,
     GridIbkrSyncRequest,
     GridStrategyCreate,
     GridStrategyUpdate,
+    IbGatewaySyncRequest,
+    IbGatewayTestOrderRequest,
     LoanCreate,
     LoanUpdate,
     NoteExtractRequest,
@@ -131,15 +132,21 @@ from .services.grid_service import (
     infer_market_from_ibkr,
     list_ibkr_grid_candidates,
     nearest_level,
-    sync_email_stock_trades_to_grids,
     sync_ibkr_to_grids,
     to_tencent_code,
 )
-from .services.ibkr_service import (
-    get_ibkr_overview,
-    get_ibkr_sync_status,
-    sync_ibkr_flex,
-    test_ibkr_connection,
+from .services.ibgw_service import (
+    cancel_gateway_order,
+    connect_gateway,
+    disconnect_gateway,
+    get_gateway_status,
+    get_ibgw_overview,
+    is_gateway_connected,
+    list_ibgw_orders,
+    place_test_gateway_order,
+    reconcile_auto_grid_orders,
+    sync_gateway_snapshot,
+    test_gateway_connection,
 )
 from .services.proxy_service import test_proxy_connection
 from .services.siyuan_service import fetch_siyuan_notes, test_siyuan_connection
@@ -364,12 +371,6 @@ async def _email_auto_sync_loop() -> None:
                                         for e in res["emails"]
                                     ],
                                 )
-                                if res.get("stock_trades"):
-                                    sync_email_stock_trades_to_grids(
-                                        conn,
-                                        res["stock_trades"],
-                                        auto_create_missing=False,
-                                    )
                             await _push_new_reminders_bark(batch_out.get("reminders", []), prefix="📧 自动同步提醒：")
         except Exception:
             pass
@@ -625,18 +626,25 @@ async def _ctrader_token_auto_refresh_loop() -> None:
         await asyncio.sleep(3600.0)
 
 
-async def _ibkr_auto_sync_loop() -> None:
-    await asyncio.sleep(30.0)
+async def _ib_gateway_loop() -> None:
+    await asyncio.sleep(15.0)
     while True:
-        interval_min = 360
+        interval_sec = 30
         try:
             settings = get_all_settings()
-            interval_min = max(15, int(settings.get("ibkr_sync_interval_min") or "360"))
-            if settings.get("ibkr_auto_sync_enabled") == "1" and (settings.get("ibkr_flex_token") or "").strip():
-                await sync_ibkr_flex()
+            interval_sec = max(10, min(3600, int(settings.get("ibgw_sync_interval_sec") or "30")))
+            if settings.get("ibgw_enabled") == "1":
+                auto_reconnect = (settings.get("ibgw_auto_reconnect") or "1") == "1"
+                if is_gateway_connected() or auto_reconnect:
+                    reconcile = settings.get("ibgw_auto_grid_enabled") == "1"
+                    await sync_gateway_snapshot(
+                        sync_grids=True,
+                        reconcile_orders=reconcile,
+                        push_summary=False,
+                    )
         except Exception:
             pass
-        await asyncio.sleep(interval_min * 60.0)
+        await asyncio.sleep(float(interval_sec))
 
 
 @app.on_event("startup")
@@ -646,7 +654,7 @@ async def on_startup() -> None:
     asyncio.create_task(_bark_due_reminder_loop())
     asyncio.create_task(_ctrader_auto_sync_loop())
     asyncio.create_task(_ctrader_token_auto_refresh_loop())
-    asyncio.create_task(_ibkr_auto_sync_loop())
+    asyncio.create_task(_ib_gateway_loop())
     asyncio.create_task(_startup_update_notify_task())
     asyncio.create_task(_startup_legacy_deals_repair_task())
     await market_service.ensure_started_from_settings()
@@ -655,6 +663,7 @@ async def on_startup() -> None:
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
     await market_service.stop()
+    await disconnect_gateway()
 
 
 # ---------------- Auth & Health ----------------
@@ -829,25 +838,26 @@ async def api_ctrader_oauth_callback(
         )
 
 
-# ---------------- IBKR Flex Daily Summary ----------------
+# ---------------- IBKR IB Gateway (ib_async) & Portfolio Overview ----------------
 
 
 @app.get("/api/ibkr/overview")
 def api_ibkr_overview(account_id: str = "") -> Dict[str, Any]:
-    return get_ibkr_overview(account_id=account_id)
+    return get_ibgw_overview(account_id=account_id)
 
 
 @app.get("/api/ibkr/sync/status")
 def api_ibkr_sync_status() -> Dict[str, Any]:
-    return get_ibkr_sync_status()
+    return get_gateway_status()
 
 
 @app.post("/api/ibkr/sync")
 async def api_ibkr_sync(payload: Optional[IBKRSyncRequest] = None) -> Dict[str, Any]:
     try:
-        return await sync_ibkr_flex(
-            query_id=payload.query_id if payload else None,
-            push_summary=payload.push_summary if payload else None,
+        return await sync_gateway_snapshot(
+            sync_grids=payload.sync_grids if payload else True,
+            reconcile_orders=payload.reconcile_orders if payload else False,
+            push_summary=bool(payload.push_summary) if payload and payload.push_summary is not None else False,
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc).strip() or repr(exc)) from exc
@@ -856,7 +866,79 @@ async def api_ibkr_sync(payload: Optional[IBKRSyncRequest] = None) -> Dict[str, 
 @app.post("/api/ibkr/test")
 async def api_ibkr_test() -> Dict[str, Any]:
     try:
-        return await test_ibkr_connection()
+        return await test_gateway_connection()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc).strip() or repr(exc)) from exc
+
+
+@app.get("/api/ibgw/status")
+def api_ibgw_status() -> Dict[str, Any]:
+    return get_gateway_status()
+
+
+@app.post("/api/ibgw/connect")
+async def api_ibgw_connect() -> Dict[str, Any]:
+    try:
+        return await connect_gateway(force=True)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc).strip() or repr(exc)) from exc
+
+
+@app.post("/api/ibgw/disconnect")
+async def api_ibgw_disconnect() -> Dict[str, Any]:
+    return await disconnect_gateway()
+
+
+@app.post("/api/ibgw/test")
+async def api_ibgw_test() -> Dict[str, Any]:
+    try:
+        return await test_gateway_connection()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc).strip() or repr(exc)) from exc
+
+
+@app.post("/api/ibgw/sync")
+async def api_ibgw_sync(payload: Optional[IbGatewaySyncRequest] = None) -> Dict[str, Any]:
+    req = payload or IbGatewaySyncRequest()
+    try:
+        return await sync_gateway_snapshot(
+            sync_grids=req.sync_grids,
+            reconcile_orders=req.reconcile_orders,
+            push_summary=req.push_summary,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc).strip() or repr(exc)) from exc
+
+
+@app.get("/api/ibgw/orders")
+def api_ibgw_orders(strategy_id: Optional[int] = None, status: str = "", limit: int = Query(100, ge=1, le=500)) -> Dict[str, Any]:
+    return {"items": list_ibgw_orders(strategy_id=strategy_id, status=status, limit=limit)}
+
+
+@app.post("/api/ibgw/test-order")
+async def api_ibgw_test_order(payload: IbGatewayTestOrderRequest) -> Dict[str, Any]:
+    try:
+        return await place_test_gateway_order(
+            symbol=payload.symbol,
+            market=payload.market,
+            side=payload.side,
+            quantity=payload.quantity,
+            lmt_price=payload.lmt_price,
+            currency=payload.currency,
+            exchange=payload.exchange,
+            strategy_id=payload.strategy_id,
+            dry_run=payload.dry_run,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc).strip() or repr(exc)) from exc
+
+
+@app.post("/api/ibgw/orders/{order_row_id}/cancel")
+async def api_ibgw_cancel_order(order_row_id: int) -> Dict[str, Any]:
+    try:
+        return await cancel_gateway_order(order_row_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc).strip() or repr(exc)) from exc
 
@@ -1568,15 +1650,7 @@ async def chat_endpoint(payload: ChatRequest) -> Dict[str, Any]:
                             skip_duplicates=True,
                             logs=logs,
                         )
-                        stock_sync_res = (
-                            sync_email_stock_trades_to_grids(
-                                conn,
-                                stk_trades,
-                                auto_create_missing=any(k in msg_low for k in ("汇丰", "hsbc", "股票", "网格")),
-                            )
-                            if stk_trades
-                            else {}
-                        )
+                    stock_sync_res: Dict[str, Any] = {}
                     created_transactions = batch_res["transactions"]
                     created_reminders = batch_res["reminders"]
                     for tx in created_transactions:
@@ -1654,7 +1728,7 @@ async def chat_endpoint(payload: ChatRequest) -> Dict[str, Any]:
                     if rems:
                         lines.append(f"• 另发现 {len(rems)} 条待办/账单提醒线索。")
                     if stk_trades:
-                        lines.append(f"• 识别出 {len(stk_trades)} 笔证券/汇丰股票成交（可回复「计入个人财务与股票网格」或在「股票网格记账 → 汇丰/邮件导入」写入）。")
+                        lines.append(f"• 检测到 {len(stk_trades)} 笔证券通知（股票网格现已切换为 IB Gateway 直连同步，不再从邮件导入）。")
                     if res.get("warnings"):
                         lines.append(f"• 部分提示：{'；'.join(res['warnings'][:3])}")
                     reply_text = "\n".join(lines)
@@ -2944,14 +3018,7 @@ async def import_email_items_endpoint(payload: EmailImportRequest) -> Dict[str, 
             auto_create_accounts=payload.auto_create_accounts,
             auto_reconcile=payload.auto_reconcile,
         )
-        stock_sync: Dict[str, Any] = {}
-        if payload.stock_trades:
-            stock_sync = sync_email_stock_trades_to_grids(
-                conn,
-                [s.model_dump() for s in payload.stock_trades],
-                auto_create_missing=payload.auto_create_grid_strategies,
-            )
-    res["stock_sync"] = stock_sync
+    res["stock_sync"] = {}
     await _push_new_reminders_bark(res.get("reminders", []), prefix="📧 邮件提醒：")
     return res
 
@@ -3804,7 +3871,14 @@ def _load_grid_detail(conn: Any, strategy_id: int) -> Dict[str, Any]:
         ).fetchall()
     ]
     state = compute_strategy_state(strat, trades)
-    return {"strategy": strat, **state}
+    orders = [
+        _row_to_dict(r)
+        for r in conn.execute(
+            "SELECT * FROM ibgw_orders WHERE strategy_id = ? ORDER BY CASE WHEN status IN ('Submitted','PreSubmitted','PendingSubmit') THEN 0 ELSE 1 END, id DESC LIMIT 30",
+            (strategy_id,),
+        ).fetchall()
+    ]
+    return {"strategy": strat, **state, "orders": orders}
 
 
 @app.get("/api/grids")
@@ -3874,8 +3948,10 @@ def create_grid_strategy(payload: GridStrategyCreate) -> Dict[str, Any]:
         cur = conn.execute(
             """INSERT INTO grid_strategies
             (name, symbol, market, currency, grid_type, lower_price, upper_price, step_value, shares_per_grid,
-             base_price, fee_rate, min_fee, stamp_tax_rate, stamp_tax_side, current_price, ibkr_auto_sync, broker, status, notes, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             base_price, fee_rate, min_fee, stamp_tax_rate, stamp_tax_side, current_price, ibkr_auto_sync, broker,
+             auto_trade_enabled, auto_allow_live, max_holding_qty, stop_buy_below_lower, lot_size, tick_size, conid, exchange,
+             status, notes, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 name,
                 sym,
@@ -3894,6 +3970,14 @@ def create_grid_strategy(payload: GridStrategyCreate) -> Dict[str, Any]:
                 payload.current_price,
                 1 if payload.ibkr_auto_sync else 0,
                 payload.broker.strip(),
+                1 if payload.auto_trade_enabled else 0,
+                1 if payload.auto_allow_live else 0,
+                payload.max_holding_qty,
+                1 if payload.stop_buy_below_lower else 0,
+                payload.lot_size,
+                payload.tick_size,
+                payload.conid.strip(),
+                payload.exchange.strip().upper(),
                 payload.status,
                 payload.notes.strip(),
                 ts,
@@ -3903,161 +3987,25 @@ def create_grid_strategy(payload: GridStrategyCreate) -> Dict[str, Any]:
         return _load_grid_detail(conn, int(cur.lastrowid))
 
 
-@app.post("/api/grids/fetch-email-trades")
-async def fetch_grid_email_trades(payload: GridEmailFetchRequest) -> Dict[str, Any]:
-    settings = get_all_settings()
-    accounts = _get_active_email_accounts(settings, account_id=payload.account_id)
-    with get_conn() as conn:
-        existing_refs = _get_existing_external_refs(conn)
-        synced_uids = _get_synced_email_uids(conn)
-        existing_stk_refs = _get_existing_stock_external_refs(conn)
-        strats = [_row_to_dict(r) for r in conn.execute("SELECT id, name, symbol, market, broker FROM grid_strategies").fetchall()]
-
-    try:
-        res = await smart_fetch_and_parse_emails(
-            base_settings=settings,
-            accounts=accounts,
-            existing_refs=existing_refs,
-            synced_uids=synced_uids,
-            days=payload.days,
-            limit=payload.limit,
-            keyword=payload.keyword,
-            zip_password=payload.pdf_password,
-            include_body_ai=payload.include_body_ai,
-            unread_only=False,
-            skip_already_synced=False,
-            existing_stock_refs=existing_stk_refs,
-            account_id=payload.account_id,
-            stock_only=True,
-            source=payload.source,
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    trades = res.get("stock_trades", [])
-    for st in trades:
-        key = canonical_symbol_key(st.get("symbol", ""), st.get("market", "HK"))
-        matched = [s for s in strats if canonical_symbol_key(s["symbol"], s["market"]) == key]
-        st["matched_strategy_id"] = matched[0]["id"] if matched else None
-        st["matched_strategy_name"] = matched[0]["name"] if matched else ""
-
-    raw_emails = res.get("emails", [])
-    scanned_emails = sorted(
-        raw_emails,
-        key=lambda em: (0 if em.get("stock_hint") else 1, -int(em.get("parsed_stock_count") or 0)),
-    )[:40]
-
-    return {
-        "emails_scanned": len(raw_emails),
-        "scanned_accounts": res.get("scanned_accounts", []),
-        "trades": trades,
-        "scanned_emails": scanned_emails,
-        "warnings": res.get("warnings", []),
-        "from_cache": bool(res.get("from_cache")),
-        "fetched_new": res.get("fetched_new", 0),
-        "cache_stats": res.get("cache_stats"),
-    }
-
-
-@app.post("/api/grids/parse-email-trade-text")
-async def parse_grid_email_trade_text(payload: EmailParseTextRequest) -> Dict[str, Any]:
-    settings = get_all_settings()
-    received_at = payload.received_at or datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
-    res = await extract_from_email_content(
-        subject=payload.subject,
-        sender=payload.sender,
-        received_at=received_at,
-        body_text=payload.body,
-        settings=settings,
-    )
-    with get_conn() as conn:
-        existing_stk_refs = _get_existing_stock_external_refs(conn)
-        strats = [_row_to_dict(r) for r in conn.execute("SELECT id, name, symbol, market, broker FROM grid_strategies").fetchall()]
-    trades = res.get("stock_trades", [])
-    for st in trades:
-        fp_stk = hashlib.sha256(
-            f"email_stk|{payload.subject}|{st.get('side')}|{st.get('symbol')}|{st.get('price')}|{st.get('quantity')}|{st.get('traded_at')}".encode("utf-8")
-        ).hexdigest()[:16]
-        stk_ref = st.get("external_ref") or f"email_stk:{fp_stk}"
-        st["external_ref"] = stk_ref
-        st["already_imported"] = stk_ref in existing_stk_refs
-        key = canonical_symbol_key(st.get("symbol", ""), st.get("market", "HK"))
-        matched = [s for s in strats if canonical_symbol_key(s["symbol"], s["market"]) == key]
-        st["matched_strategy_id"] = matched[0]["id"] if matched else None
-        st["matched_strategy_name"] = matched[0]["name"] if matched else ""
-    return {"trades": trades, "engine": res.get("engine"), "warning": res.get("warning")}
-
-
-@app.post("/api/grids/parse-email-trade-pdf")
-async def parse_grid_email_trade_pdf(
-    file: UploadFile = File(...),
-    pdf_password: str = Form(""),
-) -> Dict[str, Any]:
-    raw = await file.read()
-    settings = get_all_settings()
-    text, err = _extract_pdf_text(raw, [pdf_password.strip(), settings.get("email_bill_zip_password") or ""])
-    if err:
-        raise HTTPException(status_code=400, detail=err)
-    if not text.strip():
-        raise HTTPException(status_code=400, detail="未能从 PDF 中提取到文本（可能是纯图片扫描件）")
-    res = await extract_from_email_content(
-        subject=file.filename or "券商成交单PDF",
-        sender="PDF上传",
-        received_at=datetime.now().astimezone().strftime("%Y-%m-%d %H:%M"),
-        body_text=text,
-        settings=settings,
-    )
-    with get_conn() as conn:
-        existing_stk_refs = _get_existing_stock_external_refs(conn)
-        strats = [_row_to_dict(r) for r in conn.execute("SELECT id, name, symbol, market, broker FROM grid_strategies").fetchall()]
-    trades = res.get("stock_trades", [])
-    for st in trades:
-        fp_stk = hashlib.sha256(
-            f"email_stk|{file.filename}|{st.get('side')}|{st.get('symbol')}|{st.get('price')}|{st.get('quantity')}|{st.get('traded_at')}".encode("utf-8")
-        ).hexdigest()[:16]
-        stk_ref = st.get("external_ref") or f"email_stk:{fp_stk}"
-        st["external_ref"] = stk_ref
-        st["already_imported"] = stk_ref in existing_stk_refs
-        key = canonical_symbol_key(st.get("symbol", ""), st.get("market", "HK"))
-        matched = [s for s in strats if canonical_symbol_key(s["symbol"], s["market"]) == key]
-        st["matched_strategy_id"] = matched[0]["id"] if matched else None
-        st["matched_strategy_name"] = matched[0]["name"] if matched else ""
-    return {"trades": trades, "extracted_preview": text[:500]}
-
-
-@app.post("/api/grids/import-email-trades")
-def import_grid_email_trades(payload: GridEmailImportRequest) -> Dict[str, Any]:
-    with get_conn() as conn:
-        res = sync_email_stock_trades_to_grids(
-            conn,
-            [t.model_dump() for t in payload.trades],
-            strategy_id=payload.strategy_id,
-            auto_create_missing=payload.auto_create_missing,
-            default_step_pct=payload.default_step_pct,
-            broker_tag=payload.broker_tag,
-        )
-        detail = _load_grid_detail(conn, payload.strategy_id) if payload.strategy_id is not None else None
-    return {**res, "detail": detail}
-
-
 @app.get("/api/grids/ibkr-candidates")
 def get_grid_ibkr_candidates() -> Dict[str, Any]:
     cfg = get_all_settings()
-    configured = bool((cfg.get("ibkr_flex_token") or "").strip() and (cfg.get("ibkr_flex_query_id") or "").strip())
     with get_conn() as conn:
         items = list_ibkr_grid_candidates(conn)
-    return {"configured": configured, "items": items}
+    gw = get_gateway_status(cfg)
+    configured = bool(gw["enabled"] or gw["connected"] or items)
+    return {"configured": configured, "gateway_status": gw, "items": items}
 
 
 @app.post("/api/grids/sync-ibkr")
 async def sync_grid_from_ibkr(payload: Optional[GridIbkrSyncRequest] = None) -> Dict[str, Any]:
     req = payload or GridIbkrSyncRequest()
-    flex_result: Optional[Dict[str, Any]] = None
-    if req.refresh_flex_first:
+    gw_result: Optional[Dict[str, Any]] = None
+    if req.refresh_gateway_first or req.refresh_flex_first:
         try:
-            flex_result = await sync_ibkr_flex(push_summary=False)
+            gw_result = await sync_gateway_snapshot(sync_grids=False, reconcile_orders=False, push_summary=False)
         except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"拉取 IBKR Flex 报表失败：{exc}") from exc
+            raise HTTPException(status_code=400, detail=f"从 IB Gateway 同步失败：{exc}") from exc
 
     with get_conn() as conn:
         res = sync_ibkr_to_grids(
@@ -4069,10 +4017,22 @@ async def sync_grid_from_ibkr(payload: Optional[GridIbkrSyncRequest] = None) -> 
         detail = _load_grid_detail(conn, req.strategy_id) if req.strategy_id is not None else None
     return {
         **res,
-        "flex_refreshed": flex_result is not None,
-        "flex_result": flex_result,
+        "gateway_refreshed": gw_result is not None,
+        "gateway_result": gw_result,
         "detail": detail,
     }
+
+
+@app.post("/api/grids/{strategy_id}/auto-sync-orders")
+async def sync_grid_auto_orders(strategy_id: int, payload: Optional[GridAutoSyncOrdersRequest] = None) -> Dict[str, Any]:
+    req = payload or GridAutoSyncOrdersRequest()
+    try:
+        res = await reconcile_auto_grid_orders(strategy_id=strategy_id, cancel_only=req.cancel_only)
+        with get_conn() as conn:
+            detail = _load_grid_detail(conn, strategy_id)
+        return {**res, "detail": detail}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc).strip() or repr(exc)) from exc
 
 
 @app.get("/api/grids/{strategy_id}")
@@ -4094,8 +4054,13 @@ def update_grid_strategy(strategy_id: int, payload: GridStrategyUpdate) -> Dict[
         updates["notes"] = updates["notes"].strip()
     if "currency" in updates and updates["currency"] is not None:
         updates["currency"] = updates["currency"].strip().upper()
-    if "ibkr_auto_sync" in updates and updates["ibkr_auto_sync"] is not None:
-        updates["ibkr_auto_sync"] = 1 if updates["ibkr_auto_sync"] else 0
+    for bool_col in ("ibkr_auto_sync", "auto_trade_enabled", "auto_allow_live", "stop_buy_below_lower"):
+        if bool_col in updates and updates[bool_col] is not None:
+            updates[bool_col] = 1 if updates[bool_col] else 0
+    if "exchange" in updates and updates["exchange"] is not None:
+        updates["exchange"] = updates["exchange"].strip().upper()
+    if "conid" in updates and updates["conid"] is not None:
+        updates["conid"] = updates["conid"].strip()
     ts = now_iso()
     if "current_price" in updates:
         updates["price_updated_at"] = ts

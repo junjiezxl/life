@@ -1403,118 +1403,115 @@ class TestLifeHubAPI(unittest.TestCase):
 
         update_settings({"bark_enabled": "0", "bark_device_key": ""})
 
-    def test_20_ibkr_flex_sync_and_daily_overview(self):
-        from unittest.mock import patch
+    def test_20_ibkr_gateway_sync_and_daily_overview(self):
+        from types import SimpleNamespace
+        from datetime import datetime
         from app.db import get_conn, update_settings
+        from app.services import ibgw_service
 
         with get_conn() as conn:
             conn.execute("DELETE FROM ibkr_equity_snapshots")
             conn.execute("DELETE FROM ibkr_positions")
             conn.execute("DELETE FROM ibkr_trades")
             conn.execute("DELETE FROM ibkr_cash_transactions")
+            conn.execute("DELETE FROM ibgw_orders")
 
         update_settings(
             {
-                "ibkr_flex_token": "flex_tok_123",
-                "ibkr_flex_query_id": "998877",
-                "ibkr_bark_daily_summary": "0",
+                "ibgw_enabled": "1",
+                "ibgw_host": "127.0.0.1",
+                "ibgw_port": "4002",
+                "ibgw_client_id": "18",
+                "ibgw_trading_mode": "paper",
+                "ibgw_notify_fills": "0",
             }
         )
 
-        sample_flex_xml = """<?xml version="1.0" encoding="UTF-8"?>
-<FlexQueryResponse queryName="DailyActivity" type="AF">
-  <FlexStatements count="1">
-    <FlexStatement accountId="U1234567" fromDate="20261121" toDate="20261123" whenGenerated="20261123;220000">
-      <EquitySummaryInBase>
-        <EquitySummaryByReportDateInBase accountId="U1234567" currency="USD" reportDate="20261122" totalCash="10000.00" stock="20000.00" options="500.00" />
-        <EquitySummaryByReportDateInBase accountId="U1234567" currency="USD" reportDate="20261123" totalCash="10500.00" stock="20800.00" options="700.00" />
-      </EquitySummaryInBase>
-      <OpenPositions>
-        <OpenPosition accountId="U1234567" levelOfDetail="SUMMARY" symbol="NVDA" conid="4815747" assetCategory="STK" description="NVIDIA CORP" currency="USD" fxRateToBase="1" position="100" markPrice="148.00" positionValue="14800.00" openPrice="140.00" costBasis="14000.00" fifoPnlUnrealized="800.00" side="Long" reportDate="20261123" />
-        <OpenPosition accountId="U1234567" levelOfDetail="LOT" symbol="NVDA" conid="4815747" assetCategory="STK" currency="USD" fxRateToBase="1" position="50" markPrice="148.00" positionValue="7400.00" openPrice="138.00" costBasis="6900.00" fifoPnlUnrealized="500.00" side="Long" reportDate="20261123" />
-      </OpenPositions>
-      <Trades>
-        <Trade accountId="U1234567" levelOfDetail="ORDER" symbol="AAPL" conid="265598" assetCategory="STK" currency="USD" fxRateToBase="1" buySell="SELL" quantity="-10" tradePrice="230.00" proceeds="2300.00" ibCommission="-1.00" fifoPnlRealized="150.00" tradeDate="20261123" tradeTime="100500" orderID="55501" />
-        <Trade accountId="U1234567" levelOfDetail="EXECUTION" symbol="AAPL" conid="265598" assetCategory="STK" currency="USD" fxRateToBase="1" buySell="SELL" openCloseIndicator="C" quantity="-10" tradePrice="230.00" proceeds="2300.00" ibCommission="-1.00" fifoPnlRealized="150.00" tradeDate="20261123" tradeTime="100501" tradeID="88801" ibOrderID="55501" />
-        <Trade accountId="U1234567" levelOfDetail="EXECUTION" symbol="MSFT" conid="272093" assetCategory="STK" currency="USD" fxRateToBase="1" buySell="BUY" openCloseIndicator="O" quantity="5" tradePrice="420.00" proceeds="-2100.00" ibCommission="-1.05" fifoPnlRealized="0" tradeDate="20261122" tradeTime="151000" tradeID="88802" ibOrderID="55502" />
-      </Trades>
-      <CashTransactions>
-        <CashTransaction accountId="U1234567" transactionID="CT901" type="Dividends" symbol="AAPL" description="AAPL CASH DIVIDEND" currency="USD" fxRateToBase="1" amount="25.50" reportDate="20261123" />
-      </CashTransactions>
-    </FlexStatement>
-  </FlexStatements>
-</FlexQueryResponse>"""
+        class _FakeGatewayIB:
+            def __init__(self):
+                self._connected = False
+                self.disconnectedEvent = []
 
-        req_urls = []
-        get_stmt_calls = 0
+            def isConnected(self):
+                return self._connected
 
-        class _MockFlexResp:
-            def __init__(self, text):
-                self.text = text
-                self.status_code = 200
+            async def connectAsync(self, host, port, clientId=18, timeout=12):
+                self._connected = True
 
-            def raise_for_status(self):
-                return None
+            def disconnect(self):
+                self._connected = False
 
-        class _MockFlexClient:
-            def __init__(self, *args, **kwargs):
-                pass
+            def managedAccounts(self):
+                return ["DU1234567"]
 
-            async def __aenter__(self):
-                return self
+            async def accountSummaryAsync(self):
+                return [
+                    SimpleNamespace(account="DU1234567", tag="NetLiquidation", value="32000.00", currency="USD"),
+                    SimpleNamespace(account="DU1234567", tag="TotalCashValue", value="10500.00", currency="USD"),
+                    SimpleNamespace(account="DU1234567", tag="GrossPositionValue", value="21500.00", currency="USD"),
+                ]
 
-            async def __aexit__(self, exc_type, exc, tb):
-                return False
-
-            async def get(self, url, params=None):
-                nonlocal get_stmt_calls
-                req_urls.append((url, dict(params or {})))
-                if "SendRequest" in url:
-                    return _MockFlexResp(
-                        "<FlexStatementResponse><Status>Success</Status><ReferenceCode>REF777</ReferenceCode>"
-                        "<Url>https://gdcdyn.interactivebrokers.com/Universal/servlet/FlexStatementService.GetStatement</Url>"
-                        "</FlexStatementResponse>"
+            def portfolio(self):
+                return [
+                    SimpleNamespace(
+                        account="DU1234567",
+                        contract=SimpleNamespace(conId=4815747, symbol="NVDA", secType="STK", currency="USD", localSymbol="NVDA"),
+                        position=100.0,
+                        marketPrice=148.0,
+                        marketValue=14800.0,
+                        averageCost=140.0,
+                        unrealizedPNL=800.0,
                     )
-                get_stmt_calls += 1
-                if get_stmt_calls == 1:
-                    return _MockFlexResp(
-                        "<FlexStatementResponse><Status>Warn</Status><ErrorCode>1019</ErrorCode>"
-                        "<ErrorMessage>Statement generation in progress.</ErrorMessage></FlexStatementResponse>"
-                    )
-                return _MockFlexResp(sample_flex_xml)
+                ]
 
-        with (
-            patch("app.services.ibkr_service.httpx.AsyncClient", _MockFlexClient),
-            patch("app.services.ibkr_service.asyncio.sleep", return_value=None),
-        ):
-            sync_resp = self.client.post("/api/ibkr/sync", json={})
+            async def reqExecutionsAsync(self):
+                return [
+                    SimpleNamespace(
+                        contract=SimpleNamespace(conId=265598, symbol="AAPL", secType="STK", currency="USD", localSymbol="AAPL"),
+                        execution=SimpleNamespace(execId="GW_E1", acctNumber="DU1234567", orderId=55501, side="SLD", shares=10.0, price=230.0, time=datetime(2026, 11, 23, 10, 5, 1)),
+                        commissionReport=SimpleNamespace(commission=1.0, realizedPNL=150.0),
+                    ),
+                    SimpleNamespace(
+                        contract=SimpleNamespace(conId=272093, symbol="MSFT", secType="STK", currency="USD", localSymbol="MSFT"),
+                        execution=SimpleNamespace(execId="GW_E2", acctNumber="DU1234567", orderId=55502, side="BOT", shares=5.0, price=420.0, time=datetime(2026, 11, 22, 15, 10, 0)),
+                        commissionReport=SimpleNamespace(commission=1.05, realizedPNL=0.0),
+                    ),
+                ]
 
-        self.assertEqual(sync_resp.status_code, 200, sync_resp.text)
-        sr = sync_resp.json()
-        self.assertTrue(sr["ok"])
-        self.assertEqual(sr["accounts"], ["U1234567"])
-        self.assertEqual(sr["equity_snapshots"], 2)
-        self.assertEqual(sr["positions"], 1)  # SUMMARY only, LOT skipped
-        self.assertEqual(sr["trades_inserted"], 2)  # EXECUTION only, ORDER skipped
-        self.assertEqual(sr["cash_transactions"], 1)
+            async def reqAllOpenOrdersAsync(self):
+                return []
 
-        ov = self.client.get("/api/ibkr/overview")
-        self.assertEqual(ov.status_code, 200)
-        body = ov.json()
-        s = body["summary"]
-        self.assertEqual(s["latest_report_date"], "2026-11-23")
-        self.assertEqual(s["total_nav"], 32000.0)
-        self.assertEqual(s["day_change"], 1500.0)
-        self.assertAlmostEqual(s["day_change_pct"], 4.92, places=2)
-        self.assertEqual(s["unrealized_pnl"], 800.0)
-        self.assertEqual(s["total_realized_pnl"], 150.0)
-        self.assertEqual(s["total_commission"], -2.05)
-        self.assertEqual(s["total_net_pnl"], 147.95)
-        self.assertEqual(s["total_dividends"], 25.5)
-        self.assertEqual(len(body["daily_equity"]), 2)
-        self.assertEqual(len(body["daily_trades"]), 2)
-        self.assertEqual(body["daily_trades"][0]["trade_date"], "2026-11-23")
-        self.assertEqual(body["daily_trades"][0]["net_pnl"], 149.0)
+            def openTrades(self):
+                return []
+
+        ibgw_service.reset_gateway_state_for_test()
+        ibgw_service.set_ib_factory_for_test(lambda: _FakeGatewayIB())
+        try:
+            sync_resp = self.client.post("/api/ibkr/sync", json={"sync_grids": False})
+            self.assertEqual(sync_resp.status_code, 200, sync_resp.text)
+            sr = sync_resp.json()
+            self.assertTrue(sr["ok"])
+            self.assertEqual(sr["accounts"], ["DU1234567"])
+            self.assertEqual(sr["trading_mode"], "paper")
+            self.assertEqual(sr["equity_snapshots"], 1)
+            self.assertEqual(sr["positions"], 1)
+            self.assertEqual(sr["trades_inserted"], 2)
+
+            ov = self.client.get("/api/ibkr/overview")
+            self.assertEqual(ov.status_code, 200)
+            body = ov.json()
+            s = body["summary"]
+            self.assertEqual(s["total_nav"], 32000.0)
+            self.assertEqual(s["total_cash"], 10500.0)
+            self.assertEqual(s["unrealized_pnl"], 800.0)
+            self.assertEqual(s["total_realized_pnl"], 150.0)
+            self.assertEqual(s["total_commission"], -2.05)
+            self.assertEqual(s["total_net_pnl"], 147.95)
+            self.assertTrue(body["gateway_status"]["connected"])
+        finally:
+            ibgw_service.set_ib_factory_for_test(None)
+            ibgw_service.reset_gateway_state_for_test()
+            update_settings({"ibgw_enabled": "0"})
 
     def test_21_global_proxy_switches_and_proxied_imap_gmail(self):
         import socket
@@ -2135,14 +2132,15 @@ class TestLifeHubAPI(unittest.TestCase):
         self.assertEqual(r_del_s.status_code, 200)
         self.assertTrue(r_del_s.json()["deleted"])
 
-    def test_27_ibkr_flex_sync_to_stock_grids_and_quote_fallback(self):
-        import asyncio
+    def test_27_ibkr_gateway_sync_to_stock_grids_and_quote_fallback(self):
+        from types import SimpleNamespace
+        from datetime import datetime
         from unittest.mock import AsyncMock, patch
         from app.db import get_conn, now_iso, update_settings
-        from app.services import ibkr_service
+        from app.services import ibgw_service
 
         ts = now_iso()
-        # Seed IBKR Flex positions & trades (HK ETF 3152 -> canonical 03152 + US ETF QQQ)
+        # Seed IBKR positions & trades (HK ETF 3152 -> canonical 03152)
         with get_conn() as conn:
             conn.execute("DELETE FROM ibkr_positions")
             conn.execute("DELETE FROM ibkr_trades")
@@ -2151,7 +2149,7 @@ class TestLifeHubAPI(unittest.TestCase):
                 (account_id, report_date, conid, symbol, asset_category, description, currency, fx_rate_to_base,
                  position, mark_price, position_value, position_value_base, open_price, cost_basis,
                  unrealized_pnl, unrealized_pnl_base, side, updated_at)
-                VALUES ('U21801100', '2026-11-25', '70001', '3152', 'STK', 'A博时港元ETF', 'HKD', 0.128,
+                VALUES ('DU21801100', '2026-11-25', '70001', '3152', 'STK', 'A博时港元ETF', 'HKD', 0.128,
                         20, 1085.5, 21710.0, 2778.88, 1060.0, 21200.0, 510.0, 65.28, 'Long', ?)""",
                 (ts,),
             )
@@ -2161,9 +2159,9 @@ class TestLifeHubAPI(unittest.TestCase):
                  fx_rate_to_base, side, open_close, quantity, trade_price, proceeds, proceeds_base, commission,
                  commission_base, realized_pnl, realized_pnl_base, trade_date, trade_time, report_date, executed_at, created_at)
                 VALUES
-                ('IBKR_T_001', 'U21801100', '1001', 'O1', '70001', '3152', 'STK', 'A博时港元ETF', 'HKD', 0.128,
+                ('IBKR_T_001', 'DU21801100', '1001', 'O1', '70001', '3152', 'STK', 'A博时港元ETF', 'HKD', 0.128,
                  'BUY', 'O', 20, 1050.0, -21000.0, -2688.0, -18.5, -2.37, 0.0, 0.0, '2026-11-20', '10:15:00', '2026-11-20', '2026-11-20 10:15:00', ?),
-                ('IBKR_T_002', 'U21801100', '1002', 'O2', '70001', '3152', 'STK', 'A博时港元ETF', 'HKD', 0.128,
+                ('IBKR_T_002', 'DU21801100', '1002', 'O2', '70001', '3152', 'STK', 'A博时港元ETF', 'HKD', 0.128,
                  'SELL', 'C', -10, 1090.0, 10900.0, 1395.2, -12.0, -1.54, 400.0, 51.2, '2026-11-24', '14:20:00', '2026-11-24', '2026-11-24 14:20:00', ?)""",
                 (ts, ts),
             )
@@ -2185,14 +2183,13 @@ class TestLifeHubAPI(unittest.TestCase):
         self.assertEqual(sb1["imported_trades"], 2)
         sid = sb1["created_strategies"][0]["id"]
 
-        # Verify grid paired the 10-share sell against the 20-share buy & preserved exact IBKR commissions
         d1 = self.client.get(f"/api/grids/{sid}").json()
         self.assertEqual(d1["summary"]["holding_qty"], 10.0)
         self.assertEqual(d1["summary"]["completed_grids"], 1)
         self.assertAlmostEqual(d1["summary"]["total_fees"], 30.5, places=2)
         self.assertEqual(d1["trades"][0]["source_type"], "ibkr")
 
-        # 3. Re-sync must be 100% deduplicated (0 new imports, 2 skipped)
+        # 3. Re-sync must be 100% deduplicated
         sync2 = self.client.post("/api/grids/sync-ibkr", json={"strategy_id": sid})
         self.assertEqual(sync2.status_code, 200)
         self.assertEqual(sync2.json()["imported_trades"], 0)
@@ -2208,27 +2205,59 @@ class TestLifeHubAPI(unittest.TestCase):
         d_q = self.client.get(f"/api/grids/{sid}").json()
         self.assertAlmostEqual(d_q["strategy"]["current_price"], 1085.5, places=2)
 
-        # 5. Auto-sync hook inside sync_ibkr_flex imports a brand-new IBKR trade automatically!
-        sample_xml = """<FlexQueryResponse queryName="LifeHub" type="AF"><FlexStatements count="1">
-          <FlexStatement accountId="U21801100" fromDate="20261125" toDate="20261125" period="LastBusinessDay" whenGenerated="20261125;200000">
-            <Trades>
-              <Trade accountId="U21801100" tradeID="1003" ibOrderID="O3" conid="70001" symbol="3152" assetCategory="STK"
-                     description="A博时港元ETF" currency="HKD" fxRateToBase="0.128" buySell="SELL" openCloseIndicator="C"
-                     quantity="-10" tradePrice="1100.0" proceeds="11000" ibCommission="-11.0" fifoPnlRealized="500"
-                     tradeDate="20261125" tradeTime="150000" reportDate="20261125" multiplier="1" />
-            </Trades>
-          </FlexStatement></FlexStatements></FlexQueryResponse>"""
-        update_settings({"ibkr_flex_token": "tok_grid_hook", "ibkr_flex_query_id": "999001"})
-        with patch.object(ibkr_service, "fetch_flex_statement_xml", new=AsyncMock(return_value=sample_xml)):
-            flex_res = asyncio.run(ibkr_service.sync_ibkr_flex(push_summary=False))
-            self.assertEqual(flex_res["grid_trades_imported"], 1)
+        # 5. Live IB Gateway sync automatically imports a new execution into the linked grid
+        class _FakeExecIB:
+            def isConnected(self):
+                return True
+
+            async def connectAsync(self, *a, **kw):
+                return None
+
+            def disconnect(self):
+                pass
+
+            def managedAccounts(self):
+                return ["DU21801100"]
+
+            async def accountSummaryAsync(self):
+                return []
+
+            def portfolio(self):
+                return []
+
+            async def reqExecutionsAsync(self):
+                return [
+                    SimpleNamespace(
+                        contract=SimpleNamespace(conId=70001, symbol="3152", secType="STK", currency="HKD", localSymbol="3152"),
+                        execution=SimpleNamespace(execId="1003", acctNumber="DU21801100", orderId=3, side="SLD", shares=10.0, price=1100.0, time=datetime(2026, 11, 25, 15, 0, 0)),
+                        commissionReport=SimpleNamespace(commission=11.0, realizedPNL=500.0),
+                    )
+                ]
+
+            async def reqAllOpenOrdersAsync(self):
+                return []
+
+            def openTrades(self):
+                return []
+
+        update_settings({"ibgw_enabled": "1", "ibgw_port": "4002", "ibgw_notify_fills": "0"})
+        ibgw_service.reset_gateway_state_for_test()
+        ibgw_service.set_ib_factory_for_test(lambda: _FakeExecIB())
+        try:
+            gw_sync = self.client.post("/api/ibgw/sync", json={"sync_grids": True})
+            self.assertEqual(gw_sync.status_code, 200, gw_sync.text)
+            self.assertEqual(gw_sync.json()["grid_trades_imported"], 1)
+        finally:
+            ibgw_service.set_ib_factory_for_test(None)
+            ibgw_service.reset_gateway_state_for_test()
+            update_settings({"ibgw_enabled": "0"})
+
         d_after = self.client.get(f"/api/grids/{sid}").json()
         self.assertEqual(d_after["summary"]["holding_qty"], 0.0)
         self.assertEqual(d_after["summary"]["completed_grids"], 2)
 
         # Cleanup
         self.assertEqual(self.client.delete(f"/api/grids/{sid}").status_code, 200)
-        update_settings({"ibkr_flex_token": "", "ibkr_flex_query_id": ""})
 
     def test_28_init_db_migrates_legacy_grid_tables_without_new_columns(self):
         import sqlite3
@@ -2292,264 +2321,54 @@ class TestLifeHubAPI(unittest.TestCase):
             self.assertIn("external_ref", cols_t)
             self.assertIn("source_type", cols_t)
 
-    def test_29_hsbc_email_stock_trades_and_grid_import(self):
-        from unittest.mock import patch
-        from app.services import email_service
-        from app.db import update_settings
+    def test_29_email_stock_grid_retired_while_bills_preserved(self):
+        # 1. Retired email-to-stock-grid endpoints return 404/405
+        self.assertIn(self.client.post("/api/grids/fetch-email-trades", json={"days": 7}).status_code, (404, 405))
+        self.assertIn(self.client.post("/api/grids/import-email-trades", json={"trades": []}).status_code, (404, 405))
 
-        # 1. Paste HSBC HK Chinese stock confirmation email (should extract stock_trades, NOT daily消费 transactions)
-        hsbc_cn_body = (
-            "尊敬的客户：\n"
-            "阁下透过汇丰网上理财证券户口完成以下交易：\n"
-            "买卖方向：买入\n"
-            "股票代号：00700 (腾讯控股)\n"
-            "成交股数：100\n"
-            "成交价格：HKD 380.00\n"
-            "经纪佣金：HKD 50.00\n"
-            "政府印花税：HKD 38.00\n"
-            "交易日期：2026-11-24 10:15\n"
-        )
-        r_cn = self.client.post(
-            "/api/grids/parse-email-trade-text",
-            json={"subject": "汇丰银行证券交易成交通知", "sender": "HSBC <hsbc@hsbc.com.hk>", "body": hsbc_cn_body},
-        )
-        self.assertEqual(r_cn.status_code, 200, r_cn.text)
-        tr_cn = r_cn.json()["trades"]
-        self.assertEqual(len(tr_cn), 1)
-        self.assertEqual(tr_cn[0]["side"], "buy")
-        self.assertEqual(tr_cn[0]["symbol"], "00700")
-        self.assertEqual(tr_cn[0]["market"], "HK")
-        self.assertAlmostEqual(tr_cn[0]["price"], 380.0, places=2)
-        self.assertEqual(tr_cn[0]["quantity"], 100.0)
-        self.assertAlmostEqual(tr_cn[0]["fee"], 50.0, places=2)
-        self.assertAlmostEqual(tr_cn[0]["tax"], 38.0, places=2)
-        self.assertEqual(tr_cn[0]["broker"], "汇丰 (HSBC)")
-
-        # Ensure /api/emails/parse-text also separates stock_trades from household expense transactions
-        r_em = self.client.post(
+        # 2. General email bill parsing STILL works cleanly for credit cards & household expenses
+        r_bill = self.client.post(
             "/api/emails/parse-text",
-            json={"subject": "汇丰银行证券交易成交通知", "sender": "HSBC <hsbc@hsbc.com.hk>", "body": hsbc_cn_body},
-        )
-        self.assertEqual(r_em.status_code, 200)
-        self.assertEqual(len(r_em.json()["transactions"]), 0)
-        self.assertEqual(len(r_em.json()["stock_trades"]), 1)
-
-        # 2. Inline HSBC sell notification & English Contract Note format in mailbox fetch
-        mb_res = self.client.post(
-            "/api/email-accounts",
             json={
-                "name": "汇丰收件箱",
-                "imap_host": "imap.qq.com",
-                "imap_port": 993,
-                "username": "hsbc_test@qq.com",
-                "password": "pwd",
+                "subject": "招商银行信用卡消费通知",
+                "sender": "cmb@cmbchina.com",
+                "body": "您尾号 8812 的招商银行信用卡于 2026-11-26 消费 RMB 128.50，商户：盒马鲜生。",
             },
         )
-        self.assertEqual(mb_res.status_code, 200)
-        mb_id = mb_res.json()["id"]
+        self.assertEqual(r_bill.status_code, 200, r_bill.text)
+        self.assertGreaterEqual(len(r_bill.json()["transactions"]), 1)
 
-        fake_raw = [
-            {
-                "uid": "<hsbc-buy-00700@hsbc.com.hk>",
-                "imap_uid": "101",
-                "subject": "HSBC Stock Trading Advice",
-                "sender": "HSBC <no-reply@hsbc.com.hk>",
-                "received_at": "2026-11-24 10:15",
-                "body": "Bought 100 00700.HK (TENCENT) @ HKD 380.00 Commission: HKD 50.00 Stamp Duty: HKD 38.00",
-                "attachments": [],
-            },
-            {
-                "uid": "<hsbc-sell-00700@hsbc.com.hk>",
-                "imap_uid": "102",
-                "subject": "汇丰证券卖出成交通知",
-                "sender": "HSBC <no-reply@hsbc.com.hk>",
-                "received_at": "2026-11-25 14:20",
-                "body": "阁下于汇丰卖出 00700(腾讯控股) 100 股，成交价 HKD 400.00，佣金：HKD 50.00，印花税：HKD 40.00",
-                "attachments": [],
-            },
-        ]
-
-        with patch.object(email_service, "_fetch_raw_emails_sync", return_value=fake_raw):
-            f_res = self.client.post(
-                "/api/grids/fetch-email-trades",
-                json={"days": 30, "account_id": mb_id, "keyword": "HSBC"},
-            )
-            self.assertEqual(f_res.status_code, 200, f_res.text)
-            fetched_trades = f_res.json()["trades"]
-            self.assertEqual(len(fetched_trades), 2)
-
-            # 3. Import both HSBC trades -> auto-creates grid tagged 汇丰 (HSBC) and pairs buy 380 -> sell 400!
-            imp1 = self.client.post(
-                "/api/grids/import-email-trades",
-                json={"trades": fetched_trades, "auto_create_missing": True, "default_step_pct": 3.0},
-            )
-            self.assertEqual(imp1.status_code, 200, imp1.text)
-            ib1 = imp1.json()
-            self.assertEqual(len(ib1["created_strategies"]), 1)
-            self.assertEqual(ib1["imported_trades"], 2)
-            sid = ib1["created_strategies"][0]["id"]
-            self.assertIn("HSBC", ib1["created_strategies"][0]["broker"])
-
-            # Verify net grid profit: (400*100 - 50 - 40) - (380*100 + 50 + 38) = 39910 - 38088 = 1822.00
-            d1 = self.client.get(f"/api/grids/{sid}").json()
-            self.assertEqual(d1["summary"]["completed_grids"], 1)
-            self.assertEqual(d1["summary"]["holding_qty"], 0.0)
-            self.assertAlmostEqual(d1["summary"]["realized_pnl"], 1822.0, places=2)
-
-            # 4. Re-importing same trades must be deduplicated cleanly
-            imp2 = self.client.post(
-                "/api/grids/import-email-trades",
-                json={"trades": fetched_trades, "auto_create_missing": True},
-            )
-            self.assertEqual(imp2.status_code, 200)
-            self.assertEqual(imp2.json()["imported_trades"], 0)
-            self.assertEqual(imp2.json()["skipped_duplicates"], 2)
-            self.assertIn("scanned_emails", f_res.json())
-
-        # 5. HSBC HK real execution email format ("股票名稱/ 股票編號: ... (IAUM)" / "蘋果 (AAPL)" / "已成交數量(股/單位)")
-        hsbc_real_iaum = """香港上海滙豐銀行有限公司，香港皇后大道中1號。
-全部執行: 買入IAUM: ISHARES GOLD TRUST MICRO的股/單位(交易編號: P353813)
-親愛的客戶
-我們想通知您交易訂單的執行結果，詳情如下:
-• 交易編號: P353813
-• 交易狀況: 全部執行
-• 指示類別: 買入
-• 股票名稱/ 股票編號: ISHARES GOLD TRUST MICRO (IAUM)
-• 已成交數量(股/單位): 1
-• 成交價: USD34.49
-• 共成交數量(股/單位): 1
-• 餘下數量(股/單位): 0
-滙豐私人銀行客戶：(852) 2233 3033"""
-        r_iaum = self.client.post(
-            "/api/grids/parse-email-trade-text",
+        # 3. /api/emails/import does NOT import stock_trades into stock_trades table anymore
+        from app.db import get_conn
+        before_cnt = 0
+        with get_conn() as conn:
+            before_cnt = conn.execute("SELECT COUNT(*) FROM stock_trades").fetchone()[0]
+        imp = self.client.post(
+            "/api/emails/import",
             json={
-                "subject": "全部執行: 買入IAUM: ISHARES GOLD TRUST MICRO的股/單位(交易編號: P353813)",
-                "sender": "HSBC <hsbc@hsbc.com.hk>",
-                "body": hsbc_real_iaum,
+                "transactions": [],
+                "reminders": [],
+                "stock_trades": [
+                    {
+                        "symbol": "IAUM",
+                        "name": "IAUM",
+                        "market": "US",
+                        "currency": "USD",
+                        "side": "buy",
+                        "price": 34.49,
+                        "quantity": 1,
+                        "broker": "HSBC",
+                        "traded_at": "2026-11-26 10:00",
+                    }
+                ],
+                "auto_create_grid_strategies": True,
             },
         )
-        self.assertEqual(r_iaum.status_code, 200, r_iaum.text)
-        iaum_tr = r_iaum.json()["trades"]
-        self.assertEqual(len(iaum_tr), 1, r_iaum.text)
-        self.assertEqual(iaum_tr[0]["symbol"], "IAUM")
-        self.assertEqual(iaum_tr[0]["market"], "US")
-        self.assertEqual(iaum_tr[0]["currency"], "USD")
-        self.assertEqual(iaum_tr[0]["side"], "buy")
-        self.assertAlmostEqual(iaum_tr[0]["price"], 34.49, places=2)
-        self.assertAlmostEqual(iaum_tr[0]["quantity"], 1.0, places=2)
-
-        # Also test company name starting with a short ASCII word ("CSOP HKD MMF (03152)") does NOT grab "CSOP"!
-        hsbc_csop_body = """
-        滙豐：證券交易執行通知
-        指示類別：買入
-        股票名稱/ 股票編號：CSOP HKD MMF (03152)
-        已成交數量(股/單位)：11
-        成交價：HKD1085.50
-        交易日期：2026年11月25日
-        重要提示 / Disclaimer: This is not advice to buy or sell any securities.
-        """
-        r_tc = self.client.post(
-            "/api/grids/parse-email-trade-text",
-            json={"subject": "滙豐：證券交易執行通知", "sender": "HSBC <hsbc@hsbc.com.hk>", "body": hsbc_csop_body},
-        )
-        self.assertEqual(r_tc.status_code, 200, r_tc.text)
-        tc_tr = r_tc.json()["trades"]
-        self.assertEqual(len(tc_tr), 1, r_tc.text)
-        self.assertEqual(tc_tr[0]["symbol"], "03152")
-        self.assertEqual(tc_tr[0]["side"], "buy")
-        self.assertAlmostEqual(tc_tr[0]["price"], 1085.5, places=2)
-        self.assertAlmostEqual(tc_tr[0]["quantity"], 11.0, places=2)
-
-        pdf_space_body = """
-        HSBC Contract Note
-        Trade Date     Side   Code    Security       Qty   Price      Consideration
-        26 Nov 2026    SELL   03152   CSOP HKD MMF   11    1,086.00   11,946.00
-        """
-        r_sp = self.client.post(
-            "/api/grids/parse-email-trade-text",
-            json={"subject": "HSBC Contract Note", "sender": "HSBC <no-reply@hsbc.com.hk>", "body": pdf_space_body},
-        )
-        self.assertEqual(r_sp.status_code, 200, r_sp.text)
-        sp_tr = r_sp.json()["trades"]
-        self.assertEqual(len(sp_tr), 1, r_sp.text)
-        self.assertEqual(sp_tr[0]["side"], "sell")
-        self.assertEqual(sp_tr[0]["symbol"], "03152")
-        self.assertAlmostEqual(sp_tr[0]["price"], 1086.0, places=2)
-
-        # 6. Wrapper HTML table (<p>/<br> inside single-cell <td>) & ZIP-contained HTML Contract Note via email fetch
-        import email as py_email
-        import io as py_io
-        from email.mime.multipart import MIMEMultipart
-        from email.mime.text import MIMEText
-        import zipfile
-
-        mime_msg = MIMEMultipart()
-        mime_msg["Subject"] = "HSBC Securities Execution Advice"
-        mime_msg["From"] = "HSBC <advice@hsbc.com.hk>"
-        html_wrapper = """
-        <html><body><table><tr><td>
-          <p>滙豐證券交易通知</p>
-          <p>買賣方向：買入</p>
-          <p>股份編號：03152 (A博時港元)</p>
-          <p>成交股數：20 股</p>
-          <p>成交價：HKD 1,085.20</p>
-          <p>成交日期：2026年11月26日</p>
-          <p>Disclaimer: Not advice to buy or sell securities.</p>
-        </td></tr></table></body></html>
-        """
-        mime_msg.attach(MIMEText("Please view in HTML client.", "plain", "utf-8"))
-        mime_msg.attach(MIMEText(html_wrapper, "html", "utf-8"))
-        parsed_body, parsed_atts = email_service._extract_body_and_attachments(
-            py_email.message_from_bytes(mime_msg.as_bytes())
-        )
-        self.assertIn("\n", parsed_body)
-        r_html_wrap = self.client.post(
-            "/api/grids/parse-email-trade-text",
-            json={"subject": "HSBC Securities Execution Advice", "sender": "HSBC <advice@hsbc.com.hk>", "body": parsed_body},
-        )
-        self.assertEqual(r_html_wrap.status_code, 200, r_html_wrap.text)
-        hw_tr = r_html_wrap.json()["trades"]
-        self.assertEqual(len(hw_tr), 1, hw_tr)
-        self.assertEqual(hw_tr[0]["symbol"], "03152")
-        self.assertEqual(hw_tr[0]["side"], "buy")
-        self.assertAlmostEqual(hw_tr[0]["quantity"], 20.0, places=2)
-
-        # Verify ZIP containing HTML Contract Note works via direct mailbox fetch with keyword "汇丰" matching "HSBC"
-        zip_buf = py_io.BytesIO()
-        with zipfile.ZipFile(zip_buf, "w") as zf:
-            zf.writestr("ContractNote.html", "<html><body>Bought 50 shares of 00700 (TENCENT) at HKD 392.00</body></html>")
-        mb_res2 = self.client.post(
-            "/api/email-accounts",
-            json={"name": "汇丰附件测试", "imap_host": "imap.qq.com", "imap_port": 993, "username": "zip_test@qq.com", "password": "pwd"},
-        )
-        self.assertEqual(mb_res2.status_code, 200)
-        mb_id2 = mb_res2.json()["id"]
-        fake_zip_mail = [
-            {
-                "uid": "<hsbc-zip-001@hsbc.com.hk>",
-                "imap_uid": "201",
-                "subject": "HSBC eAdvice Attached",
-                "sender": "HSBC <eadvice@hsbc.com.hk>",
-                "received_at": "2026-11-26 15:00",
-                "body": "Dear Customer, please find your attached eAdvice.",
-                "attachments": [("eAdvice.zip", zip_buf.getvalue())],
-            }
-        ]
-        with patch.object(email_service, "_fetch_raw_emails_sync", return_value=fake_zip_mail):
-            f_zip = self.client.post(
-                "/api/grids/fetch-email-trades",
-                json={"days": 30, "account_id": mb_id2, "keyword": "汇丰"},
-            )
-            self.assertEqual(f_zip.status_code, 200, f_zip.text)
-            self.assertEqual(len(f_zip.json()["trades"]), 1, f_zip.text)
-            self.assertEqual(f_zip.json()["trades"][0]["symbol"], "00700")
-            self.assertEqual(f_zip.json()["trades"][0]["side"], "buy")
-        self.assertEqual(self.client.delete(f"/api/email-accounts/{mb_id2}").status_code, 200)
-
-        # Cleanup
-        self.assertEqual(self.client.delete(f"/api/grids/{sid}").status_code, 200)
-        self.assertEqual(self.client.delete(f"/api/email-accounts/{mb_id}").status_code, 200)
-        update_settings({"ibkr_flex_token": "", "ibkr_flex_query_id": ""})
+        self.assertEqual(imp.status_code, 200, imp.text)
+        self.assertEqual(imp.json()["stock_sync"], {})
+        with get_conn() as conn:
+            after_cnt = conn.execute("SELECT COUNT(*) FROM stock_trades").fetchone()[0]
+        self.assertEqual(after_cnt, before_cnt)
 
     def test_30_local_email_cache_and_incremental_sync(self) -> None:
         """Verify emails are cached locally in SQLite, synced incrementally by IMAP UID, and reused across modules without IMAP."""
@@ -2646,7 +2465,7 @@ class TestLifeHubAPI(unittest.TestCase):
         self.assertEqual(cs.json()["total_cached"], 3)
         self.assertEqual(cs.json()["stock_hint_count"], 2)
 
-        # 4. Both EmailBills and StockGrid parse strictly from local cache with ZERO IMAP calls!
+        # 4. EmailBills parses strictly from local cache with ZERO IMAP calls!
         with patch.object(email_service, "_fetch_raw_emails_sync", side_effect=AssertionError("Should not hit IMAP on source=cache")):
             r_bills = self.client.post(
                 "/api/emails/fetch-parse",
@@ -2656,22 +2475,6 @@ class TestLifeHubAPI(unittest.TestCase):
             self.assertTrue(r_bills.json()["from_cache"])
             self.assertEqual(len(r_bills.json()["emails"]), 3)
             self.assertGreaterEqual(len(r_bills.json()["transactions"]), 1)
-
-            r_grids = self.client.post(
-                "/api/grids/fetch-email-trades",
-                json={"days": 30, "limit": 50, "account_id": mb_id, "source": "cache", "include_body_ai": True},
-            )
-            self.assertEqual(r_grids.status_code, 200, r_grids.text)
-            self.assertTrue(r_grids.json()["from_cache"])
-            syms = {t["symbol"] for t in r_grids.json()["trades"]}
-            self.assertEqual(syms, {"IAUM", "03152"})
-
-            r_2y = self.client.post(
-                "/api/grids/fetch-email-trades",
-                json={"days": 730, "limit": 1500, "account_id": mb_id, "source": "cache"},
-            )
-            self.assertEqual(r_2y.status_code, 200, r_2y.text)
-            self.assertEqual(len(r_2y.json()["trades"]), 2)
 
         self.assertEqual(self.client.delete(f"/api/email-accounts/{mb_id}").status_code, 200)
 
@@ -2731,6 +2534,214 @@ class TestLifeHubAPI(unittest.TestCase):
             self.client.delete(f"/api/reminders/{rem.json()['id']}")
 
         update_settings({"bark_enabled": "0", "bark_device_key": ""})
+
+    def test_32_ib_gateway_auto_grid_orders_and_safety_guards(self) -> None:
+        """Verify Paper-only safety guard, HK/US tick rounding, idempotent BUY/SELL grid orders, fill->advance, and cancel."""
+        from types import SimpleNamespace
+        from datetime import datetime
+        from unittest.mock import AsyncMock, patch
+        from app.db import get_conn, update_settings
+        from app.services import ibgw_service
+
+        # 1. HKEX & US tick / lot rounding sanity checks
+        self.assertAlmostEqual(ibgw_service.round_price_to_tick(34.487, "HK", "buy"), 34.45, places=4)
+        self.assertAlmostEqual(ibgw_service.round_price_to_tick(34.487, "HK", "sell"), 34.50, places=4)
+        self.assertAlmostEqual(ibgw_service.round_price_to_tick(1085.3, "HK", "buy"), 1085.0, places=4)
+        self.assertAlmostEqual(ibgw_service.round_price_to_tick(34.484, "US", "buy"), 34.48, places=4)
+        self.assertAlmostEqual(ibgw_service.round_price_to_tick(34.484, "US", "sell"), 34.49, places=4)
+        self.assertEqual(ibgw_service.normalize_lot_qty(250, "HK", custom_lot=100), 200.0)
+        self.assertEqual(ibgw_service.normalize_ib_symbol("03152", "HK"), "3152")
+
+        with get_conn() as conn:
+            conn.execute("DELETE FROM ibgw_orders")
+            conn.execute("DELETE FROM ibkr_trades")
+
+        # 2. Paper-only guard MUST block Live port (4001) on dry_run test order & live place
+        update_settings(
+            {
+                "ibgw_enabled": "1",
+                "ibgw_port": "4001",
+                "ibgw_trading_mode": "live",
+                "ibgw_paper_only_guard": "1",
+                "bark_enabled": "0",
+                "extra_push_enabled": "0",
+            }
+        )
+        blocked_res = self.client.post(
+            "/api/ibgw/test-order",
+            json={"symbol": "IAUM", "market": "US", "side": "buy", "quantity": 1, "lmt_price": 34.0, "dry_run": True},
+        )
+        self.assertEqual(blocked_res.status_code, 400)
+        self.assertIn("仅模拟盘", blocked_res.json()["detail"])
+
+        # Stateful fake IB client tracking live open orders, placements, cancellations, and fills
+        class _StatefulMockIB:
+            def __init__(self):
+                self._connected = True
+                self._next_oid = 9001
+                self.open_trades = []
+                self.executions = []
+                self.placed_log = []
+                self.cancelled_log = []
+
+            def isConnected(self):
+                return self._connected
+
+            async def connectAsync(self, *a, **kw):
+                self._connected = True
+
+            def disconnect(self):
+                self._connected = False
+
+            def managedAccounts(self):
+                return ["DU999888"]
+
+            async def accountSummaryAsync(self):
+                return [SimpleNamespace(account="DU999888", tag="NetLiquidation", value="50000", currency="USD")]
+
+            def portfolio(self):
+                return []
+
+            async def reqExecutionsAsync(self):
+                return list(self.executions)
+
+            async def reqAllOpenOrdersAsync(self):
+                return list(self.open_trades)
+
+            def openTrades(self):
+                return list(self.open_trades)
+
+            def placeOrder(self, contract, order):
+                oid = self._next_oid
+                self._next_oid += 1
+                order.orderId = oid
+                order.permId = oid + 10000
+                tr = SimpleNamespace(
+                    contract=contract,
+                    order=order,
+                    orderStatus=SimpleNamespace(status="Submitted", filled=0.0, remaining=float(order.totalQuantity), avgFillPrice=0.0),
+                )
+                self.open_trades.append(tr)
+                self.placed_log.append((order.orderRef, order.action, float(order.totalQuantity), float(order.lmtPrice)))
+                return tr
+
+            def cancelOrder(self, order):
+                oid = getattr(order, "orderId", 0)
+                self.cancelled_log.append((getattr(order, "orderRef", ""), oid))
+                self.open_trades = [t for t in self.open_trades if getattr(t.order, "orderId", -1) != oid]
+
+        fake_ib = _StatefulMockIB()
+        ibgw_service.reset_gateway_state_for_test()
+        ibgw_service.set_ib_factory_for_test(lambda: fake_ib)
+
+        try:
+            # 3. Switch to Paper mode (4002) and verify dry_run + Paper test order + cancel
+            update_settings({"ibgw_port": "4002", "ibgw_trading_mode": "paper", "ibgw_paper_only_guard": "1"})
+            dry = self.client.post(
+                "/api/ibgw/test-order",
+                json={"symbol": "IAUM", "market": "US", "side": "buy", "quantity": 1, "lmt_price": 33.124, "dry_run": True},
+            )
+            self.assertEqual(dry.status_code, 200, dry.text)
+            self.assertAlmostEqual(dry.json()["lmt_price"], 33.12, places=2)
+
+            live_test_ord = self.client.post(
+                "/api/ibgw/test-order",
+                json={"symbol": "IAUM", "market": "US", "side": "buy", "quantity": 1, "lmt_price": 31.50, "dry_run": False},
+            )
+            self.assertEqual(live_test_ord.status_code, 200, live_test_ord.text)
+            test_ord_id = live_test_ord.json()["order"]["id"]
+            c_res = self.client.post(f"/api/ibgw/orders/{test_ord_id}/cancel")
+            self.assertEqual(c_res.status_code, 200, c_res.text)
+            self.assertEqual(c_res.json()["order"]["status"], "Cancelled")
+
+            # 4. Create auto-trade IAUM US Grid (30 ~ 38, step 2, 2 shares/grid, current 34, max_holding 4)
+            cr = self.client.post(
+                "/api/grids",
+                json={
+                    "name": "IAUM自动网格",
+                    "symbol": "IAUM",
+                    "market": "US",
+                    "grid_type": "arithmetic",
+                    "lower_price": 30.0,
+                    "upper_price": 38.0,
+                    "step_value": 2.0,
+                    "shares_per_grid": 2.0,
+                    "current_price": 34.0,
+                    "auto_trade_enabled": True,
+                    "max_holding_qty": 4.0,
+                    "stop_buy_below_lower": True,
+                    "fee_rate": 0.0,
+                    "min_fee": 0.0,
+                },
+            )
+            self.assertEqual(cr.status_code, 200, cr.text)
+            sid = cr.json()["strategy"]["id"]
+
+            # Seed initial buy at level 2 (price=34) -> next_buy=32 (level 1), next_sell=36 (level 3)
+            self.client.post(
+                f"/api/grids/{sid}/trades",
+                json={"side": "buy", "price": 34.0, "quantity": 2.0, "grid_level": 2, "traded_at": "2026-11-26 10:00"},
+            )
+
+            # First reconcile places BUY @ 32 & SELL @ 36
+            rec1 = self.client.post(f"/api/grids/{sid}/auto-sync-orders", json={"cancel_only": False})
+            self.assertEqual(rec1.status_code, 200, rec1.text)
+            r1 = rec1.json()
+            self.assertEqual(r1["placed"], 2)
+            self.assertEqual(r1["cancelled"], 0)
+            refs_and_prices = {(o[0], o[1], o[3]) for o in fake_ib.placed_log}
+            self.assertIn((f"LH_GRID_{sid}_BUY_1", "BUY", 32.0), refs_and_prices)
+            self.assertIn((f"LH_GRID_{sid}_SELL_3", "SELL", 36.0), refs_and_prices)
+
+            # Second reconcile MUST be 100% idempotent (0 placed, 0 cancelled, 2 kept)
+            rec2 = self.client.post(f"/api/grids/{sid}/auto-sync-orders", json={"cancel_only": False})
+            self.assertEqual(rec2.status_code, 200)
+            self.assertEqual(rec2.json()["placed"], 0)
+            self.assertEqual(rec2.json()["cancelled"], 0)
+            self.assertEqual(rec2.json()["kept"], 2)
+
+            # 5. Simulate BUY @ 32 filling via IB Gateway + verify MeoW notification fires!
+            buy_tr = next(t for t in fake_ib.open_trades if t.order.action == "BUY")
+            fake_ib.open_trades = [t for t in fake_ib.open_trades if t is not buy_tr]
+            fake_ib.executions.append(
+                SimpleNamespace(
+                    contract=SimpleNamespace(conId=9911, symbol="IAUM", secType="STK", currency="USD", localSymbol="IAUM"),
+                    execution=SimpleNamespace(execId="GW_FILL_BUY32", acctNumber="DU999888", orderId=buy_tr.order.orderId, side="BOT", shares=2.0, price=32.0, time=datetime(2026, 11, 26, 11, 0, 0)),
+                    commissionReport=SimpleNamespace(commission=0.0, realizedPNL=0.0),
+                )
+            )
+            update_settings({"bark_enabled": "1", "bark_device_key": "", "extra_push_enabled": "1", "extra_push_urls": "https://api.chuckfang.com/f6281445/", "ibgw_notify_fills": "1"})
+
+            class _OkResp:
+                def raise_for_status(self):
+                    return None
+
+                def json(self):
+                    return {"status": 200}
+
+            with patch("app.services.bark_service.httpx.AsyncClient.post", new=AsyncMock(return_value=_OkResp())) as mock_push:
+                sync_after_fill = self.client.post("/api/ibgw/sync", json={"sync_grids": True, "reconcile_orders": True})
+                self.assertEqual(sync_after_fill.status_code, 200, sync_after_fill.text)
+                sj = sync_after_fill.json()
+                self.assertEqual(sj["grid_trades_imported"], 1)
+                self.assertGreaterEqual(mock_push.call_count, 1)
+                self.assertIn("IBKR 成交回执", mock_push.call_args.kwargs["json"]["title"])
+
+            # Now holding_qty == 4 == max_holding_qty, lowest lot is level 1 (price=32) -> SELL shifts to 34 (level 2), BUY paused due to max_holding_qty!
+            open_refs = {(t.order.orderRef, t.order.action, float(t.order.lmtPrice)) for t in fake_ib.open_trades}
+            self.assertEqual(open_refs, {(f"LH_GRID_{sid}_SELL_2", "SELL", 34.0)})
+
+            # 6. Cancel all active grid orders via cancel_only=True
+            rec_cancel = self.client.post(f"/api/grids/{sid}/auto-sync-orders", json={"cancel_only": True})
+            self.assertEqual(rec_cancel.status_code, 200)
+            self.assertEqual(rec_cancel.json()["cancelled"], 1)
+            self.assertEqual(len(fake_ib.open_trades), 0)
+
+            self.client.delete(f"/api/grids/{sid}")
+        finally:
+            ibgw_service.set_ib_factory_for_test(None)
+            ibgw_service.reset_gateway_state_for_test()
+            update_settings({"ibgw_enabled": "0", "ibgw_port": "4002", "ibgw_trading_mode": "paper", "bark_enabled": "0"})
 
 
 if __name__ == "__main__":

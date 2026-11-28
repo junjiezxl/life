@@ -327,12 +327,12 @@ export const SettingsView: React.FC<Props> = ({
     await api.updateSettings(settings);
     setIbkrTestResult(null);
     try {
-      const res = await api.testIbkr();
+      const res = await api.testIbGateway();
       setIbkrTestResult({ ok: res.ok, message: res.message });
     } catch (err) {
       setIbkrTestResult({
         ok: false,
-        message: err instanceof Error ? err.message : 'IBKR Flex 连接失败',
+        message: err instanceof Error ? err.message : 'IB Gateway 连接失败',
       });
     }
   };
@@ -1666,78 +1666,157 @@ export const SettingsView: React.FC<Props> = ({
       <div className="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-xs space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
-            <h3 className="text-sm font-semibold text-slate-900">盈透证券 (IBKR) Flex Web Service 配置（每日汇总）</h3>
+            <h3 className="text-sm font-semibold text-slate-900">盈透证券 IB Gateway (`ib_async`) 连接与自动网格风控</h3>
             <p className="text-xs text-slate-500">
-              免挂机与二次验证，通过官方 Flex Token + Query ID 定时拉取每日净值、持仓、成交与分红报表。
+              直连同机 Docker 部署的 IB Gateway（默认 127.0.0.1），实时同步净值/持仓/成交，并驱动「股票网格」限价自动挂单。
             </p>
           </div>
-          <button
-            type="button"
-            onClick={handleTestIbkr}
-            className="rounded-xl border border-blue-200 bg-blue-50 px-3.5 py-1.5 text-xs font-medium text-blue-700 hover:bg-blue-100 cursor-pointer"
-          >
-            测试 Flex 拉取
-          </button>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-6 text-xs text-slate-700">
-          <label className="inline-flex items-center gap-2 font-medium cursor-pointer">
-            <input
-              type="checkbox"
-              checked={settings.ibkr_auto_sync_enabled === '1'}
-              onChange={(e) => updateField('ibkr_auto_sync_enabled', e.target.checked ? '1' : '0')}
-            />
-            <span>开启后台定时自动拉取 Flex 报表</span>
-          </label>
-          <label className="inline-flex items-center gap-2 font-medium cursor-pointer">
-            <input
-              type="checkbox"
-              checked={settings.ibkr_bark_daily_summary === '1'}
-              onChange={(e) => updateField('ibkr_bark_daily_summary', e.target.checked ? '1' : '0')}
-            />
-            <span>出现新报告日时通过 Bark 发送每日净值汇总</span>
-          </label>
-          <label className="inline-flex items-center gap-2 font-medium cursor-pointer">
-            <input
-              type="checkbox"
-              checked={settings.ibkr_use_proxy === '1'}
-              onChange={(e) => updateField('ibkr_use_proxy', e.target.checked ? '1' : '0')}
-            />
-            <span>使用全局代理拉取 Flex</span>
-          </label>
-        </div>
-
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
-          <div>
-            <label className="mb-1 block text-xs font-medium text-slate-600">Flex Token</label>
-            <input
-              type="password"
-              value={settings.ibkr_flex_token || ''}
-              onChange={(e) => updateField('ibkr_flex_token', e.target.value)}
-              placeholder="IBKR Client Portal 中生成的 Flex Web Service Token"
-              className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-500"
-            />
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                updateField('ibgw_trading_mode', 'paper');
+                updateField('ibgw_port', '4002');
+                updateField('ibgw_paper_only_guard', '1');
+              }}
+              className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-700 hover:bg-amber-100 cursor-pointer"
+            >
+              模拟盘预设 (4002)
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                updateField('ibgw_trading_mode', 'live');
+                updateField('ibgw_port', '4001');
+              }}
+              className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-1.5 text-xs font-medium text-rose-700 hover:bg-rose-100 cursor-pointer"
+            >
+              实盘预设 (4001)
+            </button>
+            <button
+              type="button"
+              onClick={handleTestIbkr}
+              className="rounded-xl border border-blue-200 bg-blue-50 px-3.5 py-1.5 text-xs font-medium text-blue-700 hover:bg-blue-100 cursor-pointer"
+            >
+              测试网关连接
+            </button>
           </div>
+        </div>
+
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 text-xs text-slate-700">
+          <label className="inline-flex items-center gap-2 font-medium cursor-pointer rounded-xl border border-slate-100 bg-slate-50/70 px-3 py-2">
+            <input
+              type="checkbox"
+              checked={settings.ibgw_enabled === '1'}
+              onChange={(e) => updateField('ibgw_enabled', e.target.checked ? '1' : '0')}
+            />
+            <span>启用 IB Gateway 后台连接与实时同步</span>
+          </label>
+          <label className="inline-flex items-center gap-2 font-medium cursor-pointer rounded-xl border border-slate-100 bg-slate-50/70 px-3 py-2">
+            <input
+              type="checkbox"
+              checked={settings.ibgw_auto_reconnect !== '0'}
+              onChange={(e) => updateField('ibgw_auto_reconnect', e.target.checked ? '1' : '0')}
+            />
+            <span>断线后自动重连（配合每日 05:30 重启）</span>
+          </label>
+          <label className="inline-flex items-center gap-2 font-medium cursor-pointer rounded-xl border border-indigo-100 bg-indigo-50/60 px-3 py-2 text-indigo-900">
+            <input
+              type="checkbox"
+              checked={settings.ibgw_auto_grid_enabled === '1'}
+              onChange={(e) => updateField('ibgw_auto_grid_enabled', e.target.checked ? '1' : '0')}
+            />
+            <span>启用全自动网格限价挂单引擎</span>
+          </label>
+          <label className="inline-flex items-center gap-2 font-medium cursor-pointer rounded-xl border border-amber-200 bg-amber-50/70 px-3 py-2 text-amber-900">
+            <input
+              type="checkbox"
+              checked={(settings.ibgw_paper_only_guard ?? '1') === '1'}
+              onChange={(e) => updateField('ibgw_paper_only_guard', e.target.checked ? '1' : '0')}
+            />
+            <span>安全锁：仅允许模拟盘 (DU账户/4002) 下单</span>
+          </label>
+          <label className="inline-flex items-center gap-2 font-medium cursor-pointer rounded-xl border border-slate-100 bg-slate-50/70 px-3 py-2">
+            <input
+              type="checkbox"
+              checked={settings.ibgw_notify_fills !== '0'}
+              onChange={(e) => updateField('ibgw_notify_fills', e.target.checked ? '1' : '0')}
+            />
+            <span>成交同步立即推送 Bark + MeoW 通知</span>
+          </label>
+          <label className="inline-flex items-center gap-2 font-medium cursor-pointer rounded-xl border border-slate-100 bg-slate-50/70 px-3 py-2">
+            <input
+              type="checkbox"
+              checked={settings.ibgw_notify_disconnect !== '0'}
+              onChange={(e) => updateField('ibgw_notify_disconnect', e.target.checked ? '1' : '0')}
+            />
+            <span>断线 / 2FA 验证过期实时告警推送</span>
+          </label>
+        </div>
+
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 md:grid-cols-5">
           <div>
-            <label className="mb-1 block text-xs font-medium text-slate-600">Activity Flex Query ID</label>
+            <label className="mb-1 block text-xs font-medium text-slate-600">Gateway 地址 (Host)</label>
             <input
               type="text"
-              value={settings.ibkr_flex_query_id || ''}
-              onChange={(e) => updateField('ibkr_flex_query_id', e.target.value)}
-              placeholder="例如 1048293"
-              className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-500"
+              value={settings.ibgw_host || '127.0.0.1'}
+              onChange={(e) => updateField('ibgw_host', e.target.value)}
+              placeholder="127.0.0.1"
+              className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm font-mono outline-none focus:border-blue-500"
             />
           </div>
           <div>
-            <label className="mb-1 block text-xs font-medium text-slate-600">自动拉取间隔（分钟）</label>
+            <label className="mb-1 block text-xs font-medium text-slate-600">端口 (4002模拟 / 4001实盘)</label>
             <input
               type="number"
-              min={15}
-              value={settings.ibkr_sync_interval_min || '360'}
-              onChange={(e) => updateField('ibkr_sync_interval_min', e.target.value)}
-              className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-blue-500"
+              value={settings.ibgw_port || '4002'}
+              onChange={(e) => {
+                const v = e.target.value;
+                updateField('ibgw_port', v);
+                if (v.trim() === '4001') updateField('ibgw_trading_mode', 'live');
+                else if (v.trim() === '4002') updateField('ibgw_trading_mode', 'paper');
+              }}
+              className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm font-mono outline-none focus:border-blue-500"
             />
           </div>
+          <div>
+            <label className="mb-1 block text-xs font-medium text-slate-600">Client ID</label>
+            <input
+              type="number"
+              min={1}
+              value={settings.ibgw_client_id || '18'}
+              onChange={(e) => updateField('ibgw_client_id', e.target.value)}
+              className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm font-mono outline-none focus:border-blue-500"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs font-medium text-slate-600">轮询间隔（秒）</label>
+            <input
+              type="number"
+              min={10}
+              max={3600}
+              value={settings.ibgw_sync_interval_sec || '30'}
+              onChange={(e) => updateField('ibgw_sync_interval_sec', e.target.value)}
+              className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm font-mono outline-none focus:border-blue-500"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs font-medium text-slate-600">指定账户（可选）</label>
+            <input
+              type="text"
+              value={settings.ibgw_account || ''}
+              onChange={(e) => updateField('ibgw_account', e.target.value)}
+              placeholder="默认自动识别首账户"
+              className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm font-mono outline-none focus:border-blue-500"
+            />
+          </div>
+        </div>
+
+        <div className="rounded-xl border border-slate-200/80 bg-slate-50/70 p-3.5 text-xs text-slate-600 space-y-1">
+          <div className="font-semibold text-slate-800">服务器 Docker 一键启动参考（已内置在仓库 `deploy/ib-gateway/`）</div>
+          <pre className="overflow-x-auto rounded-lg bg-slate-900 px-3 py-2 font-mono text-[11px] text-slate-100">
+{`cd /opt/lifehub/deploy/ib-gateway && cp .env.example .env && docker compose up -d`}
+          </pre>
         </div>
 
         {ibkrTestResult && (
