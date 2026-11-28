@@ -20,6 +20,7 @@ backend/data/
 *.sqlite3
 .env
 .env.*
+!.env.example
 .build_meta.json
 
 # OS & Editor
